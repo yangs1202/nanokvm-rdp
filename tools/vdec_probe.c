@@ -204,7 +204,7 @@ int main(void)
 	uint32_t submitted = 0;
 	uint32_t decoded = 0;
 
-	if (sizeof(VdecChannelAttr) != 36 || sizeof(VdecStream) != 32 || sizeof(VideoFrameInfo) != 208)
+	if (sizeof(VdecChannelAttr) != 40 || sizeof(VdecStream) != 32 || sizeof(VideoFrameInfo) != 152)
 	{
 		fprintf(stderr, "unexpected VDEC ABI structure size: attr=%zu stream=%zu frame=%zu\n",
 		        sizeof(VdecChannelAttr), sizeof(VdecStream), sizeof(VideoFrameInfo));
