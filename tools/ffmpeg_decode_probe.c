@@ -74,6 +74,11 @@ int main(void)
 			fprintf(stderr, "FoldVNC video read failed\n");
 			goto out;
 		}
+		if (!keyframe)
+		{
+			free(data);
+			continue;
+		}
 		if (!ffmpeg_decoder_push(&decoder, data, length))
 		{
 			fprintf(stderr, "ffmpeg input pipe failed for FoldVNC H.264 frame\n");

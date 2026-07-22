@@ -668,6 +668,11 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 			client_stop(client);
 			break;
 		}
+		if (!keyframe)
+		{
+			free(data);
+			continue;
+		}
 		const bool pushed = ffmpeg_decoder_push(&decoder, data, length);
 		free(data);
 		if (!pushed)
