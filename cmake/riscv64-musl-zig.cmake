@@ -2,6 +2,10 @@ set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR riscv64)
 
 set(CMAKE_C_COMPILER "${CMAKE_CURRENT_LIST_DIR}/../scripts/zig-riscv64-musl-cc")
+set(CMAKE_AR "${CMAKE_CURRENT_LIST_DIR}/../scripts/zig-riscv64-musl-ar")
+set(CMAKE_RANLIB "${CMAKE_CURRENT_LIST_DIR}/../scripts/zig-riscv64-musl-ranlib")
+set(CMAKE_C_COMPILER_AR "${CMAKE_CURRENT_LIST_DIR}/../scripts/zig-riscv64-musl-ar")
+set(CMAKE_C_COMPILER_RANLIB "${CMAKE_CURRENT_LIST_DIR}/../scripts/zig-riscv64-musl-ranlib")
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)

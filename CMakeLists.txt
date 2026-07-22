@@ -7,7 +7,7 @@ option(NANOKVM_RDP_BUILD_TESTS "Build local unit tests" ON)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_C_EXTENSIONS ON)
 
 if(NANOKVM_RDP_BUILD_TESTS)
   enable_testing()
@@ -49,6 +49,20 @@ if(NANOKVM_RDP_BUILD_SERVER)
   set(WITH_PCSC OFF CACHE BOOL "" FORCE)
   set(WITH_LIBUSB OFF CACHE BOOL "" FORCE)
   set(WITH_MANPAGES OFF CACHE BOOL "" FORCE)
+  set(WITH_SMARTCARD_EMULATE OFF CACHE BOOL "" FORCE)
+  set(WITH_KRB5 OFF CACHE BOOL "" FORCE)
+  set(WITH_ALSA OFF CACHE BOOL "" FORCE)
+  set(WITH_PULSE OFF CACHE BOOL "" FORCE)
+  set(WITH_UNICODE_BUILTIN ON CACHE BOOL "" FORCE)
+  set(WITH_JSON_DISABLED ON CACHE BOOL "" FORCE)
+  set(WITH_URIPARSER OFF CACHE BOOL "" FORCE)
+  set(WITH_FUSE OFF CACHE BOOL "" FORCE)
+  set(WITH_OPUS OFF CACHE BOOL "" FORCE)
+  set(WITH_AAD OFF CACHE BOOL "" FORCE)
+  set(USE_UNWIND OFF CACHE BOOL "" FORCE)
+  set(WITH_DSP_FFMPEG OFF CACHE BOOL "" FORCE)
+  set(WITH_VIDEO_FFMPEG OFF CACHE BOOL "" FORCE)
+  set(WITH_SWSCALE OFF CACHE BOOL "" FORCE)
   set(WITH_GFX_H264 ON CACHE BOOL "" FORCE)
   set(WITH_OPENSSL ON CACHE BOOL "" FORCE)
   if(NANOKVM_RDP_OPENSSL_ROOT)
@@ -62,7 +76,13 @@ if(NANOKVM_RDP_BUILD_SERVER)
     src/hid.c
     src/h264.c
   )
-  target_include_directories(nanokvm-rdp PRIVATE src)
-  target_compile_options(nanokvm-rdp PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(nanokvm-rdp PRIVATE
+    src
+    "${NANOKVM_RDP_FREERDP_DIR}/include"
+    "${NANOKVM_RDP_FREERDP_DIR}/winpr/include"
+    "${CMAKE_BINARY_DIR}/freerdp/include"
+    "${CMAKE_BINARY_DIR}/freerdp/winpr/include"
+  )
+  target_compile_options(nanokvm-rdp PRIVATE -Wall -Wextra -Werror -Wno-deprecated-declarations)
   target_link_libraries(nanokvm-rdp PRIVATE freerdp-server freerdp winpr dl)
 endif()
