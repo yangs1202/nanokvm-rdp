@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -78,6 +79,8 @@ bool ffmpeg_decoder_start(FfmpegDecoder* decoder, uint16_t width, uint16_t heigh
 		goto fail;
 	if (decoder->pid == 0)
 	{
+		char scale[32] = { 0 };
+		(void)snprintf(scale, sizeof(scale), "scale=%u:%u", width, height);
 		(void)dup2(input[0], STDIN_FILENO);
 		(void)dup2(output[1], STDOUT_FILENO);
 		(void)close(input[0]);
@@ -86,7 +89,7 @@ bool ffmpeg_decoder_start(FfmpegDecoder* decoder, uint16_t width, uint16_t heigh
 		(void)close(output[1]);
 		execl("/usr/bin/ffmpeg", "ffmpeg", "-loglevel", "error", "-threads", "1", "-fflags",
 		      "nobuffer", "-flags", "low_delay", "-f", "h264", "-i", "pipe:0", "-an", "-pix_fmt",
-		      "bgra", "-f", "rawvideo", "pipe:1", (char*)NULL);
+		      "bgra", "-vf", scale, "-f", "rawvideo", "pipe:1", (char*)NULL);
 		_exit(127);
 	}
 	(void)close(input[0]);

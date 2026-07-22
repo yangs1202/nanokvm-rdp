@@ -639,10 +639,12 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 	Client* client = (Client*)argument;
 	FoldVncClient foldvnc = { .fd = -1 };
 	FfmpegDecoder decoder = { .pid = -1, .input = -1, .output = -1 };
+	const uint16_t capture_width = DEFAULT_WIDTH;
+	const uint16_t capture_height = DEFAULT_HEIGHT;
 	const uint16_t width = client->server->config.width;
 	const uint16_t height = client->server->config.height;
 
-	if (!foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, width, height, 60) ||
+	if (!foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, capture_width, capture_height, 60) ||
 	    !ffmpeg_decoder_start(&decoder, width, height, on_decoded_bitmap_frame, client))
 	{
 		log_message("ERROR", "FoldVNC H.264 backend 또는 FFmpeg decoder를 시작할 수 없습니다");
