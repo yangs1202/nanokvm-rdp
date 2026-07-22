@@ -645,6 +645,7 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 	FfmpegDecoder decoder = { .pid = -1, .input = -1, .output = -1 };
 	const uint16_t capture_width = BITMAP_CAPTURE_WIDTH;
 	const uint16_t capture_height = BITMAP_CAPTURE_HEIGHT;
+	unsigned frames_after_keyframe = 0;
 	const uint16_t width = client->server->config.width;
 	const uint16_t height = client->server->config.height;
 
@@ -668,11 +669,15 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 			client_stop(client);
 			break;
 		}
-		if (!keyframe)
+		if (keyframe)
+			frames_after_keyframe = 1;
+		else if (frames_after_keyframe == 0)
 		{
 			free(data);
 			continue;
 		}
+		else
+			frames_after_keyframe--;
 		const bool pushed = ffmpeg_decoder_push(&decoder, data, length);
 		free(data);
 		if (!pushed)
