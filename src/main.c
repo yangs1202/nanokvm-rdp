@@ -41,6 +41,8 @@
 #define DEFAULT_HEIGHT 1080U
 #define DEFAULT_BITRATE 3000U
 #define MAX_EVENT_HANDLES 32U
+#define BITMAP_CAPTURE_WIDTH 1280U
+#define BITMAP_CAPTURE_HEIGHT 720U
 #define BITMAP_CAPTURE_FPS 10U
 #define BITMAP_MIN_INTERVAL_MS 2000U
 
@@ -641,8 +643,8 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 	Client* client = (Client*)argument;
 	FoldVncClient foldvnc = { .fd = -1 };
 	FfmpegDecoder decoder = { .pid = -1, .input = -1, .output = -1 };
-	const uint16_t capture_width = DEFAULT_WIDTH;
-	const uint16_t capture_height = DEFAULT_HEIGHT;
+	const uint16_t capture_width = BITMAP_CAPTURE_WIDTH;
+	const uint16_t capture_height = BITMAP_CAPTURE_HEIGHT;
 	const uint16_t width = client->server->config.width;
 	const uint16_t height = client->server->config.height;
 
