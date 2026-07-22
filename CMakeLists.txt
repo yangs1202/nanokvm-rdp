@@ -85,4 +85,10 @@ if(NANOKVM_RDP_BUILD_SERVER)
   )
   target_compile_options(nanokvm-rdp PRIVATE -Wall -Wextra -Werror -Wno-deprecated-declarations)
   target_link_libraries(nanokvm-rdp PRIVATE freerdp-server freerdp winpr dl)
+
+  add_executable(nanokvm-rdp-vdec-probe
+    tools/vdec_probe.c
+  )
+  target_compile_options(nanokvm-rdp-vdec-probe PRIVATE -Wall -Wextra -Werror)
+  target_link_libraries(nanokvm-rdp-vdec-probe PRIVATE dl)
 endif()
