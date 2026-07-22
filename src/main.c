@@ -475,14 +475,19 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	const uint16_t width = client->server->config.width;
 	const uint16_t height = client->server->config.height;
 	const size_t expected_length = (size_t)width * height * 4U;
-	const size_t row_bytes = (size_t)width * 4U;
+	const rdpSettings* settings = client->context.settings;
+	const uint32_t color_depth =
+	    settings ? freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth) : 0;
+	const uint16_t bits_per_pixel = color_depth == 24 ? 16 : (uint16_t)color_depth;
+	const size_t bytes_per_pixel = bits_per_pixel / 8U;
+	const size_t row_bytes = (size_t)width * bytes_per_pixel;
 	const uint16_t rows_per_rectangle =
-	    WINPR_ASSERTING_INT_CAST(uint16_t, UINT16_MAX / row_bytes);
+	    row_bytes ? WINPR_ASSERTING_INT_CAST(uint16_t, UINT16_MAX / row_bytes) : 0;
 	uint8_t* reversed = NULL;
 
 	if (!client->context.update || !client->context.update->BitmapUpdate ||
-	    client->context.settings == NULL ||
-	    freerdp_settings_get_uint32(client->context.settings, FreeRDP_ColorDepth) != 32 ||
+	    settings == NULL ||
+	    (bits_per_pixel != 16 && bits_per_pixel != 32) ||
 	    length != expected_length || rows_per_rectangle == 0 || client_should_stop(client))
 		return false;
 
@@ -499,7 +504,21 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 		for (uint16_t row = 0; row < rows; row++)
 		{
 			const size_t source_row = (size_t)(top + rows - row - 1);
-			memcpy(reversed + ((size_t)row * row_bytes), bgra + (source_row * row_bytes), row_bytes);
+			const uint8_t* source = bgra + (source_row * (size_t)width * 4U);
+			uint8_t* destination = reversed + ((size_t)row * row_bytes);
+			if (bits_per_pixel == 32)
+				memcpy(destination, source, row_bytes);
+			else
+			{
+				for (uint16_t column = 0; column < width; column++)
+				{
+					const uint8_t* pixel = source + ((size_t)column * 4U);
+					const uint16_t rgb565 = (uint16_t)(((uint16_t)(pixel[2] >> 3) << 11U) |
+					                                  ((uint16_t)(pixel[1] >> 2) << 5U) |
+					                                  (uint16_t)(pixel[0] >> 3));
+					memcpy(destination + ((size_t)column * 2U), &rgb565, sizeof(rgb565));
+				}
+			}
 		}
 
 		rectangle.destLeft = 0;
@@ -508,7 +527,7 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 		rectangle.destBottom = top + rows - 1;
 		rectangle.width = width;
 		rectangle.height = rows;
-		rectangle.bitsPerPixel = 32;
+		rectangle.bitsPerPixel = bits_per_pixel;
 		rectangle.bitmapLength = WINPR_ASSERTING_INT_CAST(uint16_t, row_bytes * rows);
 		rectangle.bitmapDataStream = reversed;
 		rectangle.compressed = FALSE;
@@ -803,12 +822,20 @@ static bool client_prepare_bitmap(Client* client)
 	}
 	else
 	{
-		if (freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth) != 32)
+		const uint32_t color_depth = freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth);
+		if (color_depth == 24 &&
+		    !freerdp_settings_set_uint32((rdpSettings*)settings, FreeRDP_ColorDepth, 16))
+			return false;
+		if (color_depth != 16 && color_depth != 24 && color_depth != 32)
 		{
-			log_message("ERROR", "client가 32-bit classic bitmap을 지원하지 않습니다");
+			log_message("ERROR", "client가 지원하지 않는 classic bitmap 색 깊이를 요청했습니다");
 			return false;
 		}
-		log_message("INFO", "RemoteFX/NSCodec 없이 classic BitmapUpdate 경로를 사용합니다");
+		char message[128];
+		(void)snprintf(message, sizeof(message),
+		               "RemoteFX/NSCodec 없이 %u-bit classic BitmapUpdate 경로를 사용합니다",
+		               color_depth == 24 ? 16 : color_depth);
+		log_message("INFO", message);
 	}
 	if (client->bitmap_uses_rfx || client->nsc)
 	{
