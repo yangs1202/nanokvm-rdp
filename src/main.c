@@ -604,6 +604,8 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 			break;
 		handles[count++] = WTSVirtualChannelManagerGetEventHandle(client->vcm);
 		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, 100);
+		if (status == WAIT_TIMEOUT)
+			continue;
 		if (status == WAIT_FAILED)
 			break;
 		if (!peer->CheckFileDescriptor(peer) ||
