@@ -1,0 +1,5 @@
+.omc/
+build/
+third_party/cache/
+dist/
+*.log
