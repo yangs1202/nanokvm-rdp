@@ -470,6 +470,64 @@ static bool bitmap_stream_nsc_supported(const rdpSettings* settings)
 	       (supported & SURFCMDS_SET_SURFACE_BITS) != 0;
 }
 
+static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
+{
+	const uint16_t width = client->server->config.width;
+	const uint16_t height = client->server->config.height;
+	const size_t expected_length = (size_t)width * height * 4U;
+	const size_t row_bytes = (size_t)width * 4U;
+	const uint16_t rows_per_rectangle =
+	    WINPR_ASSERTING_INT_CAST(uint16_t, UINT16_MAX / row_bytes);
+	uint8_t* reversed = NULL;
+
+	if (!client->context.update || !client->context.update->BitmapUpdate ||
+	    client->context.settings == NULL ||
+	    freerdp_settings_get_uint32(client->context.settings, FreeRDP_ColorDepth) != 32 ||
+	    length != expected_length || rows_per_rectangle == 0 || client_should_stop(client))
+		return false;
+
+	reversed = malloc(row_bytes * rows_per_rectangle);
+	if (!reversed)
+		return false;
+
+	for (uint16_t top = 0; top < height;)
+	{
+		const uint16_t rows = MIN(rows_per_rectangle, (uint16_t)(height - top));
+		BITMAP_DATA rectangle = WINPR_C_ARRAY_INIT;
+		BITMAP_UPDATE bitmap = WINPR_C_ARRAY_INIT;
+
+		for (uint16_t row = 0; row < rows; row++)
+		{
+			const size_t source_row = (size_t)(top + rows - row - 1);
+			memcpy(reversed + ((size_t)row * row_bytes), bgra + (source_row * row_bytes), row_bytes);
+		}
+
+		rectangle.destLeft = 0;
+		rectangle.destTop = top;
+		rectangle.destRight = width - 1;
+		rectangle.destBottom = top + rows - 1;
+		rectangle.width = width;
+		rectangle.height = rows;
+		rectangle.bitsPerPixel = 32;
+		rectangle.bitmapLength = WINPR_ASSERTING_INT_CAST(uint16_t, row_bytes * rows);
+		rectangle.bitmapDataStream = reversed;
+		rectangle.compressed = FALSE;
+		bitmap.number = 1;
+		bitmap.rectangles = &rectangle;
+		bitmap.skipCompression = FALSE;
+
+		if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
+		{
+			free(reversed);
+			return false;
+		}
+		top += rows;
+	}
+
+	free(reversed);
+	return true;
+}
+
 static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
 {
 	const uint16_t width = client->server->config.width;
@@ -480,8 +538,11 @@ static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length
 	SURFACE_BITS_COMMAND command = WINPR_C_ARRAY_INIT;
 	RFX_RECT rect = { .x = 0, .y = 0, .width = width, .height = height };
 
-	if (!settings || !update || !update->SurfaceBits || !client->bitmap_stream ||
-	    length != expected_length || client_should_stop(client))
+	if (!settings || !update || length != expected_length || client_should_stop(client))
+		return false;
+	if (!client->bitmap_uses_rfx && !client->nsc)
+		goto sent_classic;
+	if (!update->SurfaceBits || !client->bitmap_stream)
 		return false;
 	Stream_Clear(client->bitmap_stream);
 	Stream_ResetPosition(client->bitmap_stream);
@@ -523,6 +584,10 @@ static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length
 	    WINPR_ASSERTING_INT_CAST(uint32_t, Stream_GetPosition(client->bitmap_stream));
 	command.bmp.bitmapData = Stream_Buffer(client->bitmap_stream);
 	if (!update->SurfaceBits(&client->context, &command))
+		return false;
+
+sent_classic:
+	if (!client->bitmap_uses_rfx && !client->nsc && !send_classic_bitmap_frame(client, bgra, length))
 		return false;
 	client->bitmap_frames++;
 	if (client->bitmap_frames == 1)
@@ -722,11 +787,6 @@ static bool client_prepare_bitmap(Client* client)
 	if (!settings)
 		return false;
 	client->bitmap_uses_rfx = bitmap_stream_rfx_supported(settings);
-	if (!client->bitmap_uses_rfx && !bitmap_stream_nsc_supported(settings))
-	{
-		log_message("ERROR", "client가 RDP RemoteFX/NSCodec bitmap을 지원하지 않습니다");
-		return false;
-	}
 	if (client->bitmap_uses_rfx)
 	{
 		client->rfx = rfx_context_new_ex(
@@ -735,15 +795,27 @@ static bool client_prepare_bitmap(Client* client)
 		                                      client->server->config.height))
 			return false;
 	}
-	else
+	else if (bitmap_stream_nsc_supported(settings))
 	{
 		client->nsc = nsc_context_new();
 		if (!client->nsc)
 			return false;
 	}
-	client->bitmap_stream = Stream_New(NULL, 65536);
-	if (!client->bitmap_stream)
-		return false;
+	else
+	{
+		if (freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth) != 32)
+		{
+			log_message("ERROR", "client가 32-bit classic bitmap을 지원하지 않습니다");
+			return false;
+		}
+		log_message("INFO", "RemoteFX/NSCodec 없이 classic BitmapUpdate 경로를 사용합니다");
+	}
+	if (client->bitmap_uses_rfx || client->nsc)
+	{
+		client->bitmap_stream = Stream_New(NULL, 65536);
+		if (!client->bitmap_stream)
+			return false;
+	}
 	client->video_thread = CreateThread(NULL, 0, bitmap_video_thread, client, 0, NULL);
 	return client->video_thread != NULL;
 }
