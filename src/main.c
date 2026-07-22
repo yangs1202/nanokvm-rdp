@@ -635,7 +635,7 @@ static void print_usage(const char* executable)
 {
 	(void)fprintf(stderr,
 	              "Usage: %s [-listen host:port] [-cert file] [-key file] [-width n] [-height n] "
-	              "[-bitrate n]\\n",
+	              "[-bitrate n]\n",
 	              executable);
 }
 
@@ -714,7 +714,7 @@ int main(int argc, char* argv[])
 	}
 	(void)signal(SIGINT, on_signal);
 	(void)signal(SIGTERM, on_signal);
-	(void)fprintf(stderr, "%s: INFO: TLS RDP server listening on %s:%u\\n", TAG,
+	(void)fprintf(stderr, "%s: INFO: TLS RDP server listening on %s:%u\n", TAG,
 	              server.config.bind_address, server.config.port);
 
 	while (!stop_requested)
