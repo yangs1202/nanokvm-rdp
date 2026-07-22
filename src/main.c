@@ -116,6 +116,7 @@ struct Client
 	size_t pps_length;
 	bool bitmap_uses_rfx;
 	uint32_t bitmap_frames;
+	uint64_t bitmap_last_sent_at;
 	bool keyboard_input_logged;
 	bool pointer_input_logged;
 	bool wheel_input_logged;
@@ -620,8 +621,14 @@ sent_classic:
 static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t length)
 {
 	Client* client = context;
-	if (send_bitmap_frame(client, bgra, length))
+	const uint64_t now = monotonic_milliseconds();
+	if (client->bitmap_frames > 0 && now - client->bitmap_last_sent_at < 1000U)
 		return true;
+	if (send_bitmap_frame(client, bgra, length))
+	{
+		client->bitmap_last_sent_at = now;
+		return true;
+	}
 	log_message("ERROR", "RDP bitmap frame 전송 실패");
 	client_stop(client);
 	return false;
