@@ -214,6 +214,8 @@ int main(void)
 	(void)signal(SIGTERM, on_signal);
 	if (!load_kvm(&kvm) || !load_vdec(&vdec))
 		goto out;
+	kvm.init(0);
+	kvm.set_frame_detect(0);
 
 	VdecChannelAttr attr = { 0 };
 	attr.enType = 96; /* PT_H264 */
@@ -239,8 +241,6 @@ int main(void)
 		goto out;
 	}
 	receiving = true;
-	kvm.init(0);
-	kvm.set_frame_detect(0);
 	fprintf(stderr, "VDEC probe started: %ux%u for %u seconds\n", WIDTH, HEIGHT, PROBE_SECONDS);
 
 	while (!stop_requested && monotonic_milliseconds() < deadline)
