@@ -7,8 +7,6 @@ LOGFILE="$APP_DIR/nanokvm-rdp.log"
 CERT="$APP_DIR/cert.pem"
 KEY="$APP_DIR/key.pem"
 FOLDVNC_INIT=/etc/init.d/S99foldvnc
-BITMAP_WIDTH=960
-BITMAP_HEIGHT=540
 
 is_running() {
     [ -s "$PIDFILE" ] || return 1
@@ -36,7 +34,6 @@ start() {
     [ -x "$FOLDVNC_INIT" ] && "$FOLDVNC_INIT" start
     export LD_LIBRARY_PATH=/root/foldvnc/dl_lib:/kvmapp/server/dl_lib:/tmp/server/dl_lib
     nohup "$DAEMON" -listen 0.0.0.0:3389 -cert "$CERT" -key "$KEY" \
-        -width "$BITMAP_WIDTH" -height "$BITMAP_HEIGHT" \
         >> "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     sleep 1
