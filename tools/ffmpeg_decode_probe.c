@@ -8,8 +8,10 @@
 #include <stdlib.h>
 #include <time.h>
 
-#define WIDTH 1920U
-#define HEIGHT 1080U
+#define CAPTURE_WIDTH 1920U
+#define CAPTURE_HEIGHT 1080U
+#define OUTPUT_WIDTH 960U
+#define OUTPUT_HEIGHT 540U
 #define PROBE_SECONDS 12U
 
 typedef struct
@@ -37,10 +39,10 @@ static bool on_frame(void* context, const uint8_t* bgra, size_t length)
 {
 	ProbeState* state = context;
 	(void)bgra;
-	if (length != (size_t)WIDTH * HEIGHT * 4U)
+	if (length != (size_t)OUTPUT_WIDTH * OUTPUT_HEIGHT * 4U)
 		return false;
 	state->frames++;
-	fprintf(stderr, "decoded=%u raw_bgra=%ux%u\n", state->frames, WIDTH, HEIGHT);
+	fprintf(stderr, "decoded=%u raw_bgra=%ux%u\n", state->frames, OUTPUT_WIDTH, OUTPUT_HEIGHT);
 	return true;
 }
 
@@ -56,12 +58,12 @@ int main(void)
 	(void)signal(SIGINT, on_signal);
 	(void)signal(SIGTERM, on_signal);
 	(void)signal(SIGPIPE, SIG_IGN);
-	if (!foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, WIDTH, HEIGHT, 60) ||
-	    !ffmpeg_decoder_start(&decoder, WIDTH, HEIGHT, on_frame, &state))
+	if (!foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, CAPTURE_WIDTH, CAPTURE_HEIGHT, 60) ||
+	    !ffmpeg_decoder_start(&decoder, OUTPUT_WIDTH, OUTPUT_HEIGHT, on_frame, &state))
 		goto out;
 
-	fprintf(stderr, "FoldVNC ffmpeg decode probe started: %ux%u for %u seconds\n", WIDTH, HEIGHT,
-	        PROBE_SECONDS);
+	fprintf(stderr, "FoldVNC %ux%u → FFmpeg %ux%u decode probe started for %u seconds\n",
+	        CAPTURE_WIDTH, CAPTURE_HEIGHT, OUTPUT_WIDTH, OUTPUT_HEIGHT, PROBE_SECONDS);
 	while (!stop_requested && monotonic_milliseconds() < deadline)
 	{
 		uint8_t* data = NULL;
