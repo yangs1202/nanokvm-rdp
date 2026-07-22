@@ -96,6 +96,7 @@ struct Client
 	bool inflight;
 	bool need_idr;
 	uint64_t gfx_wait_started_at;
+	uint64_t gfx_opened_at;
 	uint32_t inflight_frame_id;
 	uint32_t next_frame_id;
 	uint64_t sent_at;
@@ -470,6 +471,17 @@ static BOOL on_extended_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	return on_mouse(input, flags, x, y);
 }
 
+static BOOL on_dvc_creation_status(void* userdata, UINT32 channel_id, INT32 creation_status)
+{
+	Client* client = (Client*)userdata;
+	(void)client;
+	char message[128] = { 0 };
+	(void)snprintf(message, sizeof(message), "RDP dynamic channel id=%u creation status=%d",
+	               channel_id, creation_status);
+	log_message(creation_status == 0 ? "INFO" : "ERROR", message);
+	return TRUE;
+}
+
 static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 {
 	Client* client = (Client*)context;
@@ -483,6 +495,7 @@ static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 	client->vcm = WTSOpenServerA((LPSTR)context);
 	if (!client->vcm || client->vcm == INVALID_HANDLE_VALUE)
 		goto fail;
+	WTSVirtualChannelManagerSetDVCCreationCallback(client->vcm, on_dvc_creation_status, client);
 
 	EnterCriticalSection(&server->lock);
 	if (server->active)
@@ -576,16 +589,22 @@ static bool client_process_dynamic_channels(Client* client)
 	if (!client->gfx->Open || !client->gfx->Open(client->gfx))
 		return false;
 	client->gfx_opened = true;
+	client->gfx_opened_at = monotonic_milliseconds();
 	log_message("INFO", "RDPGFX dynamic channel open 완료; AVC420 capability 대기 중");
 	return true;
 }
 
 static bool client_check_gfx_timeout(Client* client)
 {
-	if (client->gfx_wait_started_at == 0 || client->gfx_opened ||
-	    monotonic_milliseconds() - client->gfx_wait_started_at <= 5000)
+	if (client->gfx_wait_started_at == 0 || client->gfx_ready)
 		return true;
-	log_message("ERROR", "client가 5초 내 RDPGFX dynamic channel을 열지 않아 session을 종료합니다");
+	const uint64_t started_at = client->gfx_opened ? client->gfx_opened_at : client->gfx_wait_started_at;
+	if (monotonic_milliseconds() - started_at <= 5000)
+		return true;
+	if (client->gfx_opened)
+		log_message("ERROR", "client가 5초 내 RDPGFX AVC420 capability를 보내지 않아 session을 종료합니다");
+	else
+		log_message("ERROR", "client가 5초 내 RDPGFX dynamic channel을 열지 않아 session을 종료합니다");
 	return false;
 }
 
