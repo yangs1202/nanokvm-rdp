@@ -94,7 +94,9 @@ if(NANOKVM_RDP_BUILD_SERVER)
 
   add_executable(nanokvm-rdp-ffmpeg-decode-probe
     tools/ffmpeg_decode_probe.c
+    src/foldvnc_client.c
   )
+  target_include_directories(nanokvm-rdp-ffmpeg-decode-probe PRIVATE src)
   target_compile_options(nanokvm-rdp-ffmpeg-decode-probe PRIVATE -Wall -Wextra -Werror)
   target_link_libraries(nanokvm-rdp-ffmpeg-decode-probe PRIVATE dl)
 endif()

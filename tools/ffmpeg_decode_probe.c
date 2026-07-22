@@ -1,4 +1,5 @@
-#include <dlfcn.h>
+#include "foldvnc_client.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -15,27 +16,7 @@
 
 #define WIDTH 1920U
 #define HEIGHT 1080U
-#define BITRATE_KBPS 3000U
 #define PROBE_SECONDS 12U
-
-enum kvm_frame_kind
-{
-	KVM_FRAME_MJPEG = 0,
-	KVM_FRAME_SPS = 1,
-	KVM_FRAME_PPS = 2,
-	KVM_FRAME_IDR = 3,
-	KVM_FRAME_P = 4,
-};
-
-typedef struct
-{
-	void* handle;
-	void (*init)(uint8_t level);
-	int (*read_image)(uint16_t width, uint16_t height, uint8_t type, uint16_t quality,
-	                  uint8_t** data, uint32_t* length);
-	int (*free_data)(uint8_t** data);
-	void (*set_frame_detect)(uint8_t enabled);
-} KvmApi;
 
 typedef struct
 {
@@ -60,45 +41,6 @@ static uint64_t monotonic_milliseconds(void)
 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
 		return 0;
 	return ((uint64_t)now.tv_sec * 1000U) + ((uint64_t)now.tv_nsec / 1000000U);
-}
-
-static bool has_annexb_start_code(const uint8_t* data, size_t length)
-{
-	return length >= 3 && data[0] == 0 && data[1] == 0 &&
-	       (data[2] == 1 || (length >= 4 && data[2] == 0 && data[3] == 1));
-}
-
-static bool load_kvm(KvmApi* api)
-{
-	const char* paths[] = {
-		"/root/foldvnc/dl_lib/libkvm.so",
-		"/kvmapp/server/dl_lib/libkvm.so",
-		"/tmp/server/dl_lib/libkvm.so",
-		"libkvm.so",
-	};
-	for (size_t index = 0; index < sizeof(paths) / sizeof(paths[0]); index++)
-	{
-		api->handle = dlopen(paths[index], RTLD_NOW | RTLD_LOCAL);
-		if (api->handle)
-			break;
-	}
-	if (!api->handle)
-	{
-		fprintf(stderr, "cannot open libkvm.so: %s\n", dlerror());
-		return false;
-	}
-	*(void**)(&api->init) = dlsym(api->handle, "kvmv_init");
-	*(void**)(&api->read_image) = dlsym(api->handle, "kvmv_read_img");
-	*(void**)(&api->free_data) = dlsym(api->handle, "free_kvmv_data");
-	*(void**)(&api->set_frame_detect) = dlsym(api->handle, "set_frame_detact");
-	if (!api->init || !api->read_image || !api->free_data || !api->set_frame_detect)
-	{
-		fprintf(stderr, "libkvm.so is missing a required symbol\n");
-		dlclose(api->handle);
-		memset(api, 0, sizeof(*api));
-		return false;
-	}
-	return true;
 }
 
 static bool set_nonblocking(int fd)
@@ -234,7 +176,7 @@ static void decoder_stop(FfmpegDecoder* decoder)
 
 int main(void)
 {
-	KvmApi kvm = { 0 };
+	FoldVncClient foldvnc = { .fd = -1 };
 	FfmpegDecoder decoder = { .pid = -1, .input = -1, .output = -1 };
 	const uint64_t deadline = monotonic_milliseconds() + (PROBE_SECONDS * 1000U);
 	uint32_t submitted = 0;
@@ -243,52 +185,41 @@ int main(void)
 	(void)signal(SIGINT, on_signal);
 	(void)signal(SIGTERM, on_signal);
 	(void)signal(SIGPIPE, SIG_IGN);
-	if (!load_kvm(&kvm) || !decoder_start(&decoder))
+	if (!foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, WIDTH, HEIGHT, 60) ||
+	    !decoder_start(&decoder))
 		goto out;
 
-	kvm.init(0);
-	kvm.set_frame_detect(0);
-	fprintf(stderr, "ffmpeg decode probe started: %ux%u for %u seconds\n", WIDTH, HEIGHT,
+	fprintf(stderr, "FoldVNC ffmpeg decode probe started: %ux%u for %u seconds\n", WIDTH, HEIGHT,
 	        PROBE_SECONDS);
 	while (!stop_requested && monotonic_milliseconds() < deadline)
 	{
 		uint8_t* data = NULL;
-		uint32_t length = 0;
-		const int kind = kvm.read_image(WIDTH, HEIGHT, 1, BITRATE_KBPS, &data, &length);
-		if (kind < 0 || !data || length == 0)
+		size_t length = 0;
+		bool keyframe = false;
+		if (!foldvnc_client_read_video(&foldvnc, &data, &length, &keyframe) || !data || length == 0)
 		{
-			if (data)
-				(void)kvm.free_data(&data);
-			(void)decoder_drain(&decoder, 5);
-			continue;
+			fprintf(stderr, "FoldVNC video read failed\n");
+			goto out;
 		}
 
-		if (kind >= KVM_FRAME_SPS && kind <= KVM_FRAME_P)
+		if (!decoder_write(&decoder, data, length))
 		{
-			static const uint8_t annexb_prefix[] = { 0, 0, 0, 1 };
-			bool write_ok = true;
-			if (!has_annexb_start_code(data, length))
-				write_ok = decoder_write(&decoder, annexb_prefix, sizeof(annexb_prefix));
-			if (write_ok)
-				write_ok = decoder_write(&decoder, data, length);
-			if (!write_ok)
-			{
-				fprintf(stderr, "ffmpeg input pipe failed for H.264 frame kind=%d\n", kind);
-				(void)kvm.free_data(&data);
-				goto out;
-			}
-			submitted++;
+			fprintf(stderr, "ffmpeg input pipe failed for FoldVNC H.264 frame\n");
+			free(data);
+			goto out;
 		}
-		(void)kvm.free_data(&data);
+		if (keyframe)
+			fprintf(stderr, "FoldVNC keyframe submitted bytes=%zu\n", length);
+		submitted++;
+		free(data);
 		(void)decoder_drain(&decoder, 0);
 	}
-	fprintf(stderr, "ffmpeg decode probe complete: submitted=%u decoded=%u\n", submitted,
+	fprintf(stderr, "FoldVNC ffmpeg decode probe complete: submitted=%u decoded=%u\n", submitted,
 	        decoder.frames);
 	result = decoder.frames > 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 
 out:
 	decoder_stop(&decoder);
-	if (kvm.handle)
-		dlclose(kvm.handle);
+	foldvnc_client_close(&foldvnc);
 	return result;
 }
