@@ -647,10 +647,22 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 	const uint16_t capture_height = BITMAP_CAPTURE_HEIGHT;
 	const uint16_t width = client->server->config.width;
 	const uint16_t height = client->server->config.height;
+	bool backend_ready = false;
 
-	if (!foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, capture_width, capture_height,
-	                            BITMAP_CAPTURE_FPS) ||
-	    !ffmpeg_decoder_start(&decoder, width, height, on_decoded_bitmap_frame, client))
+	for (unsigned attempt = 0; attempt < 10 && !client_should_stop(client); attempt++)
+	{
+		if (foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, capture_width, capture_height,
+		                           BITMAP_CAPTURE_FPS) &&
+		    ffmpeg_decoder_start(&decoder, width, height, on_decoded_bitmap_frame, client))
+		{
+			backend_ready = true;
+			break;
+		}
+		ffmpeg_decoder_stop(&decoder);
+		foldvnc_client_close(&foldvnc);
+		Sleep(1000);
+	}
+	if (!backend_ready)
 	{
 		log_message("ERROR", "FoldVNC H.264 backend 또는 FFmpeg decoder를 시작할 수 없습니다");
 		client_stop(client);
