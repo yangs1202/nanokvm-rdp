@@ -93,6 +93,7 @@ struct Client
 	bool gfx_ready;
 	bool inflight;
 	bool need_idr;
+	uint64_t gfx_wait_started_at;
 	uint32_t inflight_frame_id;
 	uint32_t next_frame_id;
 	uint64_t sent_at;
@@ -526,27 +527,31 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	log_message("INFO", "RDP client 연결 종료 및 USB HID release 완료");
 }
 
-static BOOL peer_post_connect(freerdp_peer* peer)
+static bool client_initialize_gfx(Client* client)
 {
-	Client* client = (Client*)peer->context;
-	if (!WTSVirtualChannelManagerIsChannelJoined(client->vcm, "rdpgfx"))
-	{
-		log_message("ERROR", "client가 rdpgfx virtual channel을 열지 않아 session을 종료합니다");
-		return FALSE;
-	}
+	if (client->gfx)
+		return true;
 	client->gfx = rdpgfx_server_context_new(client->vcm);
 	if (!client->gfx)
-		return FALSE;
+		return false;
 	client->gfx->rdpcontext = &client->context;
 	client->gfx->custom = client;
 	client->gfx->CapsAdvertise = on_gfx_caps_advertise;
 	client->gfx->FrameAcknowledge = on_gfx_frame_ack;
 	if (!client->gfx->Initialize || !client->gfx->Initialize(client->gfx, FALSE))
-		return FALSE;
+		return false;
 	client->video_thread = CreateThread(NULL, 0, video_thread, client, 0, NULL);
 	if (!client->video_thread)
-		return FALSE;
-	log_message("INFO", "RDP session activation 완료; AVC420 capability 대기 중");
+		return false;
+	log_message("INFO", "RDPGFX dynamic channel 연결 완료; AVC420 capability 대기 중");
+	return true;
+}
+
+static BOOL peer_post_connect(freerdp_peer* peer)
+{
+	Client* client = (Client*)peer->context;
+	client->gfx_wait_started_at = monotonic_milliseconds();
+	log_message("INFO", "RDP session activation 완료; RDPGFX dynamic channel 대기 중");
 	return TRUE;
 }
 
@@ -611,6 +616,18 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		if (!peer->CheckFileDescriptor(peer) ||
 		    !WTSVirtualChannelManagerCheckFileDescriptor(client->vcm))
 			break;
+		if (client->gfx_wait_started_at > 0 && !client->gfx &&
+		    WTSVirtualChannelManagerIsChannelJoined(client->vcm, "rdpgfx"))
+		{
+			if (!client_initialize_gfx(client))
+				break;
+		}
+		if (client->gfx_wait_started_at > 0 && !client->gfx &&
+		    monotonic_milliseconds() - client->gfx_wait_started_at > 5000)
+		{
+			log_message("ERROR", "client가 5초 내 rdpgfx virtual channel을 열지 않아 session을 종료합니다");
+			break;
+		}
 	}
 out:
 	if (peer->Disconnect)
