@@ -73,6 +73,8 @@ if(NANOKVM_RDP_BUILD_SERVER)
 
   add_executable(nanokvm-rdp
     src/main.c
+    src/ffmpeg_decoder.c
+    src/foldvnc_client.c
     src/hid.c
     src/h264.c
   )

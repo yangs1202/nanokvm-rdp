@@ -1,3 +1,5 @@
+#include "ffmpeg_decoder.h"
+#include "foldvnc_client.h"
 #include "h264.h"
 #include "hid.h"
 
@@ -6,18 +8,22 @@
 #include <freerdp/channels/rdpgfx.h>
 #include <freerdp/channels/wtsvc.h>
 #include <freerdp/codec/color.h>
+#include <freerdp/codec/nsc.h>
+#include <freerdp/codec/rfx.h>
 #include <freerdp/freerdp.h>
 #include <freerdp/input.h>
 #include <freerdp/listener.h>
 #include <freerdp/peer.h>
 #include <freerdp/server/rdpgfx.h>
 #include <freerdp/settings.h>
+#include <freerdp/update.h>
 
 #include <winpr/crt.h>
 #include <winpr/ssl.h>
 #include <winpr/sysinfo.h>
 #include <winpr/synch.h>
 #include <winpr/thread.h>
+#include <winpr/stream.h>
 #include <winpr/wtsapi.h>
 #include <winpr/winsock.h>
 
@@ -67,6 +73,7 @@ typedef struct
 	uint16_t width;
 	uint16_t height;
 	uint16_t bitrate;
+	bool direct_gfx;
 } ServerConfig;
 
 typedef struct Server Server;
@@ -88,6 +95,9 @@ struct Client
 	HANDLE vcm;
 	RdpgfxServerContext* gfx;
 	HANDLE video_thread;
+	RFX_CONTEXT* rfx;
+	NSC_CONTEXT* nsc;
+	wStream* bitmap_stream;
 	CRITICAL_SECTION lock;
 	HidState hid;
 	bool stopping;
@@ -104,6 +114,8 @@ struct Client
 	size_t sps_length;
 	uint8_t* pps;
 	size_t pps_length;
+	bool bitmap_uses_rfx;
+	uint32_t bitmap_frames;
 };
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -440,6 +452,139 @@ static DWORD WINAPI video_thread(LPVOID argument)
 	return 0;
 }
 
+static bool bitmap_stream_rfx_supported(const rdpSettings* settings)
+{
+	const uint32_t supported =
+	    freerdp_settings_get_uint32(settings, FreeRDP_SurfaceCommandsSupported);
+	return freerdp_settings_get_bool(settings, FreeRDP_RemoteFxCodec) &&
+	       freerdp_settings_get_uint32(settings, FreeRDP_RemoteFxCodecId) != 0 &&
+	       (supported & SURFCMDS_STREAM_SURFACE_BITS) != 0;
+}
+
+static bool bitmap_stream_nsc_supported(const rdpSettings* settings)
+{
+	const uint32_t supported =
+	    freerdp_settings_get_uint32(settings, FreeRDP_SurfaceCommandsSupported);
+	return freerdp_settings_get_bool(settings, FreeRDP_NSCodec) &&
+	       freerdp_settings_get_uint32(settings, FreeRDP_NSCodecId) != 0 &&
+	       (supported & SURFCMDS_SET_SURFACE_BITS) != 0;
+}
+
+static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
+{
+	const uint16_t width = client->server->config.width;
+	const uint16_t height = client->server->config.height;
+	const size_t expected_length = (size_t)width * height * 4U;
+	rdpSettings* settings = client->context.settings;
+	rdpUpdate* update = client->context.update;
+	SURFACE_BITS_COMMAND command = WINPR_C_ARRAY_INIT;
+	RFX_RECT rect = { .x = 0, .y = 0, .width = width, .height = height };
+
+	if (!settings || !update || !update->SurfaceBits || !client->bitmap_stream ||
+	    length != expected_length || client_should_stop(client))
+		return false;
+	Stream_Clear(client->bitmap_stream);
+	Stream_ResetPosition(client->bitmap_stream);
+	if (client->bitmap_uses_rfx)
+	{
+		if (!client->rfx || !bitmap_stream_rfx_supported(settings))
+			return false;
+		rfx_context_set_pixel_format(client->rfx, PIXEL_FORMAT_BGRX32);
+		if (!rfx_compose_message(client->rfx, client->bitmap_stream, &rect, 1, bgra, width, height,
+		                         (uint32_t)width * 4U))
+			return false;
+		command.cmdType = CMDTYPE_STREAM_SURFACE_BITS;
+		command.bmp.codecID =
+		    WINPR_ASSERTING_INT_CAST(uint16_t,
+		                             freerdp_settings_get_uint32(settings, FreeRDP_RemoteFxCodecId));
+	}
+	else
+	{
+		if (!client->nsc || !bitmap_stream_nsc_supported(settings))
+			return false;
+		if (!nsc_context_set_parameters(client->nsc, NSC_COLOR_FORMAT, PIXEL_FORMAT_BGRX32) ||
+		    !nsc_compose_message(client->nsc, client->bitmap_stream, bgra, width, height,
+		                         (uint32_t)width * 4U))
+			return false;
+		command.cmdType = CMDTYPE_SET_SURFACE_BITS;
+		command.bmp.codecID =
+		    WINPR_ASSERTING_INT_CAST(uint16_t,
+		                             freerdp_settings_get_uint32(settings, FreeRDP_NSCodecId));
+	}
+	command.destLeft = 0;
+	command.destTop = 0;
+	command.destRight = width;
+	command.destBottom = height;
+	command.bmp.bpp = 32;
+	command.bmp.flags = 0;
+	command.bmp.width = width;
+	command.bmp.height = height;
+	command.bmp.bitmapDataLength =
+	    WINPR_ASSERTING_INT_CAST(uint32_t, Stream_GetPosition(client->bitmap_stream));
+	command.bmp.bitmapData = Stream_Buffer(client->bitmap_stream);
+	if (!update->SurfaceBits(&client->context, &command))
+		return false;
+	client->bitmap_frames++;
+	if (client->bitmap_frames == 1)
+		log_message("INFO", "FoldVNC H.264 → FFmpeg BGRA → RDP bitmap 첫 frame 전송 완료");
+	return true;
+}
+
+static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t length)
+{
+	Client* client = context;
+	if (send_bitmap_frame(client, bgra, length))
+		return true;
+	log_message("ERROR", "RDP bitmap frame 전송 실패");
+	client_stop(client);
+	return false;
+}
+
+static DWORD WINAPI bitmap_video_thread(LPVOID argument)
+{
+	Client* client = (Client*)argument;
+	FoldVncClient foldvnc = { .fd = -1 };
+	FfmpegDecoder decoder = { .pid = -1, .input = -1, .output = -1 };
+	const uint16_t width = client->server->config.width;
+	const uint16_t height = client->server->config.height;
+
+	if (!foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, width, height, 60) ||
+	    !ffmpeg_decoder_start(&decoder, width, height, on_decoded_bitmap_frame, client))
+	{
+		log_message("ERROR", "FoldVNC H.264 backend 또는 FFmpeg decoder를 시작할 수 없습니다");
+		client_stop(client);
+		goto out;
+	}
+	log_message("INFO", "FoldVNC H.264 backend와 FFmpeg BGRA decoder 시작 완료");
+	while (!client_should_stop(client))
+	{
+		uint8_t* data = NULL;
+		size_t length = 0;
+		bool keyframe = false;
+		if (!foldvnc_client_read_video(&foldvnc, &data, &length, &keyframe) || !data || length == 0)
+		{
+			log_message("ERROR", "FoldVNC H.264 frame 수신 실패");
+			client_stop(client);
+			break;
+		}
+		const bool pushed = ffmpeg_decoder_push(&decoder, data, length);
+		free(data);
+		if (!pushed)
+		{
+			log_message("ERROR", "FFmpeg H.264 decoder 입력 실패");
+			client_stop(client);
+			break;
+		}
+		if (keyframe)
+			log_message("INFO", "FoldVNC H.264 keyframe 동기화 완료");
+	}
+
+out:
+	ffmpeg_decoder_stop(&decoder);
+	foldvnc_client_close(&foldvnc);
+	return 0;
+}
+
 static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 {
 	Client* client = (Client*)input->context;
@@ -492,10 +637,13 @@ static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 	client->peer = peer;
 	client->need_idr = true;
 	hid_init(&client->hid, server->config.keyboard, server->config.mouse, server->config.touch);
-	client->vcm = WTSOpenServerA((LPSTR)context);
-	if (!client->vcm || client->vcm == INVALID_HANDLE_VALUE)
-		goto fail;
-	WTSVirtualChannelManagerSetDVCCreationCallback(client->vcm, on_dvc_creation_status, client);
+	if (server->config.direct_gfx)
+	{
+		client->vcm = WTSOpenServerA((LPSTR)context);
+		if (!client->vcm || client->vcm == INVALID_HANDLE_VALUE)
+			goto fail;
+		WTSVirtualChannelManagerSetDVCCreationCallback(client->vcm, on_dvc_creation_status, client);
+	}
 
 	EnterCriticalSection(&server->lock);
 	if (server->active)
@@ -527,6 +675,12 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	}
 	if (client->gfx)
 		rdpgfx_server_context_free(client->gfx);
+	if (client->rfx)
+		rfx_context_free(client->rfx);
+	if (client->nsc)
+		nsc_context_free(client->nsc);
+	if (client->bitmap_stream)
+		Stream_Free(client->bitmap_stream, TRUE);
 	if (client->vcm && client->vcm != INVALID_HANDLE_VALUE)
 		WTSCloseServer(client->vcm);
 	hid_release_all(&client->hid);
@@ -562,13 +716,54 @@ static bool client_prepare_gfx(Client* client)
 	return true;
 }
 
+static bool client_prepare_bitmap(Client* client)
+{
+	const rdpSettings* settings = client->context.settings;
+	if (!settings)
+		return false;
+	client->bitmap_uses_rfx = bitmap_stream_rfx_supported(settings);
+	if (!client->bitmap_uses_rfx && !bitmap_stream_nsc_supported(settings))
+	{
+		log_message("ERROR", "client가 RDP RemoteFX/NSCodec bitmap을 지원하지 않습니다");
+		return false;
+	}
+	if (client->bitmap_uses_rfx)
+	{
+		client->rfx = rfx_context_new_ex(
+		    TRUE, freerdp_settings_get_uint32(settings, FreeRDP_ThreadingFlags));
+		if (!client->rfx || !rfx_context_reset(client->rfx, client->server->config.width,
+		                                      client->server->config.height))
+			return false;
+	}
+	else
+	{
+		client->nsc = nsc_context_new();
+		if (!client->nsc)
+			return false;
+	}
+	client->bitmap_stream = Stream_New(NULL, 65536);
+	if (!client->bitmap_stream)
+		return false;
+	client->video_thread = CreateThread(NULL, 0, bitmap_video_thread, client, 0, NULL);
+	return client->video_thread != NULL;
+}
+
 static BOOL peer_post_connect(freerdp_peer* peer)
 {
 	Client* client = (Client*)peer->context;
-	if (!client_prepare_gfx(client))
-		return FALSE;
-	client->gfx_wait_started_at = monotonic_milliseconds();
-	log_message("INFO", "RDP session activation 완료; RDPGFX dynamic channel open 대기 중");
+	if (client->server->config.direct_gfx)
+	{
+		if (!client_prepare_gfx(client))
+			return FALSE;
+		client->gfx_wait_started_at = monotonic_milliseconds();
+		log_message("INFO", "RDP session activation 완료; RDPGFX dynamic channel open 대기 중");
+	}
+	else
+	{
+		if (!client_prepare_bitmap(client))
+			return FALSE;
+		log_message("INFO", "RDP session activation 완료; FoldVNC bitmap backend 시작");
+	}
 	return TRUE;
 }
 
@@ -626,10 +821,16 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 	    !freerdp_settings_set_bool(settings, FreeRDP_RdpSecurity, FALSE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_TlsSecurity, TRUE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_NlaSecurity, FALSE) ||
-	    !freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE) ||
-	    !freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE) ||
-	    !freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled, TRUE) ||
-	    !freerdp_settings_set_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled, TRUE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline,
+	                               server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_GfxH264, server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec,
+	                               !server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_NSCodec, !server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled,
+	                               server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled,
+	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_HasRelativeMouseEvent, TRUE) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, server->config.width) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, server->config.height) ||
@@ -660,11 +861,13 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		DWORD count = peer->GetEventHandles(peer, handles, ARRAYSIZE(handles));
 		if (count == 0 || count >= ARRAYSIZE(handles))
 			break;
-		handles[count++] = WTSVirtualChannelManagerGetEventHandle(client->vcm);
+		if (server->config.direct_gfx)
+			handles[count++] = WTSVirtualChannelManagerGetEventHandle(client->vcm);
 		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, 100);
 		if (status == WAIT_TIMEOUT)
 		{
-			if (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client))
+			if (server->config.direct_gfx &&
+			    (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client)))
 				break;
 			continue;
 		}
@@ -672,7 +875,8 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 			break;
 		if (!peer->CheckFileDescriptor(peer))
 			break;
-		if (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client))
+		if (server->config.direct_gfx &&
+		    (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client)))
 			break;
 	}
 out:
@@ -698,7 +902,7 @@ static void print_usage(const char* executable)
 {
 	(void)fprintf(stderr,
 	              "Usage: %s [-listen host:port] [-cert file] [-key file] [-width n] [-height n] "
-	              "[-bitrate n]\n",
+	              "[-bitrate n] [-direct-gfx]\n",
 	              executable);
 }
 
@@ -749,6 +953,8 @@ int main(int argc, char* argv[])
 			server.config.height = (uint16_t)strtoul(argv[++index], NULL, 10);
 		else if (strcmp(argv[index], "-bitrate") == 0 && index + 1 < argc)
 			server.config.bitrate = (uint16_t)strtoul(argv[++index], NULL, 10);
+		else if (strcmp(argv[index], "-direct-gfx") == 0)
+			server.config.direct_gfx = true;
 		else
 		{
 			print_usage(argv[0]);
