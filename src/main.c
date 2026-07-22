@@ -116,6 +116,9 @@ struct Client
 	size_t pps_length;
 	bool bitmap_uses_rfx;
 	uint32_t bitmap_frames;
+	bool keyboard_input_logged;
+	bool pointer_input_logged;
+	bool wheel_input_logged;
 };
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -672,8 +675,14 @@ out:
 static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 {
 	Client* client = (Client*)input->context;
-	return hid_scancode(&client->hid, code, (flags & KBD_FLAGS_EXTENDED) != 0,
-	                     (flags & KBD_FLAGS_RELEASE) != 0);
+	const bool sent = hid_scancode(&client->hid, code, (flags & KBD_FLAGS_EXTENDED) != 0,
+	                               (flags & KBD_FLAGS_RELEASE) != 0);
+	if (sent && !client->keyboard_input_logged)
+	{
+		log_message("INFO", "RDP keyboard scancode → USB HID keyboard report 전달 확인");
+		client->keyboard_input_logged = true;
+	}
+	return sent;
 }
 
 static BOOL on_unicode_keyboard(rdpInput* input, UINT16 flags, UINT16 code)
@@ -692,6 +701,17 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	const uint32_t height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
 	const bool position_ok = hid_absolute(&client->hid, x, y, width, height, flags);
 	const bool wheel_ok = hid_wheel(&client->hid, flags);
+	if (position_ok && !client->pointer_input_logged)
+	{
+		log_message("INFO", "RDP absolute pointer → USB HID touch report 전달 확인");
+		client->pointer_input_logged = true;
+	}
+	if (wheel_ok && (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) != 0 &&
+	    !client->wheel_input_logged)
+	{
+		log_message("INFO", "RDP wheel → USB HID mouse report 전달 확인");
+		client->wheel_input_logged = true;
+	}
 	return position_ok && wheel_ok;
 }
 
