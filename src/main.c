@@ -41,6 +41,8 @@
 #define DEFAULT_HEIGHT 1080U
 #define DEFAULT_BITRATE 3000U
 #define MAX_EVENT_HANDLES 32U
+#define BITMAP_CAPTURE_FPS 10U
+#define BITMAP_MIN_INTERVAL_MS 2000U
 
 enum kvm_frame_kind
 {
@@ -622,7 +624,7 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 {
 	Client* client = context;
 	const uint64_t now = monotonic_milliseconds();
-	if (client->bitmap_frames > 0 && now - client->bitmap_last_sent_at < 1000U)
+	if (client->bitmap_frames > 0 && now - client->bitmap_last_sent_at < BITMAP_MIN_INTERVAL_MS)
 		return true;
 	if (send_bitmap_frame(client, bgra, length))
 	{
@@ -644,7 +646,8 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 	const uint16_t width = client->server->config.width;
 	const uint16_t height = client->server->config.height;
 
-	if (!foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, capture_width, capture_height, 60) ||
+	if (!foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, capture_width, capture_height,
+	                            BITMAP_CAPTURE_FPS) ||
 	    !ffmpeg_decoder_start(&decoder, width, height, on_decoded_bitmap_frame, client))
 	{
 		log_message("ERROR", "FoldVNC H.264 backend 또는 FFmpeg decoder를 시작할 수 없습니다");
