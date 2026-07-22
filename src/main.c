@@ -145,6 +145,7 @@ static bool kvm_load(KvmApi* api)
 	if (api->handle)
 		return true;
 	const char* candidates[] = {
+		"/root/foldvnc/dl_lib/libkvm.so",
 		"/kvmapp/server/dl_lib/libkvm.so",
 		"/tmp/server/dl_lib/libkvm.so",
 		"libkvm.so",
