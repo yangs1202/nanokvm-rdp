@@ -2,6 +2,7 @@
 #include "hid.h"
 
 #include <freerdp/channels/channels.h>
+#include <freerdp/channels/drdynvc.h>
 #include <freerdp/channels/rdpgfx.h>
 #include <freerdp/channels/wtsvc.h>
 #include <freerdp/codec/color.h>
@@ -91,6 +92,7 @@ struct Client
 	HidState hid;
 	bool stopping;
 	bool gfx_ready;
+	bool gfx_opened;
 	bool inflight;
 	bool need_idr;
 	uint64_t gfx_wait_started_at;
@@ -527,7 +529,7 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	log_message("INFO", "RDP client 연결 종료 및 USB HID release 완료");
 }
 
-static bool client_initialize_gfx(Client* client)
+static bool client_prepare_gfx(Client* client)
 {
 	if (client->gfx)
 		return true;
@@ -543,15 +545,16 @@ static bool client_initialize_gfx(Client* client)
 	client->video_thread = CreateThread(NULL, 0, video_thread, client, 0, NULL);
 	if (!client->video_thread)
 		return false;
-	log_message("INFO", "RDPGFX dynamic channel 연결 완료; AVC420 capability 대기 중");
 	return true;
 }
 
 static BOOL peer_post_connect(freerdp_peer* peer)
 {
 	Client* client = (Client*)peer->context;
+	if (!client_prepare_gfx(client))
+		return FALSE;
 	client->gfx_wait_started_at = monotonic_milliseconds();
-	log_message("INFO", "RDP session activation 완료; RDPGFX dynamic channel 대기 중");
+	log_message("INFO", "RDP session activation 완료; RDPGFX dynamic channel open 대기 중");
 	return TRUE;
 }
 
@@ -616,16 +619,19 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		if (!peer->CheckFileDescriptor(peer) ||
 		    !WTSVirtualChannelManagerCheckFileDescriptor(client->vcm))
 			break;
-		if (client->gfx_wait_started_at > 0 && !client->gfx &&
-		    WTSVirtualChannelManagerIsChannelJoined(client->vcm, "rdpgfx"))
+		if (client->gfx_wait_started_at > 0 && client->gfx && !client->gfx_opened &&
+		    WTSVirtualChannelManagerIsChannelJoined(client->vcm, DRDYNVC_SVC_CHANNEL_NAME) &&
+		    WTSVirtualChannelManagerGetDrdynvcState(client->vcm) == DRDYNVC_STATE_READY)
 		{
-			if (!client_initialize_gfx(client))
+			if (!client->gfx->Open || !client->gfx->Open(client->gfx))
 				break;
+			client->gfx_opened = true;
+			log_message("INFO", "RDPGFX dynamic channel open 완료; AVC420 capability 대기 중");
 		}
-		if (client->gfx_wait_started_at > 0 && !client->gfx &&
+		if (client->gfx_wait_started_at > 0 && !client->gfx_opened &&
 		    monotonic_milliseconds() - client->gfx_wait_started_at > 5000)
 		{
-			log_message("ERROR", "client가 5초 내 rdpgfx virtual channel을 열지 않아 session을 종료합니다");
+			log_message("ERROR", "client가 5초 내 RDPGFX dynamic channel을 열지 않아 session을 종료합니다");
 			break;
 		}
 	}
