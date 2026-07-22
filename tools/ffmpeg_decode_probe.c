@@ -53,7 +53,6 @@ int main(void)
 	ProbeState state = { 0 };
 	const uint64_t deadline = monotonic_milliseconds() + (PROBE_SECONDS * 1000U);
 	uint32_t submitted = 0;
-	unsigned frames_after_keyframe = 0;
 	int result = EXIT_FAILURE;
 
 	(void)signal(SIGINT, on_signal);
@@ -75,15 +74,6 @@ int main(void)
 			fprintf(stderr, "FoldVNC video read failed\n");
 			goto out;
 		}
-		if (keyframe)
-			frames_after_keyframe = 1;
-		else if (frames_after_keyframe == 0)
-		{
-			free(data);
-			continue;
-		}
-		else
-			frames_after_keyframe--;
 		if (!ffmpeg_decoder_push(&decoder, data, length))
 		{
 			fprintf(stderr, "ffmpeg input pipe failed for FoldVNC H.264 frame\n");
