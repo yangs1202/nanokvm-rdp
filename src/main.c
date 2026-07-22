@@ -559,6 +559,36 @@ static BOOL peer_post_connect(freerdp_peer* peer)
 	return TRUE;
 }
 
+static bool client_process_dynamic_channels(Client* client)
+{
+	if (client->gfx_wait_started_at == 0 ||
+	    !WTSVirtualChannelManagerIsChannelJoined(client->vcm, DRDYNVC_SVC_CHANNEL_NAME))
+		return true;
+
+	/* This only flushes the VCM's local queue; it does not read the peer transport. */
+	if (!WTSVirtualChannelManagerCheckFileDescriptor(client->vcm))
+		return false;
+
+	if (!client->gfx || client->gfx_opened ||
+	    WTSVirtualChannelManagerGetDrdynvcState(client->vcm) != DRDYNVC_STATE_READY)
+		return true;
+
+	if (!client->gfx->Open || !client->gfx->Open(client->gfx))
+		return false;
+	client->gfx_opened = true;
+	log_message("INFO", "RDPGFX dynamic channel open 완료; AVC420 capability 대기 중");
+	return true;
+}
+
+static bool client_check_gfx_timeout(Client* client)
+{
+	if (client->gfx_wait_started_at == 0 || client->gfx_opened ||
+	    monotonic_milliseconds() - client->gfx_wait_started_at <= 5000)
+		return true;
+	log_message("ERROR", "client가 5초 내 RDPGFX dynamic channel을 열지 않아 session을 종료합니다");
+	return false;
+}
+
 static bool configure_peer(freerdp_peer* peer, Server* server)
 {
 	peer->ContextSize = sizeof(Client);
@@ -614,27 +644,17 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		handles[count++] = WTSVirtualChannelManagerGetEventHandle(client->vcm);
 		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, 100);
 		if (status == WAIT_TIMEOUT)
+		{
+			if (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client))
+				break;
 			continue;
+		}
 		if (status == WAIT_FAILED)
 			break;
-		if (!peer->CheckFileDescriptor(peer) ||
-		    !WTSVirtualChannelManagerCheckFileDescriptor(client->vcm))
+		if (!peer->CheckFileDescriptor(peer))
 			break;
-		if (client->gfx_wait_started_at > 0 && client->gfx && !client->gfx_opened &&
-		    WTSVirtualChannelManagerIsChannelJoined(client->vcm, DRDYNVC_SVC_CHANNEL_NAME) &&
-		    WTSVirtualChannelManagerGetDrdynvcState(client->vcm) == DRDYNVC_STATE_READY)
-		{
-			if (!client->gfx->Open || !client->gfx->Open(client->gfx))
-				break;
-			client->gfx_opened = true;
-			log_message("INFO", "RDPGFX dynamic channel open 완료; AVC420 capability 대기 중");
-		}
-		if (client->gfx_wait_started_at > 0 && !client->gfx_opened &&
-		    monotonic_milliseconds() - client->gfx_wait_started_at > 5000)
-		{
-			log_message("ERROR", "client가 5초 내 RDPGFX dynamic channel을 열지 않아 session을 종료합니다");
+		if (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client))
 			break;
-		}
 	}
 out:
 	if (peer->Disconnect)
