@@ -91,4 +91,10 @@ if(NANOKVM_RDP_BUILD_SERVER)
   )
   target_compile_options(nanokvm-rdp-vdec-probe PRIVATE -Wall -Wextra -Werror)
   target_link_libraries(nanokvm-rdp-vdec-probe PRIVATE dl)
+
+  add_executable(nanokvm-rdp-ffmpeg-decode-probe
+    tools/ffmpeg_decode_probe.c
+  )
+  target_compile_options(nanokvm-rdp-ffmpeg-decode-probe PRIVATE -Wall -Wextra -Werror)
+  target_link_libraries(nanokvm-rdp-ffmpeg-decode-probe PRIVATE dl)
 endif()
