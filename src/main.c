@@ -178,6 +178,8 @@ static bool server_set_stream_requested(Server* server, bool requested)
 		                     requested ? NANOKVM_CONTROL_START_STREAM : NANOKVM_CONTROL_STOP_STREAM,
 		                     NULL, 0);
 	LeaveCriticalSection(&server->control_lock);
+	log_message(sent ? "INFO" : "ERROR", requested ? "NanoKVM agent에 START_STREAM 전송"
+	                                                : "NanoKVM agent에 STOP_STREAM 전송");
 	return sent;
 }
 

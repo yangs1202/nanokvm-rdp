@@ -213,10 +213,13 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 		case NANOKVM_CONTROL_START_STREAM:
 			agent->streaming = true;
 			agent->wait_for_idr = true;
+			(void)fprintf(stderr, "%s: START_STREAM 수신 (%ux%u 원본 H.264 전송 시작)\n", TAG,
+			              agent->width, agent->height);
 			break;
 		case NANOKVM_CONTROL_STOP_STREAM:
 			agent->streaming = false;
 			hid_release_all(&agent->hid);
+			(void)fprintf(stderr, "%s: STOP_STREAM 수신\n", TAG);
 			break;
 		case NANOKVM_CONTROL_IDR_REQUEST:
 			agent->wait_for_idr = true;
