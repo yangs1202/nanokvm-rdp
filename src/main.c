@@ -824,7 +824,17 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 			break;
 		}
 		client->last_rtp_received_at = monotonic_milliseconds();
-		const bool pushed = ffmpeg_decoder_push(&decoder, data, length);
+		const size_t annexb_length = h264_annexb_size(data, length);
+		uint8_t* annexb = malloc(annexb_length);
+		if (!annexb)
+		{
+			free(data);
+			client_stop(client);
+			break;
+		}
+		(void)h264_copy_annexb(annexb, data, length);
+		const bool pushed = ffmpeg_decoder_push(&decoder, annexb, annexb_length);
+		free(annexb);
 		free(data);
 		if (!pushed)
 		{
