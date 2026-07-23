@@ -10,13 +10,20 @@ VIDEO_PORT=5004
 WIDTH=1920
 HEIGHT=1080
 BITRATE=3000
-LEGACY_INIT=/etc/init.d/S100nanokvm-rdp
-FOLDVNC_INIT=/etc/init.d/S99foldvnc
+STOCK_KVM_INIT=/kvmapp/system/init.d/S95nanokvm
+LEGACY_PIDFILE="$APP_DIR/nanokvm-rdp.pid"
 
 is_running() {
     [ -s "$PIDFILE" ] || return 1
     pid="$(cat "$PIDFILE" 2>/dev/null || true)"
     [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+stop_legacy_rdp() {
+    [ -s "$LEGACY_PIDFILE" ] || return 0
+    pid="$(cat "$LEGACY_PIDFILE" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    rm -f "$LEGACY_PIDFILE"
 }
 
 start() {
@@ -26,8 +33,8 @@ start() {
         echo "OK (already running pid $(cat "$PIDFILE"))"
         return 0
     fi
-    [ -x "$LEGACY_INIT" ] && "$LEGACY_INIT" stop
-    [ -x "$FOLDVNC_INIT" ] && "$FOLDVNC_INIT" stop
+    stop_legacy_rdp
+    [ -x "$STOCK_KVM_INIT" ] && "$STOCK_KVM_INIT" stop
     export LD_LIBRARY_PATH=/kvmapp/server/dl_lib:/tmp/server/dl_lib
     nohup "$DAEMON" -gateway "$GATEWAY" -control-port "$CONTROL_PORT" -video-port "$VIDEO_PORT" \
         -width "$WIDTH" -height "$HEIGHT" -bitrate "$BITRATE" >> "$LOGFILE" 2>&1 &
@@ -47,7 +54,6 @@ stop() {
     is_running && kill -9 "$(cat "$PIDFILE")" 2>/dev/null || true
     rm -f "$PIDFILE"
     echo OK
-    [ -x "$LEGACY_INIT" ] && "$LEGACY_INIT" start
 }
 
 case "$1" in

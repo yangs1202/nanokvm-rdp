@@ -37,6 +37,7 @@ typedef struct
 	                  uint8_t** data, uint32_t* length);
 	int (*free_data)(uint8_t** data);
 	void (*set_frame_detect)(uint8_t enabled);
+	void (*deinit)(void);
 } KvmApi;
 
 typedef struct
@@ -97,7 +98,8 @@ static bool kvm_load(KvmApi* api)
 	*(void**)(&api->read_image) = dlsym(api->handle, "kvmv_read_img");
 	*(void**)(&api->free_data) = dlsym(api->handle, "free_kvmv_data");
 	*(void**)(&api->set_frame_detect) = dlsym(api->handle, "set_frame_detact");
-	if (!api->init || !api->read_image || !api->free_data || !api->set_frame_detect)
+	*(void**)(&api->deinit) = dlsym(api->handle, "kvmv_deinit");
+	if (!api->init || !api->read_image || !api->free_data || !api->set_frame_detect || !api->deinit)
 		return false;
 	api->init(0);
 	api->set_frame_detect(0);
@@ -379,5 +381,8 @@ int main(int argc, char* argv[])
 		(void)close(agent.control_fd);
 	if (agent.video_fd >= 0)
 		(void)close(agent.video_fd);
+	agent.kvm.deinit();
+	if (agent.kvm.handle)
+		(void)dlclose(agent.kvm.handle);
 	return 0;
 }
