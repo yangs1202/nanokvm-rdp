@@ -146,6 +146,8 @@ struct Client
 	uint16_t render_width;
 	uint16_t render_height;
 	uint32_t bitmap_frames;
+	uint32_t decoded_frames;
+	uint32_t rtp_nals;
 	uint64_t bitmap_last_sent_at;
 	bool keyboard_input_logged;
 	bool pointer_input_logged;
@@ -303,7 +305,9 @@ static void server_heartbeat(Server* server)
 	struct rusage usage = { 0 };
 	if (getrusage(RUSAGE_SELF, &usage) == 0)
 	{
-		uint32_t bitmap_frames = 0;
+	uint32_t bitmap_frames = 0;
+		uint32_t decoded_frames = 0;
+		uint32_t rtp_nals = 0;
 		bool bitmap_pending = false;
 		EnterCriticalSection(&server->lock);
 		Client* active = server->active;
@@ -311,16 +315,18 @@ static void server_heartbeat(Server* server)
 		{
 			EnterCriticalSection(&active->lock);
 			bitmap_frames = active->bitmap_frames;
+			decoded_frames = active->decoded_frames;
+			rtp_nals = active->rtp_nals;
 			bitmap_pending = active->bitmap_pending;
 			LeaveCriticalSection(&active->lock);
 		}
 		LeaveCriticalSection(&server->lock);
 		char message[256] = { 0 };
 		(void)snprintf(message, sizeof(message),
-		               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rdp_frames=%u queue=%u gateway_rss=%ld latency_ms=%llu",
+		               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u decoded=%u rdp_frames=%u queue=%u gateway_rss=%ld latency_ms=%llu",
 		               server->agent_sent_packets, server->agent_dropped_packets,
 		               server->agent_capture_frames, server->agent_dropped_frames,
-		               bitmap_frames, bitmap_pending ? 1U : 0U,
+		               rtp_nals, decoded_frames, bitmap_frames, bitmap_pending ? 1U : 0U,
 		               usage.ru_maxrss, (unsigned long long)(server->active ?
 		               server->active->last_decode_latency_ms : 0));
 		log_message("INFO", message);
@@ -787,6 +793,7 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 	const size_t expected_length = (size_t)client->render_width * client->render_height * 4U;
 	if (length != expected_length || client_should_stop(client))
 		return false;
+	client->decoded_frames++;
 	EnterCriticalSection(&client->lock);
 	if (client->bitmap_last_queued_at != 0 &&
 	    now - client->bitmap_last_queued_at < BITMAP_MIN_INTERVAL_MS)
@@ -874,6 +881,7 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 			break;
 		}
 		client->last_rtp_received_at = monotonic_milliseconds();
+		client->rtp_nals++;
 		const size_t annexb_length = h264_annexb_size(data, length);
 		uint8_t* annexb = malloc(annexb_length);
 		if (!annexb)
