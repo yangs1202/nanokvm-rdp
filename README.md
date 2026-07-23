@@ -45,10 +45,10 @@ cmake --build build/gateway --target nanokvm-rdp-gateway --parallel 4
 백업하고, 문제 발생 시 복구 명령으로 기존 service를 되돌린다.
 
 ```sh
-ssh root@10.97.11.193 'ts=$(date +%Y%m%d%H%M%S); mkdir -p /data/nanokvm-rdp-backup/$ts; cp -a /root/nanokvm-rdp /data/nanokvm-rdp-backup/$ts/; cp -a /etc/init.d/S100nanokvm-rdp /data/nanokvm-rdp-backup/$ts/'
+ssh root@10.97.12.49 'ts=$(date +%Y%m%d%H%M%S); mkdir -p /data/nanokvm-rdp-backup/$ts; cp -a /root/nanokvm-rdp /data/nanokvm-rdp-backup/$ts/; cp -a /etc/init.d/S100nanokvm-rdp /data/nanokvm-rdp-backup/$ts/'
 
 # 복구
-ssh root@10.97.11.193 '/etc/init.d/S100nanokvm-agent stop || true; /etc/init.d/S100nanokvm-rdp start'
+ssh root@10.97.12.49 '/etc/init.d/S100nanokvm-agent stop || true; /etc/init.d/S100nanokvm-rdp start'
 ```
 
 `deploy/S100nanokvm-agent`의 `GATEWAY`와 포트를 대상 host에 맞춰 배포한다. 방화벽은

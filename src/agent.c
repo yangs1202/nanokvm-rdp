@@ -24,6 +24,8 @@
 #define DEFAULT_WIDTH 960U
 #define DEFAULT_HEIGHT 540U
 #define DEFAULT_BITRATE 3000U
+#define HEARTBEAT_INTERVAL_MS 1000U
+#define HEARTBEAT_TIMEOUT_MS 5000U
 
 enum KvmFrameKind { KVM_FRAME_SPS = 1, KVM_FRAME_PPS = 2, KVM_FRAME_IDR = 3, KVM_FRAME_P = 4 };
 
@@ -56,6 +58,11 @@ typedef struct
 	uint32_t timestamp;
 	uint32_t sent_packets;
 	uint32_t dropped_packets;
+	uint32_t capture_frames;
+	uint32_t dropped_frames;
+	uint64_t last_ping_at;
+	uint64_t last_pong_at;
+	uint64_t last_stats_at;
 } Agent;
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -64,6 +71,14 @@ static void on_signal(int ignored)
 {
 	(void)ignored;
 	stop_requested = 1;
+}
+
+static uint64_t monotonic_milliseconds(void)
+{
+	struct timespec now = { 0 };
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		return 0;
+	return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 }
 
 static bool kvm_load(KvmApi* api)
@@ -114,7 +129,30 @@ static bool connect_control(Agent* agent)
 		return false;
 	}
 	agent->control_fd = fd;
+	agent->last_ping_at = monotonic_milliseconds();
+	agent->last_pong_at = agent->last_ping_at;
+	agent->last_stats_at = agent->last_ping_at;
 	return true;
+}
+
+static void disconnect_control(Agent* agent)
+{
+	hid_release_all(&agent->hid);
+	if (agent->control_fd >= 0)
+		(void)close(agent->control_fd);
+	agent->control_fd = -1;
+	agent->streaming = false;
+	agent->wait_for_idr = true;
+}
+
+static bool send_stats(Agent* agent)
+{
+	uint8_t payload[NANOKVM_STATS_PAYLOAD_SIZE] = { 0 };
+	protocol_write_u32(payload, agent->sent_packets);
+	protocol_write_u32(payload + 4, agent->dropped_packets);
+	protocol_write_u32(payload + 8, agent->capture_frames);
+	protocol_write_u32(payload + 12, agent->dropped_frames);
+	return protocol_send(agent->control_fd, NANOKVM_CONTROL_STATS, payload, sizeof(payload));
 }
 
 static bool send_packet(void* context, const uint8_t* packet, size_t length)
@@ -211,6 +249,9 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 		case NANOKVM_CONTROL_PING:
 			(void)protocol_send(agent->control_fd, NANOKVM_CONTROL_PONG, NULL, 0);
 			break;
+		case NANOKVM_CONTROL_PONG:
+			agent->last_pong_at = monotonic_milliseconds();
+			break;
 		default: break;
 	}
 }
@@ -281,12 +322,29 @@ int main(int argc, char* argv[])
 			NanokvmControlMessage message = { 0 };
 			if (!protocol_receive(agent.control_fd, &message))
 			{
-				hid_release_all(&agent.hid);
-				(void)close(agent.control_fd);
-				agent.control_fd = -1;
+				disconnect_control(&agent);
 				continue;
 			}
 			handle_control(&agent, &message);
+		}
+		const uint64_t now = monotonic_milliseconds();
+		if (now - agent.last_pong_at > HEARTBEAT_TIMEOUT_MS ||
+		    (now - agent.last_ping_at >= HEARTBEAT_INTERVAL_MS &&
+		     !protocol_send(agent.control_fd, NANOKVM_CONTROL_PING, NULL, 0)))
+		{
+			disconnect_control(&agent);
+			continue;
+		}
+		if (now - agent.last_ping_at >= HEARTBEAT_INTERVAL_MS)
+			agent.last_ping_at = now;
+		if (now - agent.last_stats_at >= HEARTBEAT_INTERVAL_MS)
+		{
+			if (!send_stats(&agent))
+			{
+				disconnect_control(&agent);
+				continue;
+			}
+			agent.last_stats_at = now;
 		}
 		if (!agent.streaming)
 			continue;
@@ -301,9 +359,15 @@ int main(int argc, char* argv[])
 		}
 		if (kind == KVM_FRAME_IDR)
 			agent.wait_for_idr = false;
+		agent.capture_frames++;
 		if ((kind == KVM_FRAME_SPS || kind == KVM_FRAME_PPS || kind == KVM_FRAME_IDR ||
 		     (!agent.wait_for_idr && kind == KVM_FRAME_P)))
-			(void)send_h264(&agent, data, length);
+		{
+			if (!send_h264(&agent, data, length))
+				agent.dropped_frames++;
+		}
+		else if (kind == KVM_FRAME_P)
+			agent.dropped_frames++;
 		agent.timestamp += 9000U;
 		(void)agent.kvm.free_data(&data);
 	}

@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -46,6 +47,9 @@
 #define DEFAULT_BITRATE 3000U
 #define MAX_EVENT_HANDLES 32U
 #define BITMAP_MIN_INTERVAL_MS 100U
+#define HEARTBEAT_INTERVAL_MS 1000U
+#define HEARTBEAT_TIMEOUT_MS 5000U
+#define STATS_LOG_INTERVAL_MS 5000U
 
 enum kvm_frame_kind
 {
@@ -95,6 +99,13 @@ struct Server
 	int control_listener;
 	int control_fd;
 	bool stream_requested;
+	uint64_t last_agent_activity_at;
+	uint64_t last_ping_at;
+	uint64_t last_stats_log_at;
+	uint32_t agent_sent_packets;
+	uint32_t agent_dropped_packets;
+	uint32_t agent_capture_frames;
+	uint32_t agent_dropped_frames;
 	Client* active;
 };
 
@@ -131,9 +142,14 @@ struct Client
 	bool keyboard_input_logged;
 	bool pointer_input_logged;
 	bool wheel_input_logged;
+	uint8_t relative_buttons;
+	uint64_t last_rtp_received_at;
+	uint64_t last_decode_latency_ms;
 };
 
 static volatile sig_atomic_t stop_requested = 0;
+
+static uint64_t monotonic_milliseconds(void);
 
 static void log_message(const char* level, const char* message)
 {
@@ -178,6 +194,8 @@ static DWORD WINAPI control_thread(LPVOID argument)
 		if (server->control_fd >= 0)
 			(void)close(server->control_fd);
 		server->control_fd = fd;
+		server->last_agent_activity_at = monotonic_milliseconds();
+		server->last_ping_at = server->last_agent_activity_at;
 		const bool start = server->stream_requested;
 		LeaveCriticalSection(&server->control_lock);
 		if (start)
@@ -188,6 +206,17 @@ static DWORD WINAPI control_thread(LPVOID argument)
 			NanokvmControlMessage message = { 0 };
 			if (!protocol_receive(fd, &message))
 				break;
+			EnterCriticalSection(&server->control_lock);
+			server->last_agent_activity_at = monotonic_milliseconds();
+			if (message.type == NANOKVM_CONTROL_STATS &&
+			    message.length == NANOKVM_STATS_PAYLOAD_SIZE)
+			{
+				server->agent_sent_packets = protocol_read_u32(message.payload);
+				server->agent_dropped_packets = protocol_read_u32(message.payload + 4);
+				server->agent_capture_frames = protocol_read_u32(message.payload + 8);
+				server->agent_dropped_frames = protocol_read_u32(message.payload + 12);
+			}
+			LeaveCriticalSection(&server->control_lock);
 			if (message.type == NANOKVM_CONTROL_PING)
 				(void)server_send_control(server, NANOKVM_CONTROL_PONG, NULL, 0);
 		}
@@ -221,6 +250,43 @@ static int open_control_listener(const char* host, uint16_t port)
 static uint64_t monotonic_milliseconds(void)
 {
 	return (uint64_t)GetTickCount64();
+}
+
+static void server_heartbeat(Server* server)
+{
+	const uint64_t now = monotonic_milliseconds();
+	bool send_ping = false;
+	bool timeout = false;
+	EnterCriticalSection(&server->control_lock);
+	if (server->control_fd >= 0)
+	{
+		timeout = now - server->last_agent_activity_at > HEARTBEAT_TIMEOUT_MS;
+		send_ping = now - server->last_ping_at >= HEARTBEAT_INTERVAL_MS;
+		if (send_ping)
+			server->last_ping_at = now;
+		if (timeout)
+			(void)shutdown(server->control_fd, SHUT_RDWR);
+	}
+	LeaveCriticalSection(&server->control_lock);
+	if (send_ping && !timeout)
+		(void)server_send_control(server, NANOKVM_CONTROL_PING, NULL, 0);
+	if (timeout)
+		log_message("WARN", "NanoKVM agent heartbeat timeout; HID ReleaseAll을 요청하고 control 연결을 종료합니다");
+	if (now - server->last_stats_log_at < STATS_LOG_INTERVAL_MS)
+		return;
+	server->last_stats_log_at = now;
+	struct rusage usage = { 0 };
+	if (getrusage(RUSAGE_SELF, &usage) == 0)
+	{
+		char message[256] = { 0 };
+		(void)snprintf(message, sizeof(message),
+		               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u gateway_rss=%ld latency_ms=%llu queue=0",
+		               server->agent_sent_packets, server->agent_dropped_packets,
+		               server->agent_capture_frames, server->agent_dropped_frames,
+		               usage.ru_maxrss, (unsigned long long)(server->active ?
+		               server->active->last_decode_latency_ms : 0));
+		log_message("INFO", message);
+	}
 }
 
 static bool copy_bytes(uint8_t** destination, size_t* destination_length, const uint8_t* source,
@@ -710,6 +776,7 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 	if (send_bitmap_frame(client, bgra, length))
 	{
 		client->bitmap_last_sent_at = now;
+		client->last_decode_latency_ms = now - client->last_rtp_received_at;
 		return true;
 	}
 	log_message("ERROR", "RDP bitmap frame 전송 실패");
@@ -756,6 +823,7 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 			client_stop(client);
 			break;
 		}
+		client->last_rtp_received_at = monotonic_milliseconds();
 		const bool pushed = ffmpeg_decoder_push(&decoder, data, length);
 		free(data);
 		if (!pushed)
@@ -833,6 +901,37 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 static BOOL on_extended_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 {
 	return on_mouse(input, flags, x, y);
+}
+
+static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT16 y_delta)
+{
+	Client* client = (Client*)input->context;
+	if ((flags & PTR_FLAGS_BUTTON1) != 0)
+	{
+		if ((flags & PTR_FLAGS_DOWN) != 0)
+			client->relative_buttons |= 0x01;
+		else
+			client->relative_buttons &= (uint8_t)~0x01U;
+	}
+	if ((flags & PTR_FLAGS_BUTTON2) != 0)
+	{
+		if ((flags & PTR_FLAGS_DOWN) != 0)
+			client->relative_buttons |= 0x02;
+		else
+			client->relative_buttons &= (uint8_t)~0x02U;
+	}
+	if ((flags & PTR_FLAGS_BUTTON3) != 0)
+	{
+		if ((flags & PTR_FLAGS_DOWN) != 0)
+			client->relative_buttons |= 0x04;
+		else
+			client->relative_buttons &= (uint8_t)~0x04U;
+	}
+	uint8_t payload[5] = { 0 };
+	protocol_write_u16(payload, (uint16_t)x_delta);
+	protocol_write_u16(payload + 2, (uint16_t)y_delta);
+	payload[4] = client->relative_buttons;
+	return server_send_control(client->server, NANOKVM_CONTROL_POINTER_REL, payload, sizeof(payload));
 }
 
 static BOOL on_dvc_creation_status(void* userdata, UINT32 channel_id, INT32 creation_status)
@@ -1083,6 +1182,7 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 	peer->context->input->KeyboardEvent = on_keyboard;
 	peer->context->input->UnicodeKeyboardEvent = on_unicode_keyboard;
 	peer->context->input->MouseEvent = on_mouse;
+	peer->context->input->RelMouseEvent = on_relative_mouse;
 	peer->context->input->ExtendedMouseEvent = on_extended_mouse;
 	return peer->Initialize(peer) == TRUE;
 }
@@ -1254,6 +1354,7 @@ int main(int argc, char* argv[])
 
 	while (!stop_requested)
 	{
+		server_heartbeat(&server);
 		HANDLE handles[8] = WINPR_C_ARRAY_INIT;
 		const DWORD count = listener->GetEventHandles(listener, handles, ARRAYSIZE(handles));
 		if (count == 0 || WaitForMultipleObjects(count, handles, FALSE, 200) == WAIT_FAILED)
