@@ -46,7 +46,7 @@
 #define DEFAULT_HEIGHT 1080U
 #define DEFAULT_BITRATE 3000U
 #define MAX_EVENT_HANDLES 32U
-#define BITMAP_MIN_INTERVAL_MS 100U
+#define BITMAP_MIN_INTERVAL_MS 200U
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define STATS_LOG_INTERVAL_MS 5000U
@@ -121,6 +121,10 @@ struct Client
 	NSC_CONTEXT* nsc;
 	wStream* bitmap_stream;
 	CRITICAL_SECTION lock;
+	uint8_t* pending_bitmap;
+	size_t pending_bitmap_length;
+	bool bitmap_pending;
+	uint64_t bitmap_last_queued_at;
 	HidState hid;
 	bool stopping;
 	bool gfx_ready;
@@ -790,17 +794,54 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 {
 	Client* client = context;
 	const uint64_t now = monotonic_milliseconds();
-	if (client->bitmap_frames > 0 && now - client->bitmap_last_sent_at < BITMAP_MIN_INTERVAL_MS)
-		return true;
-	if (send_bitmap_frame(client, bgra, length))
+	const size_t expected_length = (size_t)client->render_width * client->render_height * 4U;
+	if (length != expected_length || client_should_stop(client))
+		return false;
+	EnterCriticalSection(&client->lock);
+	if (client->bitmap_last_queued_at != 0 &&
+	    now - client->bitmap_last_queued_at < BITMAP_MIN_INTERVAL_MS)
 	{
-		client->bitmap_last_sent_at = now;
-		client->last_decode_latency_ms = now - client->last_rtp_received_at;
+		LeaveCriticalSection(&client->lock);
 		return true;
 	}
-	log_message("ERROR", "RDP bitmap frame 전송 실패");
-	client_stop(client);
-	return false;
+	if (!client->pending_bitmap)
+	{
+		client->pending_bitmap = malloc(expected_length);
+		client->pending_bitmap_length = client->pending_bitmap ? expected_length : 0;
+	}
+	if (!client->pending_bitmap || client->pending_bitmap_length != expected_length)
+	{
+		LeaveCriticalSection(&client->lock);
+		return false;
+	}
+	memcpy(client->pending_bitmap, bgra, expected_length);
+	client->bitmap_pending = true;
+	client->bitmap_last_queued_at = now;
+	client->last_decode_latency_ms = now - client->last_rtp_received_at;
+	LeaveCriticalSection(&client->lock);
+	return true;
+}
+
+static bool client_flush_pending_bitmap(Client* client)
+{
+	bool pending = false;
+	bool sent = true;
+	EnterCriticalSection(&client->lock);
+	pending = client->bitmap_pending;
+	if (pending)
+	{
+		client->bitmap_pending = false;
+		sent = send_bitmap_frame(client, client->pending_bitmap, client->pending_bitmap_length);
+		if (sent)
+			client->bitmap_last_sent_at = monotonic_milliseconds();
+	}
+	LeaveCriticalSection(&client->lock);
+	if (pending && !sent)
+	{
+		log_message("ERROR", "RDP bitmap frame 전송 실패");
+		client_stop(client);
+	}
+	return sent;
 }
 
 static DWORD WINAPI bitmap_video_thread(LPVOID argument)
@@ -1048,6 +1089,7 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 		nsc_context_free(client->nsc);
 	if (client->bitmap_stream)
 		Stream_Free(client->bitmap_stream, TRUE);
+	free(client->pending_bitmap);
 	if (client->vcm && client->vcm != INVALID_HANDLE_VALUE)
 		WTSCloseServer(client->vcm);
 	hid_release_all(&client->hid);
@@ -1249,13 +1291,15 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 	log_message("INFO", "TLS RDP client 연결 수락");
 	while (!client_should_stop(client))
 	{
+		if (!server->config.direct_gfx && !client_flush_pending_bitmap(client))
+			break;
 		HANDLE handles[MAX_EVENT_HANDLES] = WINPR_C_ARRAY_INIT;
 		DWORD count = peer->GetEventHandles(peer, handles, ARRAYSIZE(handles));
 		if (count == 0 || count >= ARRAYSIZE(handles))
 			break;
 		if (server->config.direct_gfx)
 			handles[count++] = WTSVirtualChannelManagerGetEventHandle(client->vcm);
-		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, 100);
+		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, 20);
 		if (status == WAIT_TIMEOUT)
 		{
 			if (server->config.direct_gfx &&
@@ -1266,6 +1310,8 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		if (status == WAIT_FAILED)
 			break;
 		if (!peer->CheckFileDescriptor(peer))
+			break;
+		if (!server->config.direct_gfx && !client_flush_pending_bitmap(client))
 			break;
 		if (server->config.direct_gfx &&
 		    (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client)))
