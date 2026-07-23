@@ -48,6 +48,9 @@
 #define DEFAULT_BITRATE 3000U
 #define MAX_EVENT_HANDLES 32U
 #define BITMAP_MIN_INTERVAL_MS 200U
+#define CLASSIC_TILE_WIDTH 256U
+#define CLASSIC_TILE_HEIGHT 64U
+#define CLASSIC_TILE_MAX_ENCODED 65535U
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define STATS_LOG_INTERVAL_MS 5000U
@@ -158,6 +161,7 @@ struct Client
 	uint8_t relative_buttons;
 	uint64_t last_rtp_received_at;
 	uint64_t last_decode_latency_ms;
+	uint64_t last_rdp_send_ms;
 };
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -315,6 +319,7 @@ static void server_heartbeat(Server* server)
 		uint32_t rtp_idr_units = 0;
 		uint32_t rtp_p_units = 0;
 		bool bitmap_pending = false;
+		uint64_t rdp_send_ms = 0;
 		EnterCriticalSection(&server->lock);
 		Client* active = server->active;
 		if (active)
@@ -327,18 +332,20 @@ static void server_heartbeat(Server* server)
 			rtp_idr_units = active->rtp_idr_units;
 			rtp_p_units = active->rtp_p_units;
 			bitmap_pending = active->bitmap_pending;
+			rdp_send_ms = active->last_rdp_send_ms;
 			LeaveCriticalSection(&active->lock);
 		}
 		LeaveCriticalSection(&server->lock);
 		char message[256] = { 0 };
 		(void)snprintf(message, sizeof(message),
-		               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u rdp_frames=%u queue=%u gateway_rss=%ld latency_ms=%llu",
+		               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u rdp_frames=%u queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
 		               server->agent_sent_packets, server->agent_dropped_packets,
 		               server->agent_capture_frames, server->agent_dropped_frames,
 		               rtp_nals, rtp_access_units, rtp_idr_units, rtp_p_units, decoded_frames,
 		               bitmap_frames, bitmap_pending ? 1U : 0U,
 		               usage.ru_maxrss, (unsigned long long)(server->active ?
-		               server->active->last_decode_latency_ms : 0));
+		               server->active->last_decode_latency_ms : 0),
+		               (unsigned long long)rdp_send_ms);
 		log_message("INFO", message);
 	}
 }
@@ -690,13 +697,13 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	    client_should_stop(client))
 		return false;
 
-	for (uint16_t top = 0; top < height; top += 64)
+	for (uint16_t top = 0; top < height; top += CLASSIC_TILE_HEIGHT)
 	{
-		const uint16_t rows = MIN(64, (uint16_t)(height - top));
-		for (uint16_t left = 0; left < width; left += 64)
+		const uint16_t rows = MIN(CLASSIC_TILE_HEIGHT, (uint16_t)(height - top));
+		for (uint16_t left = 0; left < width; left += CLASSIC_TILE_WIDTH)
 		{
-			const uint16_t columns = MIN(64, (uint16_t)(width - left));
-			uint8_t encoded[64 * 64 * 4] = { 0 };
+			const uint16_t columns = MIN(CLASSIC_TILE_WIDTH, (uint16_t)(width - left));
+			uint8_t encoded[CLASSIC_TILE_MAX_ENCODED] = { 0 };
 			uint32_t encoded_length = sizeof(encoded);
 			BITMAP_DATA rectangle = WINPR_C_ARRAY_INIT;
 			BITMAP_UPDATE bitmap = WINPR_C_ARRAY_INIT;
@@ -831,19 +838,40 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 
 static bool client_flush_pending_bitmap(Client* client)
 {
-	bool pending = false;
+	uint8_t* bitmap = NULL;
+	size_t bitmap_length = 0;
 	bool sent = true;
 	EnterCriticalSection(&client->lock);
-	pending = client->bitmap_pending;
-	if (pending)
+	if (client->bitmap_pending)
 	{
+		bitmap = client->pending_bitmap;
+		bitmap_length = client->pending_bitmap_length;
+		client->pending_bitmap = NULL;
+		client->pending_bitmap_length = 0;
 		client->bitmap_pending = false;
-		sent = send_bitmap_frame(client, client->pending_bitmap, client->pending_bitmap_length);
-		if (sent)
-			client->bitmap_last_sent_at = monotonic_milliseconds();
 	}
 	LeaveCriticalSection(&client->lock);
-	if (pending && !sent)
+	if (!bitmap)
+		return true;
+
+	const uint64_t started_at = monotonic_milliseconds();
+	sent = send_bitmap_frame(client, bitmap, bitmap_length);
+	const uint64_t completed_at = monotonic_milliseconds();
+	EnterCriticalSection(&client->lock);
+	if (sent)
+	{
+		client->bitmap_last_sent_at = completed_at;
+		client->last_rdp_send_ms = completed_at - started_at;
+	}
+	if (!client->pending_bitmap)
+	{
+		client->pending_bitmap = bitmap;
+		client->pending_bitmap_length = bitmap_length;
+		bitmap = NULL;
+	}
+	LeaveCriticalSection(&client->lock);
+	free(bitmap);
+	if (!sent)
 	{
 		log_message("ERROR", "RDP bitmap frame 전송 실패");
 		client_stop(client);
