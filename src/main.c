@@ -1358,6 +1358,14 @@ out:
 static BOOL peer_accepted(freerdp_listener* listener, freerdp_peer* peer)
 {
 	Server* server = (Server*)listener->info;
+	EnterCriticalSection(&server->lock);
+	const bool busy = server->active != NULL;
+	LeaveCriticalSection(&server->lock);
+	if (busy)
+	{
+		log_message("WARN", "single-client 제한으로 새 RDP 연결을 listener에서 거부합니다");
+		return FALSE;
+	}
 	peer->ContextExtra = server;
 	HANDLE thread = CreateThread(NULL, 0, peer_thread, peer, 0, NULL);
 	if (!thread)
