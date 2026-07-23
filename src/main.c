@@ -975,6 +975,25 @@ static BOOL on_unicode_keyboard(rdpInput* input, UINT16 flags, UINT16 code)
 	return TRUE;
 }
 
+static bool client_force_source_desktop_size(Client* client)
+{
+	rdpSettings* settings = client->context.settings;
+	rdpUpdate* update = client->context.update;
+	const uint32_t width = client->server->config.width;
+	const uint32_t height = client->server->config.height;
+	if (!settings || !update || !update->DesktopResize)
+		return false;
+	if (freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth) == width &&
+	    freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight) == height)
+		return true;
+	if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, width) ||
+	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height) ||
+	    !update->DesktopResize(update->context))
+		return false;
+	log_message("INFO", "RDP desktop을 NanoKVM 원본 1920x1080으로 재협상");
+	return true;
+}
+
 static bool client_set_render_size(Client* client)
 {
 	const rdpSettings* settings = client->context.settings;
@@ -1212,6 +1231,8 @@ static bool client_prepare_bitmap(Client* client)
 static BOOL peer_post_connect(freerdp_peer* peer)
 {
 	Client* client = (Client*)peer->context;
+	if (!client_force_source_desktop_size(client))
+		return FALSE;
 	if (!client_set_render_size(client))
 		return FALSE;
 	if (client->server->config.direct_gfx)
