@@ -661,52 +661,6 @@ static bool bitmap_stream_nsc_supported(const rdpSettings* settings)
 	       (supported & SURFCMDS_SET_SURFACE_BITS) != 0;
 }
 
-static bool raw_surface_bits_supported(const rdpSettings* settings)
-{
-	const uint32_t supported =
-	    freerdp_settings_get_uint32(settings, FreeRDP_SurfaceCommandsSupported);
-	return (supported & SURFCMDS_SET_SURFACE_BITS) != 0;
-}
-
-static bool send_raw_surface_frame(Client* client, const uint8_t* bgra, size_t length)
-{
-	const uint16_t width = client->render_width;
-	const uint16_t height = client->render_height;
-	if (!client->context.update || !client->context.update->SurfaceBits ||
-	    length != (size_t)width * height * 4U)
-		return false;
-	for (uint16_t top = 0; top < height; top += 120)
-	{
-		const uint16_t rows = MIN(120, (uint16_t)(height - top));
-		for (uint16_t left = 0; left < width; left += 120)
-		{
-			const uint16_t columns = MIN(120, (uint16_t)(width - left));
-			uint8_t tile[120 * 120 * 4] = { 0 };
-			SURFACE_BITS_COMMAND command = WINPR_C_ARRAY_INIT;
-			for (uint16_t row = 0; row < rows; row++)
-			{
-				const uint8_t* source = bgra + (((size_t)top + row) * width + left) * 4U;
-				memcpy(tile + (size_t)row * columns * 4U, source, (size_t)columns * 4U);
-			}
-			command.cmdType = CMDTYPE_SET_SURFACE_BITS;
-			command.destLeft = left;
-			command.destTop = top;
-			command.destRight = left + columns;
-			command.destBottom = top + rows;
-			command.bmp.bpp = 32;
-			command.bmp.codecID = RDP_CODEC_ID_NONE;
-			command.bmp.width = columns;
-			command.bmp.height = rows;
-			command.bmp.bitmapDataLength = columns * rows * 4U;
-			command.bmp.bitmapData = tile;
-			command.skipCompression = FALSE;
-			if (!client->context.update->SurfaceBits(&client->context, &command))
-				return false;
-		}
-	}
-	return true;
-}
-
 static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
 {
 	const uint16_t width = client->render_width;
@@ -771,12 +725,6 @@ static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length
 
 	if (!settings || !update || length != expected_length || client_should_stop(client))
 		return false;
-	if (!client->bitmap_uses_rfx && !client->nsc && raw_surface_bits_supported(settings))
-	{
-		if (!send_raw_surface_frame(client, bgra, length))
-			return false;
-		goto sent;
-	}
 	if (!client->bitmap_uses_rfx && !client->nsc)
 		goto sent_classic;
 	if (!update->SurfaceBits || !client->bitmap_stream)
@@ -826,7 +774,6 @@ static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length
 sent_classic:
 	if (!client->bitmap_uses_rfx && !client->nsc && !send_classic_bitmap_frame(client, bgra, length))
 		return false;
-sent:
 	client->bitmap_frames++;
 	if (client->bitmap_frames == 1)
 		log_message("INFO", "FoldVNC H.264 → FFmpeg BGRA → RDP bitmap 첫 frame 전송 완료");
