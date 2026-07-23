@@ -56,25 +56,6 @@
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define STATS_LOG_INTERVAL_MS 5000U
 
-enum kvm_frame_kind
-{
-	KVM_FRAME_MJPEG = 0,
-	KVM_FRAME_SPS = 1,
-	KVM_FRAME_PPS = 2,
-	KVM_FRAME_IDR = 3,
-	KVM_FRAME_P = 4,
-};
-
-typedef struct
-{
-	void* handle;
-	void (*init)(uint8_t level);
-	int (*read_image)(uint16_t width, uint16_t height, uint8_t type, uint16_t quality,
-	                  uint8_t** data, uint32_t* length);
-	int (*free_data)(uint8_t** data);
-	void (*set_frame_detect)(uint8_t enabled);
-} KvmApi;
-
 typedef struct
 {
 	const char* bind_address;
@@ -98,7 +79,6 @@ typedef struct Client Client;
 struct Server
 {
 	ServerConfig config;
-	KvmApi kvm;
 	CRITICAL_SECTION lock;
 	CRITICAL_SECTION control_lock;
 	int control_listener;
@@ -368,42 +348,6 @@ static bool copy_bytes(uint8_t** destination, size_t* destination_length, const 
 	return true;
 }
 
-static bool kvm_load(KvmApi* api)
-{
-	if (api->handle)
-		return true;
-	const char* candidates[] = {
-		"/root/foldvnc/dl_lib/libkvm.so",
-		"/kvmapp/server/dl_lib/libkvm.so",
-		"/tmp/server/dl_lib/libkvm.so",
-		"libkvm.so",
-	};
-	for (size_t index = 0; index < ARRAYSIZE(candidates); index++)
-	{
-		api->handle = dlopen(candidates[index], RTLD_NOW | RTLD_LOCAL);
-		if (api->handle)
-			break;
-	}
-	if (!api->handle)
-	{
-		log_message("ERROR", "libkvm.so를 열 수 없습니다");
-		return false;
-	}
-
-	*(void**)(&api->init) = dlsym(api->handle, "kvmv_init");
-	*(void**)(&api->read_image) = dlsym(api->handle, "kvmv_read_img");
-	*(void**)(&api->free_data) = dlsym(api->handle, "free_kvmv_data");
-	*(void**)(&api->set_frame_detect) = dlsym(api->handle, "set_frame_detact");
-	if (!api->init || !api->read_image || !api->free_data || !api->set_frame_detect)
-	{
-		log_message("ERROR", "libkvm.so 필수 symbol을 찾을 수 없습니다");
-		return false;
-	}
-	api->init(0);
-	api->set_frame_detect(0);
-	return true;
-}
-
 static bool client_should_stop(Client* client)
 {
 	bool stopping = false;
@@ -481,6 +425,12 @@ static UINT on_gfx_caps_advertise(RdpgfxServerContext* gfx,
 	client->gfx_ready = true;
 	client->need_idr = true;
 	LeaveCriticalSection(&client->lock);
+	if (!server_set_stream_requested(client->server, true))
+	{
+		log_message("ERROR", "RDPGFX NanoKVM agent에 START_STREAM을 보낼 수 없습니다");
+		client_stop(client);
+		return ERROR_CONNECTION_ABORTED;
+	}
 	log_message("INFO", "RDPGFX AVC420 capability 확인 및 surface 초기화 완료");
 	return CHANNEL_RC_OK;
 }
@@ -604,66 +554,70 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 static DWORD WINAPI video_thread(LPVOID argument)
 {
 	Client* client = (Client*)argument;
-	Server* server = client->server;
-	if (!kvm_load(&server->kvm))
+	RtpClient rtp = { .fd = -1 };
+	if (!rtp_client_open(&rtp, client->server->config.video_port))
 	{
+		log_message("ERROR", "RDPGFX RTP/H.264 receiver를 시작할 수 없습니다");
 		client_stop(client);
 		return 0;
 	}
-
+	log_message("INFO", "RDPGFX RTP/H.264 passthrough 시작");
+	uint32_t observed_losses = 0;
 	while (!client_should_stop(client))
 	{
-		if (!client_can_send(client))
-		{
-			Sleep(5);
-			continue;
-		}
-
 		uint8_t* data = NULL;
-		uint32_t length = 0;
-		const int kind = server->kvm.read_image(server->config.width, server->config.height, 1,
-		                                        server->config.bitrate, &data, &length);
-		if (kind < 0 || !data || length == 0)
+		size_t length = 0;
+		if (!rtp_client_read_h264(&rtp, &data, &length) || !data || length == 0)
 		{
-			if (data)
-				(void)server->kvm.free_data(&data);
-			Sleep(2);
-			continue;
+			log_message("ERROR", "RDPGFX RTP/H.264 frame 수신 실패");
+			client_stop(client);
+			break;
 		}
-
-		if (kind == KVM_FRAME_SPS)
+		client->last_rtp_received_at = monotonic_milliseconds();
+		client->rtp_nals++;
+		client->rtp_access_units++;
+		if (h264_contains_nal_type(data, length, 7))
 			(void)copy_bytes(&client->sps, &client->sps_length, data, length);
-		else if (kind == KVM_FRAME_PPS)
+		if (h264_contains_nal_type(data, length, 8))
 			(void)copy_bytes(&client->pps, &client->pps_length, data, length);
-
-		bool should_send = kind == KVM_FRAME_IDR || kind == KVM_FRAME_P;
+		const bool idr = h264_contains_nal_type(data, length, 5);
+		const bool p_frame = h264_contains_nal_type(data, length, 1);
+		if (idr)
+			client->rtp_idr_units++;
+		if (p_frame)
+			client->rtp_p_units++;
 		bool need_idr = true;
 		EnterCriticalSection(&client->lock);
 		need_idr = client->need_idr;
 		LeaveCriticalSection(&client->lock);
-		if (kind == KVM_FRAME_IDR)
+		if (idr)
 		{
 			EnterCriticalSection(&client->lock);
 			client->need_idr = false;
 			LeaveCriticalSection(&client->lock);
 		}
-		if (kind == KVM_FRAME_P && need_idr)
-			should_send = false;
 
-		if (should_send)
+		if ((idr || (!need_idr && p_frame)) && client_can_send(client))
 		{
 			uint8_t* owned = NULL;
 			const uint8_t* payload = data;
 			size_t payload_length = length;
 			bool payload_ok = true;
-			if (kind == KVM_FRAME_IDR)
+			if (idr)
 				payload_ok = make_idr_payload(client, data, length, &owned, &payload, &payload_length);
 			if (!payload_ok || !send_avc420_frame(client, payload, payload_length))
 				client_stop(client);
 			free(owned);
 		}
-		(void)server->kvm.free_data(&data);
+		free(data);
+		if (rtp.losses != observed_losses)
+		{
+			observed_losses = rtp.losses;
+			(void)server_send_control(client->server, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
+			log_message("WARN", "RDPGFX RTP frame loss 감지; NanoKVM agent에 IDR 재동기화를 요청합니다");
+		}
 	}
+	rtp_client_close(&rtp);
 	return 0;
 }
 
