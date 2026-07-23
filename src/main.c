@@ -455,13 +455,7 @@ static bool client_can_send(Client* client)
 {
 	bool can_send = false;
 	EnterCriticalSection(&client->lock);
-	if (client->inflight && monotonic_milliseconds() - client->sent_at > 1000U)
-	{
-		client->inflight = false;
-		client->need_idr = true;
-		log_message("WARN", "RDPGFX frame acknowledgement timeout; IDR 동기화를 재시도합니다");
-	}
-	can_send = client->gfx_ready && !client->inflight && !client->stopping;
+	can_send = client->gfx_ready && !client->stopping;
 	LeaveCriticalSection(&client->lock);
 	return can_send;
 }
@@ -508,7 +502,7 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 	UINT error = CHANNEL_RC_OK;
 
 	EnterCriticalSection(&client->lock);
-	if (!client->gfx_ready || client->inflight || client->stopping)
+	if (!client->gfx_ready || client->stopping)
 	{
 		LeaveCriticalSection(&client->lock);
 		return true;
@@ -516,9 +510,6 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 	start.frameId = client->next_frame_id++;
 	start.timestamp = (UINT32)monotonic_milliseconds();
 	end.frameId = start.frameId;
-	client->inflight = true;
-	client->inflight_frame_id = start.frameId;
-	client->sent_at = monotonic_milliseconds();
 	LeaveCriticalSection(&client->lock);
 
 	avc.meta.numRegionRects = 1;
@@ -545,7 +536,6 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 	if (error != CHANNEL_RC_OK)
 	{
 		EnterCriticalSection(&client->lock);
-		client->inflight = false;
 		client->need_idr = true;
 		LeaveCriticalSection(&client->lock);
 		log_message("ERROR", "RDPGFX AVC420 frame 전송 실패");
