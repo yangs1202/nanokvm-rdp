@@ -116,6 +116,8 @@ struct Client
 	uint64_t bitmap_last_queued_at;
 	HidState hid;
 	bool stopping;
+	bool direct_gfx_active;
+	bool bitmap_fallback_active;
 	bool gfx_ready;
 	bool gfx_opened;
 	bool inflight;
@@ -151,6 +153,7 @@ struct Client
 static volatile sig_atomic_t stop_requested = 0;
 
 static uint64_t monotonic_milliseconds(void);
+static DWORD WINAPI video_thread(LPVOID argument);
 
 static void log_message(const char* level, const char* message)
 {
@@ -399,6 +402,8 @@ static UINT on_gfx_caps_advertise(RdpgfxServerContext* gfx,
 	RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU map = WINPR_C_ARRAY_INIT;
 	UINT error = CHANNEL_RC_OK;
 
+	if (!client->direct_gfx_active || client->bitmap_fallback_active)
+		return ERROR_NOT_SUPPORTED;
 	if (!client_avc420_supported(advertise, &selected))
 	{
 		log_message("ERROR", "client가 RDPGFX AVC420을 지원하지 않아 session을 종료합니다");
@@ -428,6 +433,12 @@ static UINT on_gfx_caps_advertise(RdpgfxServerContext* gfx,
 	client->gfx_ready = true;
 	client->need_idr = true;
 	LeaveCriticalSection(&client->lock);
+	client->video_thread = CreateThread(NULL, 0, video_thread, client, 0, NULL);
+	if (!client->video_thread)
+	{
+		client_stop(client);
+		return ERROR_NOT_ENOUGH_MEMORY;
+	}
 	if (!server_set_stream_requested(client->server, true))
 	{
 		log_message("ERROR", "RDPGFX NanoKVM agent에 START_STREAM을 보낼 수 없습니다");
@@ -1165,9 +1176,7 @@ static bool client_prepare_gfx(Client* client)
 	client->gfx->FrameAcknowledge = on_gfx_frame_ack;
 	if (!client->gfx->Initialize || !client->gfx->Initialize(client->gfx, FALSE))
 		return false;
-	client->video_thread = CreateThread(NULL, 0, video_thread, client, 0, NULL);
-	if (!client->video_thread)
-		return false;
+	client->direct_gfx_active = true;
 	return true;
 }
 
@@ -1275,16 +1284,24 @@ static bool client_process_dynamic_channels(Client* client)
 
 static bool client_check_gfx_timeout(Client* client)
 {
-	if (client->gfx_wait_started_at == 0 || client->gfx_ready)
+	if (!client->direct_gfx_active || client->gfx_wait_started_at == 0 || client->gfx_ready)
 		return true;
 	const uint64_t started_at = client->gfx_opened ? client->gfx_opened_at : client->gfx_wait_started_at;
 	if (monotonic_milliseconds() - started_at <= 5000)
 		return true;
+	client->direct_gfx_active = false;
+	client->bitmap_fallback_active = true;
+	client->gfx_wait_started_at = 0;
+	if (!client_prepare_bitmap(client))
+	{
+		log_message("ERROR", "RDPGFX 미지원 client의 classic bitmap fallback을 시작할 수 없습니다");
+		return false;
+	}
 	if (client->gfx_opened)
-		log_message("ERROR", "client가 5초 내 RDPGFX AVC420 capability를 보내지 않아 session을 종료합니다");
+		log_message("INFO", "RDPGFX AVC420 capability가 없는 client를 classic bitmap backend로 전환합니다");
 	else
-		log_message("ERROR", "client가 5초 내 RDPGFX dynamic channel을 열지 않아 session을 종료합니다");
-	return false;
+		log_message("INFO", "RDPGFX dynamic channel이 없는 client를 classic bitmap backend로 전환합니다");
+	return true;
 }
 
 static bool configure_peer(freerdp_peer* peer, Server* server)
@@ -1342,18 +1359,18 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 	log_message("INFO", "TLS RDP client 연결 수락");
 	while (!client_should_stop(client))
 	{
-		if (!server->config.direct_gfx && !client_flush_pending_bitmap(client))
+		if (!client->direct_gfx_active && !client_flush_pending_bitmap(client))
 			break;
 		HANDLE handles[MAX_EVENT_HANDLES] = WINPR_C_ARRAY_INIT;
 		DWORD count = peer->GetEventHandles(peer, handles, ARRAYSIZE(handles));
 		if (count == 0 || count >= ARRAYSIZE(handles))
 			break;
-		if (server->config.direct_gfx)
+		if (client->direct_gfx_active)
 			handles[count++] = WTSVirtualChannelManagerGetEventHandle(client->vcm);
 		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, 20);
 		if (status == WAIT_TIMEOUT)
 		{
-			if (server->config.direct_gfx &&
+			if (client->direct_gfx_active &&
 			    (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client)))
 				break;
 			continue;
@@ -1362,9 +1379,9 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 			break;
 		if (!peer->CheckFileDescriptor(peer))
 			break;
-		if (!server->config.direct_gfx && !client_flush_pending_bitmap(client))
+		if (!client->direct_gfx_active && !client_flush_pending_bitmap(client))
 			break;
-		if (server->config.direct_gfx &&
+		if (client->direct_gfx_active &&
 		    (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client)))
 			break;
 	}
