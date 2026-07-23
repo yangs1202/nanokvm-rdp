@@ -1063,17 +1063,6 @@ static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT1
 	return server_send_control(client->server, NANOKVM_CONTROL_POINTER_REL, payload, sizeof(payload));
 }
 
-static BOOL on_dvc_creation_status(void* userdata, UINT32 channel_id, INT32 creation_status)
-{
-	Client* client = (Client*)userdata;
-	(void)client;
-	char message[128] = { 0 };
-	(void)snprintf(message, sizeof(message), "RDP dynamic channel id=%u creation status=%d",
-	               channel_id, creation_status);
-	log_message(creation_status == 0 ? "INFO" : "ERROR", message);
-	return TRUE;
-}
-
 static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 {
 	Client* client = (Client*)context;
@@ -1089,7 +1078,6 @@ static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 		client->vcm = WTSOpenServerA((LPSTR)context);
 		if (!client->vcm || client->vcm == INVALID_HANDLE_VALUE)
 			goto fail;
-		WTSVirtualChannelManagerSetDVCCreationCallback(client->vcm, on_dvc_creation_status, client);
 	}
 
 	EnterCriticalSection(&server->lock);
