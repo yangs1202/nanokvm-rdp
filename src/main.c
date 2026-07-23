@@ -168,6 +168,19 @@ static bool server_send_control(Server* server, uint8_t type, const void* payloa
 	return sent;
 }
 
+static bool server_set_stream_requested(Server* server, bool requested)
+{
+	bool sent = false;
+	EnterCriticalSection(&server->control_lock);
+	server->stream_requested = requested;
+	if (server->control_fd >= 0)
+		sent = protocol_send(server->control_fd,
+		                     requested ? NANOKVM_CONTROL_START_STREAM : NANOKVM_CONTROL_STOP_STREAM,
+		                     NULL, 0);
+	LeaveCriticalSection(&server->control_lock);
+	return sent;
+}
+
 static void on_signal(int signal_number)
 {
 	(void)signal_number;
@@ -200,8 +213,10 @@ static DWORD WINAPI control_thread(LPVOID argument)
 		server->last_ping_at = server->last_agent_activity_at;
 		const bool start = server->stream_requested;
 		LeaveCriticalSection(&server->control_lock);
-		if (start)
-			(void)server_send_control(server, NANOKVM_CONTROL_START_STREAM, NULL, 0);
+	if (start && !server_send_control(server, NANOKVM_CONTROL_START_STREAM, NULL, 0))
+	{
+		log_message("ERROR", "재연결 NanoKVM agent에 START_STREAM을 보낼 수 없습니다");
+	}
 		log_message("INFO", "NanoKVM agent control 연결 수락");
 		for (;;)
 		{
@@ -1017,8 +1032,7 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	Client* client = (Client*)context;
 	client_stop(client);
 	(void)server_send_control(client->server, NANOKVM_CONTROL_RELEASE_ALL, NULL, 0);
-	(void)server_send_control(client->server, NANOKVM_CONTROL_STOP_STREAM, NULL, 0);
-	client->server->stream_requested = false;
+	(void)server_set_stream_requested(client->server, false);
 	if (client->video_thread)
 	{
 		(void)WaitForSingleObject(client->video_thread, 3000);
@@ -1113,8 +1127,11 @@ static bool client_prepare_bitmap(Client* client)
 	client->video_thread = CreateThread(NULL, 0, bitmap_video_thread, client, 0, NULL);
 	if (!client->video_thread)
 		return false;
-	client->server->stream_requested = true;
-	(void)server_send_control(client->server, NANOKVM_CONTROL_START_STREAM, NULL, 0);
+	if (!server_set_stream_requested(client->server, true))
+	{
+		log_message("ERROR", "NanoKVM agent에 START_STREAM을 보낼 수 없습니다");
+		return false;
+	}
 	return true;
 }
 
