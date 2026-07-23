@@ -648,36 +648,6 @@ static bool bitmap_stream_nsc_supported(const rdpSettings* settings)
 	       (supported & SURFCMDS_SET_SURFACE_BITS) != 0;
 }
 
-static bool raw_surface_bits_supported(const rdpSettings* settings)
-{
-	const uint32_t supported =
-	    freerdp_settings_get_uint32(settings, FreeRDP_SurfaceCommandsSupported);
-	return (supported & SURFCMDS_SET_SURFACE_BITS) != 0;
-}
-
-static bool send_raw_surface_frame(Client* client, const uint8_t* bgra, size_t length)
-{
-	const uint16_t width = client->render_width;
-	const uint16_t height = client->render_height;
-	SURFACE_BITS_COMMAND command = WINPR_C_ARRAY_INIT;
-	if (!client->context.update || !client->context.update->SurfaceBits ||
-	    length != (size_t)width * height * 4U)
-		return false;
-	command.cmdType = CMDTYPE_SET_SURFACE_BITS;
-	command.destLeft = 0;
-	command.destTop = 0;
-	command.destRight = width;
-	command.destBottom = height;
-	command.bmp.bpp = 32;
-	command.bmp.codecID = RDP_CODEC_ID_NONE;
-	command.bmp.width = width;
-	command.bmp.height = height;
-	command.bmp.bitmapDataLength = WINPR_ASSERTING_INT_CAST(uint32_t, length);
-	command.bmp.bitmapData = (uint8_t*)bgra;
-	command.skipCompression = FALSE;
-	return client->context.update->SurfaceBits(&client->context, &command) != FALSE;
-}
-
 static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
 {
 	const uint16_t width = client->render_width;
@@ -742,12 +712,6 @@ static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length
 
 	if (!settings || !update || length != expected_length || client_should_stop(client))
 		return false;
-	if (!client->bitmap_uses_rfx && !client->nsc && raw_surface_bits_supported(settings))
-	{
-		if (!send_raw_surface_frame(client, bgra, length))
-			return false;
-		goto sent;
-	}
 	if (!client->bitmap_uses_rfx && !client->nsc)
 		goto sent_classic;
 	if (!update->SurfaceBits || !client->bitmap_stream)
@@ -797,7 +761,6 @@ static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length
 sent_classic:
 	if (!client->bitmap_uses_rfx && !client->nsc && !send_classic_bitmap_frame(client, bgra, length))
 		return false;
-sent:
 	client->bitmap_frames++;
 	if (client->bitmap_frames == 1)
 		log_message("INFO", "FoldVNC H.264 → FFmpeg BGRA → RDP bitmap 첫 frame 전송 완료");
