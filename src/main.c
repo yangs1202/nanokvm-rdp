@@ -996,14 +996,13 @@ static bool client_set_render_size(Client* client)
 static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 {
 	Client* client = (Client*)input->context;
-	const rdpSettings* settings = input->context->settings;
-	const uint32_t width = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
-	const uint32_t height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+	const uint16_t width = client->server->config.width;
+	const uint16_t height = client->server->config.height;
 	uint8_t payload[12] = { 0 };
-	protocol_write_u16(payload, x);
-	protocol_write_u16(payload + 2, y);
-	protocol_write_u16(payload + 4, (uint16_t)width);
-	protocol_write_u16(payload + 6, (uint16_t)height);
+	protocol_write_u16(payload, hid_clamp_absolute(x, width));
+	protocol_write_u16(payload + 2, hid_clamp_absolute(y, height));
+	protocol_write_u16(payload + 4, width);
+	protocol_write_u16(payload + 6, height);
 	protocol_write_u16(payload + 8, flags);
 	const bool position_ok = server_send_control(client->server, NANOKVM_CONTROL_POINTER_ABS,
 	                                              payload, sizeof(payload));

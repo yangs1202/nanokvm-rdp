@@ -54,6 +54,13 @@ uint16_t hid_scale_absolute(uint16_t value, uint32_t dimension)
 	return (uint16_t)scaled;
 }
 
+uint16_t hid_clamp_absolute(uint16_t value, uint16_t dimension)
+{
+	if (dimension == 0)
+		return 0;
+	return value < dimension ? value : (uint16_t)(dimension - 1U);
+}
+
 static bool send_keyboard(HidState* hid)
 {
 	uint8_t report[8] = { 0 };

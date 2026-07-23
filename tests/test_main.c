@@ -71,6 +71,8 @@ static void test_hid_mapping(void)
 	assert(usage == 0x50 && modifier == 0);
 	assert(hid_scale_absolute(0, 1920) == 1);
 	assert(hid_scale_absolute(1919, 1920) == 0x7fff);
+	assert(hid_clamp_absolute(1200, 1920) == 1200);
+	assert(hid_clamp_absolute(3000, 1920) == 1919);
 }
 
 static void test_protocol_primitives(void)
