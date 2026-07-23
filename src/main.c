@@ -116,6 +116,7 @@ struct Client
 	uint64_t bitmap_last_queued_at;
 	HidState hid;
 	bool stopping;
+	bool owns_active_client;
 	bool direct_gfx_active;
 	bool bitmap_fallback_active;
 	bool gfx_ready;
@@ -1113,13 +1114,11 @@ static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 		goto fail;
 	}
 	server->active = client;
+	client->owns_active_client = true;
 	LeaveCriticalSection(&server->lock);
 	return TRUE;
 
 fail:
-	if (client->vcm && client->vcm != INVALID_HANDLE_VALUE)
-		WTSCloseServer(client->vcm);
-	DeleteCriticalSection(&client->lock);
 	return FALSE;
 }
 
@@ -1128,8 +1127,11 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	(void)peer;
 	Client* client = (Client*)context;
 	client_stop(client);
-	(void)server_send_control(client->server, NANOKVM_CONTROL_RELEASE_ALL, NULL, 0);
-	(void)server_set_stream_requested(client->server, false);
+	if (client->owns_active_client)
+	{
+		(void)server_send_control(client->server, NANOKVM_CONTROL_RELEASE_ALL, NULL, 0);
+		(void)server_set_stream_requested(client->server, false);
+	}
 	if (client->video_thread)
 	{
 		(void)WaitForSingleObject(client->video_thread, 3000);
@@ -1152,7 +1154,7 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	hid_release_all(&client->hid);
 	free(client->sps);
 	free(client->pps);
-	if (client->server)
+	if (client->server && client->owns_active_client)
 	{
 		EnterCriticalSection(&client->server->lock);
 		if (client->server->active == client)
