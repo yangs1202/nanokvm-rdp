@@ -580,6 +580,8 @@ static DWORD WINAPI video_thread(LPVOID argument)
 		size_t length = 0;
 		if (!rtp_client_read_h264(&rtp, &data, &length) || !data || length == 0)
 		{
+			if (client_should_stop(client))
+				break;
 			log_message("ERROR", "RDPGFX RTP/H.264 frame 수신 실패");
 			client_stop(client);
 			break;
@@ -922,6 +924,8 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 		size_t length = 0;
 		if (!rtp_client_read_h264(&rtp, &data, &length) || !data || length == 0)
 		{
+			if (client_should_stop(client))
+				break;
 			log_message("ERROR", "RTP/H.264 frame 수신 실패");
 			client_stop(client);
 			break;
