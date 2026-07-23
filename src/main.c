@@ -48,6 +48,8 @@
 #define DEFAULT_BITRATE 3000U
 #define MAX_EVENT_HANDLES 32U
 #define BITMAP_QUEUE_CAPACITY 16U
+#define BITMAP_FRAME_INTERVAL_MS 33U
+#define BITMAP_MAX_QUEUE_AGE_MS 100U
 #define CLASSIC_TILE_WIDTH 64U
 #define CLASSIC_TILE_HEIGHT 64U
 #define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
@@ -111,6 +113,7 @@ struct Client
 	size_t pending_bitmap_length;
 	uint8_t* bitmap_queue[BITMAP_QUEUE_CAPACITY];
 	size_t bitmap_queue_lengths[BITMAP_QUEUE_CAPACITY];
+	uint64_t bitmap_queue_queued_at[BITMAP_QUEUE_CAPACITY];
 	uint8_t bitmap_queue_head;
 	uint8_t bitmap_queue_count;
 	uint8_t* previous_bitmap;
@@ -142,12 +145,14 @@ struct Client
 	uint32_t decoded_frames;
 	uint32_t bitmap_queued_frames;
 	uint32_t bitmap_queue_drops;
+	uint32_t bitmap_stale_drops;
 	uint32_t bitmap_flushes;
 	uint32_t bitmap_empty_flushes;
 	uint32_t rtp_nals;
 	uint32_t rtp_access_units;
 	uint32_t rtp_idr_units;
 	uint32_t rtp_p_units;
+	uint64_t bitmap_last_send_started_at;
 	bool keyboard_input_logged;
 	bool pointer_input_logged;
 	bool wheel_input_logged;
@@ -310,6 +315,7 @@ static void server_heartbeat(Server* server)
 		uint32_t decoded_frames = 0;
 		uint32_t bitmap_queued_frames = 0;
 		uint32_t bitmap_queue_drops = 0;
+		uint32_t bitmap_stale_drops = 0;
 		uint32_t bitmap_flushes = 0;
 		uint32_t bitmap_empty_flushes = 0;
 		uint32_t rtp_nals = 0;
@@ -327,6 +333,7 @@ static void server_heartbeat(Server* server)
 			decoded_frames = active->decoded_frames;
 			bitmap_queued_frames = active->bitmap_queued_frames;
 			bitmap_queue_drops = active->bitmap_queue_drops;
+			bitmap_stale_drops = active->bitmap_stale_drops;
 			bitmap_flushes = active->bitmap_flushes;
 			bitmap_empty_flushes = active->bitmap_empty_flushes;
 			rtp_nals = active->rtp_nals;
@@ -340,11 +347,12 @@ static void server_heartbeat(Server* server)
 		LeaveCriticalSection(&server->lock);
 		char message[256] = { 0 };
 		(void)snprintf(message, sizeof(message),
-			               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u queued=%u queue_drop=%u flush=%u empty_flush=%u rdp_frames=%u queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
+			               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u queued=%u queue_drop=%u stale_drop=%u flush=%u empty_flush=%u rdp_frames=%u queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
 			               server->agent_sent_packets, server->agent_dropped_packets,
 			               server->agent_capture_frames, server->agent_dropped_frames,
 			               rtp_nals, rtp_access_units, rtp_idr_units, rtp_p_units, decoded_frames,
-			               bitmap_queued_frames, bitmap_queue_drops, bitmap_flushes, bitmap_empty_flushes,
+			               bitmap_queued_frames, bitmap_queue_drops, bitmap_stale_drops, bitmap_flushes,
+			               bitmap_empty_flushes,
 			               bitmap_frames, bitmap_pending ? 1U : 0U,
 		               usage.ru_maxrss, (unsigned long long)(server->active ?
 		               server->active->last_decode_latency_ms : 0),
@@ -873,6 +881,7 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 	memcpy(bitmap, bgra, expected_length);
 	client->bitmap_queue[slot] = bitmap;
 	client->bitmap_queue_lengths[slot] = expected_length;
+	client->bitmap_queue_queued_at[slot] = now;
 	client->bitmap_queue_count++;
 	client->bitmap_pending = true;
 	client->bitmap_queued_frames++;
@@ -884,8 +893,11 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 static bool client_flush_pending_bitmap(Client* client)
 {
 	uint8_t* bitmap = NULL;
+	uint8_t* stale[BITMAP_QUEUE_CAPACITY] = { 0 };
+	size_t stale_count = 0;
 	size_t bitmap_length = 0;
 	bool sent = true;
+	const uint64_t now = monotonic_milliseconds();
 	if (client->peer && client->peer->IsWriteBlocked && client->peer->DrainOutputBuffer &&
 	    client->peer->IsWriteBlocked(client->peer))
 	{
@@ -895,10 +907,35 @@ static bool client_flush_pending_bitmap(Client* client)
 	}
 	EnterCriticalSection(&client->lock);
 	client->bitmap_flushes++;
+	while (client->bitmap_queue_count > 0)
+	{
+		const uint8_t stale_slot = client->bitmap_queue_head;
+		if (now - client->bitmap_queue_queued_at[stale_slot] <= BITMAP_MAX_QUEUE_AGE_MS)
+			break;
+		stale[stale_count++] = client->bitmap_queue[stale_slot];
+		client->bitmap_queue[stale_slot] = NULL;
+		client->bitmap_queue_lengths[stale_slot] = 0;
+		client->bitmap_queue_queued_at[stale_slot] = 0;
+		client->bitmap_queue_head =
+		    (uint8_t)((client->bitmap_queue_head + 1U) % BITMAP_QUEUE_CAPACITY);
+		client->bitmap_queue_count--;
+		client->bitmap_queue_drops++;
+		client->bitmap_stale_drops++;
+	}
 	if (client->bitmap_queue_count == 0)
 	{
 		client->bitmap_empty_flushes++;
 		LeaveCriticalSection(&client->lock);
+		for (size_t index = 0; index < stale_count; index++)
+			free(stale[index]);
+		return true;
+	}
+	if (client->bitmap_last_send_started_at != 0 &&
+	    now - client->bitmap_last_send_started_at < BITMAP_FRAME_INTERVAL_MS)
+	{
+		LeaveCriticalSection(&client->lock);
+		for (size_t index = 0; index < stale_count; index++)
+			free(stale[index]);
 		return true;
 	}
 	const uint8_t slot = client->bitmap_queue_head;
@@ -906,10 +943,14 @@ static bool client_flush_pending_bitmap(Client* client)
 	bitmap_length = client->bitmap_queue_lengths[slot];
 	client->bitmap_queue[slot] = NULL;
 	client->bitmap_queue_lengths[slot] = 0;
+	client->bitmap_queue_queued_at[slot] = 0;
 	client->bitmap_queue_head = (uint8_t)((client->bitmap_queue_head + 1U) % BITMAP_QUEUE_CAPACITY);
 	client->bitmap_queue_count--;
 	client->bitmap_pending = client->bitmap_queue_count > 0;
+	client->bitmap_last_send_started_at = now;
 	LeaveCriticalSection(&client->lock);
+	for (size_t index = 0; index < stale_count; index++)
+		free(stale[index]);
 	if (!bitmap)
 	{
 		log_message("ERROR", "RDP bitmap queue가 비어 있지 않은데 frame buffer가 없습니다");
@@ -1431,9 +1472,18 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		{
 			EnterCriticalSection(&client->lock);
 			const bool bitmap_pending = client->bitmap_queue_count > 0;
+			const uint64_t last_send_started_at = client->bitmap_last_send_started_at;
 			LeaveCriticalSection(&client->lock);
 			if (bitmap_pending)
-				timeout = 0;
+			{
+				const uint64_t now = monotonic_milliseconds();
+				if (last_send_started_at == 0 ||
+				    now - last_send_started_at >= BITMAP_FRAME_INTERVAL_MS)
+					timeout = 0;
+				else
+					timeout = WINPR_ASSERTING_INT_CAST(
+					    DWORD, BITMAP_FRAME_INTERVAL_MS - (now - last_send_started_at));
+			}
 		}
 		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, timeout);
 		if (status == WAIT_TIMEOUT)
