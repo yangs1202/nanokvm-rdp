@@ -166,6 +166,8 @@ static uint8_t touch_buttons(uint8_t buttons)
 		report |= 0x01;
 	if ((buttons & 0x02U) != 0)
 		report |= 0x10;
+	if ((buttons & 0x04U) != 0)
+		report |= 0x04;
 	return report;
 }
 

@@ -4,8 +4,10 @@
 #include "rtp_h264.h"
 
 #include <assert.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -75,6 +77,26 @@ static void test_hid_mapping(void)
 	assert(hid_clamp_absolute(3000, 1920) == 1919);
 }
 
+static void test_hid_middle_button(void)
+{
+	char touch_path[] = "/tmp/nanokvm-rdp-touch-XXXXXX";
+	const int temp_fd = mkstemp(touch_path);
+	assert(temp_fd >= 0);
+	assert(close(temp_fd) == 0);
+
+	HidState hid;
+	hid_init(&hid, "/dev/null", "/dev/null", touch_path);
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xc000U));
+
+	const int read_fd = open(touch_path, O_RDONLY);
+	assert(read_fd >= 0);
+	uint8_t report[6] = { 0 };
+	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
+	assert(report[0] == 0x04);
+	assert(close(read_fd) == 0);
+	assert(unlink(touch_path) == 0);
+}
+
 static void test_protocol_primitives(void)
 {
 	uint8_t bytes[4] = { 0 };
@@ -134,6 +156,7 @@ int main(void)
 {
 	test_h264_annexb();
 	test_hid_mapping();
+	test_hid_middle_button();
 	test_protocol_primitives();
 	test_control_wire_message();
 	test_rtp_h264_fragmentation_and_loss();
