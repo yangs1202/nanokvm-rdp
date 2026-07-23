@@ -541,6 +541,12 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 		log_message("ERROR", "RDPGFX AVC420 frame 전송 실패");
 		return false;
 	}
+	EnterCriticalSection(&client->lock);
+	client->bitmap_frames++;
+	const uint32_t frame_count = client->bitmap_frames;
+	LeaveCriticalSection(&client->lock);
+	if (frame_count == 1)
+		log_message("INFO", "NanoKVM RTP/H.264 → RDPGFX AVC420 첫 frame 전송 완료");
 	return true;
 }
 
