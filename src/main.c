@@ -303,11 +303,24 @@ static void server_heartbeat(Server* server)
 	struct rusage usage = { 0 };
 	if (getrusage(RUSAGE_SELF, &usage) == 0)
 	{
+		uint32_t bitmap_frames = 0;
+		bool bitmap_pending = false;
+		EnterCriticalSection(&server->lock);
+		Client* active = server->active;
+		if (active)
+		{
+			EnterCriticalSection(&active->lock);
+			bitmap_frames = active->bitmap_frames;
+			bitmap_pending = active->bitmap_pending;
+			LeaveCriticalSection(&active->lock);
+		}
+		LeaveCriticalSection(&server->lock);
 		char message[256] = { 0 };
 		(void)snprintf(message, sizeof(message),
-		               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u gateway_rss=%ld latency_ms=%llu queue=0",
+		               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rdp_frames=%u queue=%u gateway_rss=%ld latency_ms=%llu",
 		               server->agent_sent_packets, server->agent_dropped_packets,
 		               server->agent_capture_frames, server->agent_dropped_frames,
+		               bitmap_frames, bitmap_pending ? 1U : 0U,
 		               usage.ru_maxrss, (unsigned long long)(server->active ?
 		               server->active->last_decode_latency_ms : 0));
 		log_message("INFO", message);
