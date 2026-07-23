@@ -851,6 +851,13 @@ static bool client_flush_pending_bitmap(Client* client)
 	uint8_t* bitmap = NULL;
 	size_t bitmap_length = 0;
 	bool sent = true;
+	if (client->peer && client->peer->IsWriteBlocked && client->peer->DrainOutputBuffer &&
+	    client->peer->IsWriteBlocked(client->peer))
+	{
+		(void)client->peer->DrainOutputBuffer(client->peer);
+		if (client->peer->IsWriteBlocked(client->peer))
+			return true;
+	}
 	EnterCriticalSection(&client->lock);
 	if (client->bitmap_pending)
 	{
