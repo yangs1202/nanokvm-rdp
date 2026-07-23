@@ -9,6 +9,7 @@
 #include <freerdp/channels/rdpgfx.h>
 #include <freerdp/channels/wtsvc.h>
 #include <freerdp/codec/color.h>
+#include <freerdp/codec/interleaved.h>
 #include <freerdp/codec/nsc.h>
 #include <freerdp/codec/rfx.h>
 #include <freerdp/freerdp.h>
@@ -119,6 +120,7 @@ struct Client
 	HANDLE video_thread;
 	RFX_CONTEXT* rfx;
 	NSC_CONTEXT* nsc;
+	BITMAP_INTERLEAVED_CONTEXT* interleaved;
 	wStream* bitmap_stream;
 	CRITICAL_SECTION lock;
 	uint8_t* pending_bitmap;
@@ -652,74 +654,49 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	const uint16_t height = client->render_height;
 	const size_t expected_length = (size_t)width * height * 4U;
 	const rdpSettings* settings = client->context.settings;
-	const uint32_t color_depth =
-	    settings ? freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth) : 0;
-	const uint16_t bits_per_pixel = color_depth == 24 ? 16 : (uint16_t)color_depth;
-	const size_t bytes_per_pixel = bits_per_pixel / 8U;
-	const size_t row_bytes = (size_t)width * bytes_per_pixel;
-	const uint16_t rows_per_rectangle =
-	    row_bytes ? WINPR_ASSERTING_INT_CAST(uint16_t, UINT16_MAX / row_bytes) : 0;
-	uint8_t* reversed = NULL;
+	const uint16_t bits_per_pixel = 16;
 
 	if (!client->context.update || !client->context.update->BitmapUpdate ||
-	    settings == NULL ||
-	    (bits_per_pixel != 16 && bits_per_pixel != 32) ||
-	    length != expected_length || rows_per_rectangle == 0 || client_should_stop(client))
+	    settings == NULL || !client->interleaved || length != expected_length ||
+	    client_should_stop(client))
 		return false;
 
-	reversed = malloc(row_bytes * rows_per_rectangle);
-	if (!reversed)
-		return false;
-
-	for (uint16_t top = 0; top < height;)
+	for (uint16_t top = 0; top < height; top += 64)
 	{
-		const uint16_t rows = MIN(rows_per_rectangle, (uint16_t)(height - top));
-		BITMAP_DATA rectangle = WINPR_C_ARRAY_INIT;
-		BITMAP_UPDATE bitmap = WINPR_C_ARRAY_INIT;
-
-		for (uint16_t row = 0; row < rows; row++)
+		const uint16_t rows = MIN(64, (uint16_t)(height - top));
+		for (uint16_t left = 0; left < width; left += 64)
 		{
-			const size_t source_row = (size_t)(top + rows - row - 1);
-			const uint8_t* source = bgra + (source_row * (size_t)width * 4U);
-			uint8_t* destination = reversed + ((size_t)row * row_bytes);
-			if (bits_per_pixel == 32)
-				memcpy(destination, source, row_bytes);
-			else
-			{
-				for (uint16_t column = 0; column < width; column++)
-				{
-					const uint8_t* pixel = source + ((size_t)column * 4U);
-					const uint16_t rgb565 = (uint16_t)(((uint16_t)(pixel[2] >> 3) << 11U) |
-					                                  ((uint16_t)(pixel[1] >> 2) << 5U) |
-					                                  (uint16_t)(pixel[0] >> 3));
-					memcpy(destination + ((size_t)column * 2U), &rgb565, sizeof(rgb565));
-				}
-			}
+			const uint16_t columns = MIN(64, (uint16_t)(width - left));
+			uint8_t encoded[64 * 64 * 4] = { 0 };
+			uint32_t encoded_length = sizeof(encoded);
+			BITMAP_DATA rectangle = WINPR_C_ARRAY_INIT;
+			BITMAP_UPDATE bitmap = WINPR_C_ARRAY_INIT;
+			if ((columns % 4) != 0 ||
+			    !interleaved_compress(client->interleaved, encoded, &encoded_length, columns, rows,
+			                          bgra, PIXEL_FORMAT_BGRX32, (uint32_t)width * 4U, left, top,
+			                          NULL, bits_per_pixel))
+				return false;
+			rectangle.destLeft = left;
+			rectangle.destTop = top;
+			rectangle.destRight = left + columns - 1;
+			rectangle.destBottom = top + rows - 1;
+			rectangle.width = columns;
+			rectangle.height = rows;
+			rectangle.bitsPerPixel = bits_per_pixel;
+			rectangle.bitmapLength = WINPR_ASSERTING_INT_CAST(uint16_t, encoded_length);
+			rectangle.bitmapDataStream = encoded;
+			rectangle.compressed = TRUE;
+			rectangle.cbCompFirstRowSize = 0;
+			rectangle.cbCompMainBodySize = encoded_length;
+			rectangle.cbScanWidth = columns * 2U;
+			rectangle.cbUncompressedSize = columns * rows * 2U;
+			bitmap.number = 1;
+			bitmap.rectangles = &rectangle;
+			bitmap.skipCompression = FALSE;
+			if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
+				return false;
 		}
-
-		rectangle.destLeft = 0;
-		rectangle.destTop = top;
-		rectangle.destRight = width - 1;
-		rectangle.destBottom = top + rows - 1;
-		rectangle.width = width;
-		rectangle.height = rows;
-		rectangle.bitsPerPixel = bits_per_pixel;
-		rectangle.bitmapLength = WINPR_ASSERTING_INT_CAST(uint16_t, row_bytes * rows);
-		rectangle.bitmapDataStream = reversed;
-		rectangle.compressed = FALSE;
-		bitmap.number = 1;
-		bitmap.rectangles = &rectangle;
-		bitmap.skipCompression = FALSE;
-
-		if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
-		{
-			free(reversed);
-			return false;
-		}
-		top += rows;
 	}
-
-	free(reversed);
 	return true;
 }
 
@@ -1087,6 +1064,8 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 		rfx_context_free(client->rfx);
 	if (client->nsc)
 		nsc_context_free(client->nsc);
+	if (client->interleaved)
+		bitmap_interleaved_context_free(client->interleaved);
 	if (client->bitmap_stream)
 		Stream_Free(client->bitmap_stream, TRUE);
 	free(client->pending_bitmap);
@@ -1161,6 +1140,9 @@ static bool client_prepare_bitmap(Client* client)
 		               "RemoteFX/NSCodec 없이 %u-bit classic BitmapUpdate 경로를 사용합니다",
 		               color_depth == 24 ? 16 : color_depth);
 		log_message("INFO", message);
+		client->interleaved = bitmap_interleaved_context_new(TRUE);
+		if (!client->interleaved)
+			return false;
 	}
 	if (client->bitmap_uses_rfx || client->nsc)
 	{
