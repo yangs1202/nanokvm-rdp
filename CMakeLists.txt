@@ -18,6 +18,7 @@ if(NANOKVM_RDP_BUILD_TESTS)
     src/h264.c
     src/protocol.c
     src/rtp_h264.c
+    src/musl_compat.c
   )
   target_include_directories(nanokvm-rdp-unit PRIVATE src)
   target_compile_options(nanokvm-rdp-unit PRIVATE -Wall -Wextra -Werror)
@@ -39,6 +40,7 @@ if(NANOKVM_RDP_BUILD_AGENT)
     src/h264.c
     src/protocol.c
     src/rtp_h264.c
+    src/musl_compat.c
   )
   target_include_directories(nanokvm-agent PRIVATE src)
   target_compile_options(nanokvm-agent PRIVATE -Wall -Wextra -Werror)
