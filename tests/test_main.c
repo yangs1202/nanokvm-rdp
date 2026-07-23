@@ -29,12 +29,14 @@ static bool collect_packet(void* context, const uint8_t* packet, size_t length)
 	return true;
 }
 
-static bool collect_nal(void* context, const uint8_t* nal, size_t length, uint32_t timestamp)
+static bool collect_nal(void* context, const uint8_t* nal, size_t length, uint32_t timestamp,
+	                    bool marker)
 {
 	RtpTestState* state = context;
 	assert(timestamp == 90000U);
 	memcpy(state->output, nal, length);
 	state->output_length = length;
+	assert(marker);
 	return true;
 }
 

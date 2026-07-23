@@ -8,23 +8,49 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-static bool save_nal(void* context, const uint8_t* nal, size_t length, uint32_t timestamp)
+static bool append_access_unit(RtpClient* client, const uint8_t* data, size_t length)
 {
-	(void)timestamp;
-	RtpClient* client = context;
-	uint8_t* copied = malloc(length);
-	if (!copied)
+	if (length > RTP_H264_MAX_NAL - client->access_unit_length)
 		return false;
-	memcpy(copied, nal, length);
-	free(client->nal);
-	client->nal = copied;
-	client->nal_length = length;
+	const size_t needed = client->access_unit_length + length;
+	if (needed > client->access_unit_capacity)
+	{
+		size_t capacity = client->access_unit_capacity ? client->access_unit_capacity : 4096U;
+		while (capacity < needed)
+			capacity *= 2U;
+		uint8_t* resized = realloc(client->access_unit, capacity);
+		if (!resized)
+			return false;
+		client->access_unit = resized;
+		client->access_unit_capacity = capacity;
+	}
+	memcpy(client->access_unit + client->access_unit_length, data, length);
+	client->access_unit_length += length;
 	return true;
+}
+
+static bool save_nal(void* context, const uint8_t* nal, size_t length, uint32_t timestamp,
+	                 bool marker)
+{
+	(void)marker;
+	RtpClient* client = context;
+	if (!client->have_access_unit || client->access_unit_timestamp != timestamp)
+	{
+		client->access_unit_length = 0;
+		client->access_unit_timestamp = timestamp;
+		client->have_access_unit = true;
+	}
+	const uint8_t start_code[] = { 0, 0, 0, 1 };
+	return append_access_unit(client, start_code, sizeof(start_code)) &&
+	       append_access_unit(client, nal, length);
 }
 
 static void count_loss(void* context)
 {
-	((RtpClient*)context)->losses++;
+	RtpClient* client = context;
+	client->losses++;
+	client->access_unit_length = 0;
+	client->have_access_unit = false;
 }
 
 bool rtp_client_open(RtpClient* client, uint16_t port)
@@ -63,18 +89,17 @@ bool rtp_client_read_h264(RtpClient* client, uint8_t** data, size_t* length)
 			continue;
 		if (received <= 0)
 			return false;
-		free(client->nal);
-		client->nal = NULL;
-		client->nal_length = 0;
 		if (!rtp_h264_reassembler_push(&client->reassembler, packet, (size_t)received, save_nal,
 		                              client, count_loss, client))
 			continue;
-		if (!client->nal)
+		if ((packet[1] & 0x80U) == 0 || client->access_unit_length == 0)
 			continue;
-		*data = client->nal;
-		*length = client->nal_length;
-		client->nal = NULL;
-		client->nal_length = 0;
+		*data = client->access_unit;
+		*length = client->access_unit_length;
+		client->access_unit = NULL;
+		client->access_unit_length = 0;
+		client->access_unit_capacity = 0;
+		client->have_access_unit = false;
 		return true;
 	}
 }
@@ -85,7 +110,7 @@ void rtp_client_close(RtpClient* client)
 		return;
 	if (client->fd >= 0)
 		(void)close(client->fd);
-	free(client->nal);
+	free(client->access_unit);
 	rtp_h264_reassembler_free(&client->reassembler);
 	*client = (RtpClient){ .fd = -1 };
 }

@@ -11,8 +11,11 @@ typedef struct
 {
 	int fd;
 	RtpH264Reassembler reassembler;
-	uint8_t* nal;
-	size_t nal_length;
+	uint8_t* access_unit;
+	size_t access_unit_length;
+	size_t access_unit_capacity;
+	uint32_t access_unit_timestamp;
+	bool have_access_unit;
 	uint32_t losses;
 } RtpClient;
 

@@ -10,7 +10,7 @@
 
 typedef bool (*RtpH264PacketCallback)(void* context, const uint8_t* packet, size_t length);
 typedef bool (*RtpH264NalCallback)(void* context, const uint8_t* nal, size_t length,
-	                              uint32_t timestamp);
+	                              uint32_t timestamp, bool marker);
 typedef void (*RtpH264LossCallback)(void* context);
 
 typedef struct
@@ -35,6 +35,9 @@ typedef struct
 void rtp_h264_packetizer_init(RtpH264Packetizer* packetizer, uint16_t mtu, uint32_t ssrc);
 bool rtp_h264_packetize(RtpH264Packetizer* packetizer, const uint8_t* nal, size_t length,
 	                     uint32_t timestamp, RtpH264PacketCallback callback, void* context);
+bool rtp_h264_packetize_marker(RtpH264Packetizer* packetizer, const uint8_t* nal, size_t length,
+	                            uint32_t timestamp, bool marker,
+	                            RtpH264PacketCallback callback, void* context);
 void rtp_h264_reassembler_init(RtpH264Reassembler* reassembler);
 void rtp_h264_reassembler_free(RtpH264Reassembler* reassembler);
 bool rtp_h264_reassembler_push(RtpH264Reassembler* reassembler, const uint8_t* packet,

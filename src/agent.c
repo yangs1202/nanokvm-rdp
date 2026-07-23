@@ -185,27 +185,33 @@ static size_t start_code_length(const uint8_t* data, size_t length, size_t offse
 
 static bool send_h264(Agent* agent, const uint8_t* data, size_t length)
 {
+	size_t first = length;
+	for (size_t offset = 0; offset < length; offset++)
+	{
+		const size_t code = start_code_length(data, length, offset);
+		if (code != 0)
+		{
+			first = offset;
+			break;
+		}
+	}
+	if (first == length)
+		return rtp_h264_packetize(&agent->packetizer, data, length, agent->timestamp, send_packet, agent);
 	bool sent = false;
-	size_t start = 0;
-	for (size_t offset = 0; offset < length;)
+	for (size_t offset = first; offset < length;)
 	{
 		const size_t code = start_code_length(data, length, offset);
 		if (code == 0)
-		{
-			offset++;
-			continue;
-		}
-		if (start != 0 && offset > start)
-			sent |= rtp_h264_packetize(&agent->packetizer, data + start, offset - start,
-			                            agent->timestamp, send_packet, agent);
-		start = offset + code;
-		offset = start;
+			return false;
+		const size_t start = offset + code;
+		size_t next = start;
+		while (next < length && start_code_length(data, length, next) == 0)
+			next++;
+		if (start < next)
+			sent |= rtp_h264_packetize_marker(&agent->packetizer, data + start, next - start,
+		                                   agent->timestamp, next == length, send_packet, agent);
+		offset = next;
 	}
-	if (start == 0)
-		sent = rtp_h264_packetize(&agent->packetizer, data, length, agent->timestamp, send_packet, agent);
-	else if (start < length)
-		sent |= rtp_h264_packetize(&agent->packetizer, data + start, length - start, agent->timestamp,
-		                           send_packet, agent);
 	return sent;
 }
 

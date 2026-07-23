@@ -55,14 +55,15 @@ void rtp_h264_packetizer_init(RtpH264Packetizer* packetizer, uint16_t mtu, uint3
 		packetizer->mtu = RTP_H264_DEFAULT_MTU;
 }
 
-bool rtp_h264_packetize(RtpH264Packetizer* packetizer, const uint8_t* nal, size_t length,
-	                     uint32_t timestamp, RtpH264PacketCallback callback, void* context)
+bool rtp_h264_packetize_marker(RtpH264Packetizer* packetizer, const uint8_t* nal, size_t length,
+	                            uint32_t timestamp, bool marker,
+	                            RtpH264PacketCallback callback, void* context)
 {
 	if (!packetizer || !nal || length == 0 || length > RTP_H264_MAX_NAL)
 		return false;
 	const size_t payload_limit = packetizer->mtu - RTP_HEADER_SIZE;
 	if (length <= payload_limit)
-		return emit_packet(packetizer, nal, length, true, timestamp, callback, context);
+		return emit_packet(packetizer, nal, length, marker, timestamp, callback, context);
 	const size_t fragment_limit = payload_limit - 2U;
 	if (fragment_limit == 0)
 		return false;
@@ -74,12 +75,19 @@ bool rtp_h264_packetize(RtpH264Packetizer* packetizer, const uint8_t* nal, size_
 		payload[1] = (uint8_t)((nal[0] & 0x1fU) | (offset == 1 ? 0x80U : 0) |
 		                       (offset + fragment == length ? 0x40U : 0));
 		memcpy(payload + 2, nal + offset, fragment);
-		if (!emit_packet(packetizer, payload, fragment + 2, offset + fragment == length, timestamp,
+		if (!emit_packet(packetizer, payload, fragment + 2,
+		                 marker && offset + fragment == length, timestamp,
 		                 callback, context))
 			return false;
 		offset += fragment;
 	}
 	return true;
+}
+
+bool rtp_h264_packetize(RtpH264Packetizer* packetizer, const uint8_t* nal, size_t length,
+	                     uint32_t timestamp, RtpH264PacketCallback callback, void* context)
+{
+	return rtp_h264_packetize_marker(packetizer, nal, length, timestamp, true, callback, context);
 }
 
 void rtp_h264_reassembler_init(RtpH264Reassembler* reassembler)
@@ -114,10 +122,11 @@ static bool append(RtpH264Reassembler* reassembler, const uint8_t* data, size_t 
 	return true;
 }
 
-static bool deliver(RtpH264Reassembler* reassembler, RtpH264NalCallback callback, void* context)
+static bool deliver(RtpH264Reassembler* reassembler, RtpH264NalCallback callback, void* context,
+	               bool marker)
 {
 	const bool result = callback && callback(context, reassembler->buffer, reassembler->length,
-	                                         reassembler->timestamp);
+	                                         reassembler->timestamp, marker);
 	reassembler->assembling = false;
 	reassembler->length = 0;
 	return result;
@@ -140,11 +149,12 @@ bool rtp_h264_reassembler_push(RtpH264Reassembler* reassembler, const uint8_t* p
 	reassembler->have_sequence = true;
 	reassembler->expected_sequence = (uint16_t)(sequence + 1U);
 	const uint32_t timestamp = read_u32(packet + 4);
+	const bool marker = (packet[1] & 0x80U) != 0;
 	const uint8_t* payload = packet + RTP_HEADER_SIZE;
 	const size_t payload_length = length - RTP_HEADER_SIZE;
 	const uint8_t type = payload[0] & 0x1fU;
 	if (type >= 1U && type <= 23U)
-		return nal_callback && nal_callback(nal_context, payload, payload_length, timestamp);
+		return nal_callback && nal_callback(nal_context, payload, payload_length, timestamp, marker);
 	if (type != 28U || payload_length < 3)
 		return true;
 	const bool start = (payload[1] & 0x80U) != 0;
@@ -161,5 +171,5 @@ bool rtp_h264_reassembler_push(RtpH264Reassembler* reassembler, const uint8_t* p
 	if (!reassembler->assembling || timestamp != reassembler->timestamp ||
 	    !append(reassembler, payload + 2, payload_length - 2))
 		return false;
-	return end ? deliver(reassembler, nal_callback, nal_context) : true;
+	return end ? deliver(reassembler, nal_callback, nal_context, marker) : true;
 }

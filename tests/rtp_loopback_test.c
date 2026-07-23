@@ -28,10 +28,12 @@ static bool send_packet(void* context, const uint8_t* packet, size_t length)
 	              sizeof(sender->target)) == (ssize_t)length;
 }
 
-static bool receive_nal(void* context, const uint8_t* nal, size_t length, uint32_t timestamp)
+static bool receive_nal(void* context, const uint8_t* nal, size_t length, uint32_t timestamp,
+	                    bool marker)
 {
 	Receiver* receiver = context;
 	assert(timestamp == 1234U);
+	assert(marker);
 	memcpy(receiver->data, nal, length);
 	receiver->length = length;
 	return true;
