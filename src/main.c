@@ -137,6 +137,10 @@ struct Client
 	uint16_t render_height;
 	uint32_t bitmap_frames;
 	uint32_t decoded_frames;
+	uint32_t bitmap_queued_frames;
+	uint32_t bitmap_interval_drops;
+	uint32_t bitmap_flushes;
+	uint32_t bitmap_empty_flushes;
 	uint32_t rtp_nals;
 	uint32_t rtp_access_units;
 	uint32_t rtp_idr_units;
@@ -300,8 +304,12 @@ static void server_heartbeat(Server* server)
 	struct rusage usage = { 0 };
 	if (getrusage(RUSAGE_SELF, &usage) == 0)
 	{
-	uint32_t bitmap_frames = 0;
+		uint32_t bitmap_frames = 0;
 		uint32_t decoded_frames = 0;
+		uint32_t bitmap_queued_frames = 0;
+		uint32_t bitmap_interval_drops = 0;
+		uint32_t bitmap_flushes = 0;
+		uint32_t bitmap_empty_flushes = 0;
 		uint32_t rtp_nals = 0;
 		uint32_t rtp_access_units = 0;
 		uint32_t rtp_idr_units = 0;
@@ -315,6 +323,10 @@ static void server_heartbeat(Server* server)
 			EnterCriticalSection(&active->lock);
 			bitmap_frames = active->bitmap_frames;
 			decoded_frames = active->decoded_frames;
+			bitmap_queued_frames = active->bitmap_queued_frames;
+			bitmap_interval_drops = active->bitmap_interval_drops;
+			bitmap_flushes = active->bitmap_flushes;
+			bitmap_empty_flushes = active->bitmap_empty_flushes;
 			rtp_nals = active->rtp_nals;
 			rtp_access_units = active->rtp_access_units;
 			rtp_idr_units = active->rtp_idr_units;
@@ -326,11 +338,12 @@ static void server_heartbeat(Server* server)
 		LeaveCriticalSection(&server->lock);
 		char message[256] = { 0 };
 		(void)snprintf(message, sizeof(message),
-		               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u rdp_frames=%u queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
-		               server->agent_sent_packets, server->agent_dropped_packets,
-		               server->agent_capture_frames, server->agent_dropped_frames,
-		               rtp_nals, rtp_access_units, rtp_idr_units, rtp_p_units, decoded_frames,
-		               bitmap_frames, bitmap_pending ? 1U : 0U,
+			               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u queued=%u interval_drop=%u flush=%u empty_flush=%u rdp_frames=%u queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
+			               server->agent_sent_packets, server->agent_dropped_packets,
+			               server->agent_capture_frames, server->agent_dropped_frames,
+			               rtp_nals, rtp_access_units, rtp_idr_units, rtp_p_units, decoded_frames,
+			               bitmap_queued_frames, bitmap_interval_drops, bitmap_flushes, bitmap_empty_flushes,
+			       bitmap_frames, bitmap_pending ? 1U : 0U,
 		               usage.ru_maxrss, (unsigned long long)(server->active ?
 		               server->active->last_decode_latency_ms : 0),
 		               (unsigned long long)rdp_send_ms);
@@ -825,6 +838,7 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 	if (client->bitmap_last_queued_at != 0 &&
 	    now - client->bitmap_last_queued_at < BITMAP_MIN_INTERVAL_MS)
 	{
+		client->bitmap_interval_drops++;
 		LeaveCriticalSection(&client->lock);
 		return true;
 	}
@@ -841,6 +855,7 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 	memcpy(client->pending_bitmap, bgra, expected_length);
 	client->bitmap_pending = true;
 	client->bitmap_last_queued_at = now;
+	client->bitmap_queued_frames++;
 	client->last_decode_latency_ms = now - client->last_rtp_received_at;
 	LeaveCriticalSection(&client->lock);
 	return true;
@@ -859,6 +874,7 @@ static bool client_flush_pending_bitmap(Client* client)
 			return true;
 	}
 	EnterCriticalSection(&client->lock);
+	client->bitmap_flushes++;
 	if (client->bitmap_pending)
 	{
 		bitmap = client->pending_bitmap;
@@ -869,7 +885,12 @@ static bool client_flush_pending_bitmap(Client* client)
 	}
 	LeaveCriticalSection(&client->lock);
 	if (!bitmap)
+	{
+		EnterCriticalSection(&client->lock);
+		client->bitmap_empty_flushes++;
+		LeaveCriticalSection(&client->lock);
 		return true;
+	}
 
 	const uint64_t started_at = monotonic_milliseconds();
 	sent = send_bitmap_frame(client, bitmap, bitmap_length);
