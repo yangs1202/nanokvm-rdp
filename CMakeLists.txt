@@ -6,6 +6,8 @@ option(NANOKVM_RDP_BUILD_SERVER "Build the gateway RDP server" ON)
 option(NANOKVM_RDP_BUILD_AGENT "Build the NanoKVM capture and HID agent" ON)
 option(NANOKVM_RDP_BUILD_TESTS "Build local unit tests" ON)
 
+find_package(Threads REQUIRED)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
@@ -44,7 +46,7 @@ if(NANOKVM_RDP_BUILD_AGENT)
   )
   target_include_directories(nanokvm-agent PRIVATE src)
   target_compile_options(nanokvm-agent PRIVATE -Wall -Wextra -Werror)
-  target_link_libraries(nanokvm-agent PRIVATE dl)
+  target_link_libraries(nanokvm-agent PRIVATE dl Threads::Threads)
 endif()
 
 if(NANOKVM_RDP_BUILD_SERVER)

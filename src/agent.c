@@ -7,7 +7,9 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -53,16 +55,17 @@ typedef struct
 	KvmApi kvm;
 	HidState hid;
 	RtpH264Packetizer packetizer;
-	bool streaming;
-	bool wait_for_idr;
+	atomic_bool streaming;
+	atomic_bool wait_for_idr;
 	uint32_t timestamp;
-	uint32_t sent_packets;
-	uint32_t dropped_packets;
-	uint32_t capture_frames;
-	uint32_t dropped_frames;
+	atomic_uint_fast32_t sent_packets;
+	atomic_uint_fast32_t dropped_packets;
+	atomic_uint_fast32_t capture_frames;
+	atomic_uint_fast32_t dropped_frames;
 	uint64_t last_ping_at;
 	uint64_t last_pong_at;
 	uint64_t last_stats_at;
+	pthread_t video_thread;
 } Agent;
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -141,17 +144,17 @@ static void disconnect_control(Agent* agent)
 	if (agent->control_fd >= 0)
 		(void)close(agent->control_fd);
 	agent->control_fd = -1;
-	agent->streaming = false;
-	agent->wait_for_idr = true;
+	atomic_store(&agent->streaming, false);
+	atomic_store(&agent->wait_for_idr, true);
 }
 
 static bool send_stats(Agent* agent)
 {
 	uint8_t payload[NANOKVM_STATS_PAYLOAD_SIZE] = { 0 };
-	protocol_write_u32(payload, agent->sent_packets);
-	protocol_write_u32(payload + 4, agent->dropped_packets);
-	protocol_write_u32(payload + 8, agent->capture_frames);
-	protocol_write_u32(payload + 12, agent->dropped_frames);
+	protocol_write_u32(payload, atomic_load(&agent->sent_packets));
+	protocol_write_u32(payload + 4, atomic_load(&agent->dropped_packets));
+	protocol_write_u32(payload + 8, atomic_load(&agent->capture_frames));
+	protocol_write_u32(payload + 12, atomic_load(&agent->dropped_frames));
 	return protocol_send(agent->control_fd, NANOKVM_CONTROL_STATS, payload, sizeof(payload));
 }
 
@@ -163,10 +166,10 @@ static bool send_packet(void* context, const uint8_t* packet, size_t length)
 	                              sizeof(agent->video_address));
 	if (result == (ssize_t)length)
 	{
-		agent->sent_packets++;
+		(void)atomic_fetch_add(&agent->sent_packets, 1);
 		return true;
 	}
-	agent->dropped_packets++;
+	(void)atomic_fetch_add(&agent->dropped_packets, 1);
 	return false;
 }
 
@@ -211,18 +214,18 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 	switch (message->type)
 	{
 		case NANOKVM_CONTROL_START_STREAM:
-			agent->streaming = true;
-			agent->wait_for_idr = true;
+			atomic_store(&agent->streaming, true);
+			atomic_store(&agent->wait_for_idr, true);
 			(void)fprintf(stderr, "%s: START_STREAM 수신 (%ux%u 원본 H.264 전송 시작)\n", TAG,
 			              agent->width, agent->height);
 			break;
 		case NANOKVM_CONTROL_STOP_STREAM:
-			agent->streaming = false;
+			atomic_store(&agent->streaming, false);
 			hid_release_all(&agent->hid);
 			(void)fprintf(stderr, "%s: STOP_STREAM 수신\n", TAG);
 			break;
 		case NANOKVM_CONTROL_IDR_REQUEST:
-			agent->wait_for_idr = true;
+			atomic_store(&agent->wait_for_idr, true);
 			break;
 		case NANOKVM_CONTROL_KEY:
 			if (message->length == 3)
@@ -264,6 +267,45 @@ static void usage(const char* executable)
 	(void)fprintf(stderr, "Usage: %s -gateway IPv4 [-control-port n] [-video-port n] [-width n] [-height n] [-bitrate n]\n", executable);
 }
 
+static void* video_loop(void* argument)
+{
+	Agent* agent = argument;
+	while (!stop_requested)
+	{
+		if (!atomic_load(&agent->streaming))
+		{
+			const struct timespec pause = { .tv_sec = 0, .tv_nsec = 10000000L };
+			(void)nanosleep(&pause, NULL);
+			continue;
+		}
+		uint8_t* data = NULL;
+		uint32_t length = 0;
+		const int kind = agent->kvm.read_image(agent->width, agent->height, 1, agent->bitrate,
+		                                        &data, &length);
+		if (kind < 0 || !data || length == 0)
+		{
+			if (data)
+				(void)agent->kvm.free_data(&data);
+			continue;
+		}
+		if (kind == KVM_FRAME_IDR)
+			atomic_store(&agent->wait_for_idr, false);
+		(void)atomic_fetch_add(&agent->capture_frames, 1);
+		if (atomic_load(&agent->streaming) &&
+		    (kind == KVM_FRAME_SPS || kind == KVM_FRAME_PPS || kind == KVM_FRAME_IDR ||
+		     (!atomic_load(&agent->wait_for_idr) && kind == KVM_FRAME_P)))
+		{
+			if (!send_h264(agent, data, length))
+				(void)atomic_fetch_add(&agent->dropped_frames, 1);
+		}
+		else if (kind == KVM_FRAME_P)
+			(void)atomic_fetch_add(&agent->dropped_frames, 1);
+		agent->timestamp += 9000U;
+		(void)agent->kvm.free_data(&data);
+	}
+	return NULL;
+}
+
 int main(int argc, char* argv[])
 {
 	Agent agent = { .control_port = DEFAULT_CONTROL_PORT, .video_port = DEFAULT_VIDEO_PORT,
@@ -302,9 +344,17 @@ int main(int argc, char* argv[])
 		return 1;
 	rtp_h264_packetizer_init(&agent.packetizer, RTP_H264_DEFAULT_MTU, (uint32_t)getpid());
 	hid_init(&agent.hid, NULL, NULL, NULL);
+	atomic_init(&agent.streaming, false);
+	atomic_init(&agent.wait_for_idr, true);
+	atomic_init(&agent.sent_packets, 0);
+	atomic_init(&agent.dropped_packets, 0);
+	atomic_init(&agent.capture_frames, 0);
+	atomic_init(&agent.dropped_frames, 0);
 	(void)signal(SIGINT, on_signal);
 	(void)signal(SIGTERM, on_signal);
 	(void)signal(SIGPIPE, SIG_IGN);
+	if (pthread_create(&agent.video_thread, NULL, video_loop, &agent) != 0)
+		return 1;
 	while (!stop_requested)
 	{
 		if (agent.control_fd < 0)
@@ -349,31 +399,8 @@ int main(int argc, char* argv[])
 			}
 			agent.last_stats_at = now;
 		}
-		if (!agent.streaming)
-			continue;
-		uint8_t* data = NULL;
-		uint32_t length = 0;
-		const int kind = agent.kvm.read_image(agent.width, agent.height, 1, agent.bitrate, &data, &length);
-		if (kind < 0 || !data || length == 0)
-		{
-			if (data)
-				(void)agent.kvm.free_data(&data);
-			continue;
-		}
-		if (kind == KVM_FRAME_IDR)
-			agent.wait_for_idr = false;
-		agent.capture_frames++;
-		if ((kind == KVM_FRAME_SPS || kind == KVM_FRAME_PPS || kind == KVM_FRAME_IDR ||
-		     (!agent.wait_for_idr && kind == KVM_FRAME_P)))
-		{
-			if (!send_h264(&agent, data, length))
-				agent.dropped_frames++;
-		}
-		else if (kind == KVM_FRAME_P)
-			agent.dropped_frames++;
-		agent.timestamp += 9000U;
-		(void)agent.kvm.free_data(&data);
 	}
+	(void)pthread_join(agent.video_thread, NULL);
 	hid_release_all(&agent.hid);
 	if (agent.control_fd >= 0)
 		(void)close(agent.control_fd);
