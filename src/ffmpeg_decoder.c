@@ -90,7 +90,7 @@ bool ffmpeg_decoder_start(FfmpegDecoder* decoder, uint16_t width, uint16_t heigh
 		(void)close(output[0]);
 		(void)close(output[1]);
 		execlp("ffmpeg", "ffmpeg", "-loglevel", "error", "-threads", "4", "-filter_threads", "4",
-		      "-fflags", "nobuffer", "-flags", "low_delay", "-f", "h264", "-i", "pipe:0", "-an", "-pix_fmt",
+		      "-flags", "low_delay", "-f", "h264", "-i", "pipe:0", "-an", "-pix_fmt",
 		      "bgra", "-vf", scale, "-f", "rawvideo", "pipe:1", (char*)NULL);
 		_exit(127);
 	}
