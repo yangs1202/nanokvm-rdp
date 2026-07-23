@@ -137,6 +137,8 @@ struct Client
 	uint8_t* pps;
 	size_t pps_length;
 	bool bitmap_uses_rfx;
+	uint16_t render_width;
+	uint16_t render_height;
 	uint32_t bitmap_frames;
 	uint64_t bitmap_last_sent_at;
 	bool keyboard_input_logged;
@@ -625,8 +627,8 @@ static bool bitmap_stream_nsc_supported(const rdpSettings* settings)
 
 static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
 {
-	const uint16_t width = client->server->config.width;
-	const uint16_t height = client->server->config.height;
+	const uint16_t width = client->render_width;
+	const uint16_t height = client->render_height;
 	const size_t expected_length = (size_t)width * height * 4U;
 	const rdpSettings* settings = client->context.settings;
 	const uint32_t color_depth =
@@ -702,8 +704,8 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 
 static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
 {
-	const uint16_t width = client->server->config.width;
-	const uint16_t height = client->server->config.height;
+	const uint16_t width = client->render_width;
+	const uint16_t height = client->render_height;
 	const size_t expected_length = (size_t)width * height * 4U;
 	rdpSettings* settings = client->context.settings;
 	rdpUpdate* update = client->context.update;
@@ -789,8 +791,8 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 	Client* client = (Client*)argument;
 	RtpClient rtp = { .fd = -1 };
 	FfmpegDecoder decoder = { .pid = -1, .input = -1, .output = -1 };
-	const uint16_t width = client->server->config.width;
-	const uint16_t height = client->server->config.height;
+	const uint16_t width = client->render_width;
+	const uint16_t height = client->render_height;
 	bool backend_ready = false;
 
 	for (unsigned attempt = 0; attempt < 10 && !client_should_stop(client); attempt++)
@@ -876,6 +878,24 @@ static BOOL on_unicode_keyboard(rdpInput* input, UINT16 flags, UINT16 code)
 	(void)flags;
 	(void)code;
 	return TRUE;
+}
+
+static bool client_set_render_size(Client* client)
+{
+	const rdpSettings* settings = client->context.settings;
+	if (!settings)
+		return false;
+	const uint32_t width = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+	const uint32_t height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+	if (width == 0 || height == 0 || width > UINT16_MAX || height > UINT16_MAX)
+		return false;
+	client->render_width = (uint16_t)width;
+	client->render_height = (uint16_t)height;
+	char message[128];
+	(void)snprintf(message, sizeof(message),
+	               "RDP 협상 desktop %ux%u에 맞춰 gateway bitmap을 확대합니다", width, height);
+	log_message("INFO", message);
+	return true;
 }
 
 static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
@@ -1057,8 +1077,8 @@ static bool client_prepare_bitmap(Client* client)
 	{
 		client->rfx = rfx_context_new_ex(
 		    TRUE, freerdp_settings_get_uint32(settings, FreeRDP_ThreadingFlags));
-		if (!client->rfx || !rfx_context_reset(client->rfx, client->server->config.width,
-		                                      client->server->config.height))
+		if (!client->rfx || !rfx_context_reset(client->rfx, client->render_width,
+		                                      client->render_height))
 			return false;
 	}
 	else if (bitmap_stream_nsc_supported(settings))
@@ -1101,6 +1121,8 @@ static bool client_prepare_bitmap(Client* client)
 static BOOL peer_post_connect(freerdp_peer* peer)
 {
 	Client* client = (Client*)peer->context;
+	if (!client_set_render_size(client))
+		return FALSE;
 	if (client->server->config.direct_gfx)
 	{
 		if (!client_prepare_gfx(client))
