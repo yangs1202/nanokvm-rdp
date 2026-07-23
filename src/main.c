@@ -938,15 +938,30 @@ static bool client_flush_pending_bitmap(Client* client)
 			free(stale[index]);
 		return true;
 	}
-	const uint8_t slot = client->bitmap_queue_head;
-	bitmap = client->bitmap_queue[slot];
-	bitmap_length = client->bitmap_queue_lengths[slot];
-	client->bitmap_queue[slot] = NULL;
-	client->bitmap_queue_lengths[slot] = 0;
-	client->bitmap_queue_queued_at[slot] = 0;
-	client->bitmap_queue_head = (uint8_t)((client->bitmap_queue_head + 1U) % BITMAP_QUEUE_CAPACITY);
-	client->bitmap_queue_count--;
-	client->bitmap_pending = client->bitmap_queue_count > 0;
+	const uint8_t newest_slot = (uint8_t)((client->bitmap_queue_head +
+	                                      client->bitmap_queue_count - 1U) %
+	                                     BITMAP_QUEUE_CAPACITY);
+	bitmap = client->bitmap_queue[newest_slot];
+	bitmap_length = client->bitmap_queue_lengths[newest_slot];
+	for (uint8_t index = 0; index < client->bitmap_queue_count; index++)
+	{
+		const uint8_t slot =
+		    (uint8_t)((client->bitmap_queue_head + index) % BITMAP_QUEUE_CAPACITY);
+		if (slot == newest_slot)
+			continue;
+		stale[stale_count++] = client->bitmap_queue[slot];
+		client->bitmap_queue[slot] = NULL;
+		client->bitmap_queue_lengths[slot] = 0;
+		client->bitmap_queue_queued_at[slot] = 0;
+		client->bitmap_queue_drops++;
+		client->bitmap_stale_drops++;
+	}
+	client->bitmap_queue[newest_slot] = NULL;
+	client->bitmap_queue_lengths[newest_slot] = 0;
+	client->bitmap_queue_queued_at[newest_slot] = 0;
+	client->bitmap_queue_head = (uint8_t)((newest_slot + 1U) % BITMAP_QUEUE_CAPACITY);
+	client->bitmap_queue_count = 0;
+	client->bitmap_pending = false;
 	client->bitmap_last_send_started_at = now;
 	LeaveCriticalSection(&client->lock);
 	for (size_t index = 0; index < stale_count; index++)
