@@ -109,6 +109,9 @@ struct Client
 	CRITICAL_SECTION lock;
 	uint8_t* pending_bitmap;
 	size_t pending_bitmap_length;
+	uint8_t* previous_bitmap;
+	size_t previous_bitmap_length;
+	bool previous_bitmap_valid;
 	bool bitmap_pending;
 	uint64_t bitmap_last_queued_at;
 	HidState hid;
@@ -639,6 +642,21 @@ static bool bitmap_stream_nsc_supported(const rdpSettings* settings)
 	       (supported & SURFCMDS_SET_SURFACE_BITS) != 0;
 }
 
+static bool classic_tile_changed(const uint8_t* previous, const uint8_t* current, uint16_t width,
+                                 uint16_t left, uint16_t top, uint16_t columns, uint16_t rows)
+{
+	if (!previous)
+		return true;
+	const size_t row_length = (size_t)columns * 4U;
+	for (uint16_t row = 0; row < rows; row++)
+	{
+		const size_t offset = ((size_t)(top + row) * width + left) * 4U;
+		if (memcmp(previous + offset, current + offset, row_length) != 0)
+			return true;
+	}
+	return false;
+}
+
 static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
 {
 	const uint16_t width = client->render_width;
@@ -655,6 +673,13 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	    settings == NULL || !client->interleaved || length != expected_length ||
 	    client_should_stop(client))
 		return false;
+	if (!client->previous_bitmap)
+	{
+		client->previous_bitmap = malloc(expected_length);
+		client->previous_bitmap_length = client->previous_bitmap ? expected_length : 0;
+	}
+	if (!client->previous_bitmap || client->previous_bitmap_length != expected_length)
+		return false;
 
 	for (uint16_t top = 0; top < height; top += CLASSIC_TILE_HEIGHT)
 	{
@@ -662,6 +687,9 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 		for (uint16_t left = 0; left < width; left += CLASSIC_TILE_WIDTH)
 		{
 			const uint16_t columns = MIN(CLASSIC_TILE_WIDTH, (uint16_t)(width - left));
+			if (client->previous_bitmap_valid &&
+			    !classic_tile_changed(client->previous_bitmap, bgra, width, left, top, columns, rows))
+				continue;
 			uint32_t encoded_length = CLASSIC_TILE_MAX_ENCODED;
 			BITMAP_DATA* rectangle = &rectangles[rectangle_count];
 			if ((columns % 4) != 0 ||
@@ -703,6 +731,8 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 		if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
 			return false;
 	}
+	memcpy(client->previous_bitmap, bgra, expected_length);
+	client->previous_bitmap_valid = true;
 	return true;
 }
 
@@ -1103,6 +1133,7 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	if (client->bitmap_stream)
 		Stream_Free(client->bitmap_stream, TRUE);
 	free(client->pending_bitmap);
+	free(client->previous_bitmap);
 	if (client->vcm && client->vcm != INVALID_HANDLE_VALUE)
 		WTSCloseServer(client->vcm);
 	hid_release_all(&client->hid);
