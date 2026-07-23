@@ -1,7 +1,8 @@
 #include "ffmpeg_decoder.h"
-#include "foldvnc_client.h"
 #include "h264.h"
 #include "hid.h"
+#include "protocol.h"
+#include "rtp_client.h"
 
 #include <freerdp/channels/channels.h>
 #include <freerdp/channels/drdynvc.h>
@@ -29,22 +30,22 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-#define TAG "nanokvm-rdp"
+#define TAG "nanokvm-rdp-gateway"
 #define DEFAULT_WIDTH 1920U
 #define DEFAULT_HEIGHT 1080U
 #define DEFAULT_BITRATE 3000U
 #define MAX_EVENT_HANDLES 32U
-#define BITMAP_CAPTURE_WIDTH 1280U
-#define BITMAP_CAPTURE_HEIGHT 720U
-#define BITMAP_CAPTURE_FPS 10U
-#define BITMAP_MIN_INTERVAL_MS 2000U
+#define BITMAP_MIN_INTERVAL_MS 100U
 
 enum kvm_frame_kind
 {
@@ -77,6 +78,8 @@ typedef struct
 	uint16_t width;
 	uint16_t height;
 	uint16_t bitrate;
+	uint16_t control_port;
+	uint16_t video_port;
 	bool direct_gfx;
 } ServerConfig;
 
@@ -88,6 +91,10 @@ struct Server
 	ServerConfig config;
 	KvmApi kvm;
 	CRITICAL_SECTION lock;
+	CRITICAL_SECTION control_lock;
+	int control_listener;
+	int control_fd;
+	bool stream_requested;
 	Client* active;
 };
 
@@ -133,10 +140,82 @@ static void log_message(const char* level, const char* message)
 	(void)fprintf(stderr, "%s: %s: %s\n", TAG, level, message);
 }
 
+static bool server_send_control(Server* server, uint8_t type, const void* payload, uint16_t length)
+{
+	bool sent = false;
+	EnterCriticalSection(&server->control_lock);
+	if (server->control_fd >= 0)
+		sent = protocol_send(server->control_fd, type, payload, length);
+	LeaveCriticalSection(&server->control_lock);
+	return sent;
+}
+
 static void on_signal(int signal_number)
 {
 	(void)signal_number;
 	stop_requested = 1;
+}
+
+static DWORD WINAPI control_thread(LPVOID argument)
+{
+	Server* server = (Server*)argument;
+	while (!stop_requested)
+	{
+		struct sockaddr_in address = { 0 };
+		socklen_t length = sizeof(address);
+		const int fd = accept(server->control_listener, (struct sockaddr*)&address, &length);
+		if (fd < 0)
+			continue;
+		int enabled = 1;
+		(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+		NanokvmControlMessage hello = { 0 };
+		if (!protocol_receive(fd, &hello) || hello.type != NANOKVM_CONTROL_HELLO || hello.length != 8)
+		{
+			(void)close(fd);
+			continue;
+		}
+		EnterCriticalSection(&server->control_lock);
+		if (server->control_fd >= 0)
+			(void)close(server->control_fd);
+		server->control_fd = fd;
+		const bool start = server->stream_requested;
+		LeaveCriticalSection(&server->control_lock);
+		if (start)
+			(void)server_send_control(server, NANOKVM_CONTROL_START_STREAM, NULL, 0);
+		log_message("INFO", "NanoKVM agent control 연결 수락");
+		for (;;)
+		{
+			NanokvmControlMessage message = { 0 };
+			if (!protocol_receive(fd, &message))
+				break;
+			if (message.type == NANOKVM_CONTROL_PING)
+				(void)server_send_control(server, NANOKVM_CONTROL_PONG, NULL, 0);
+		}
+		EnterCriticalSection(&server->control_lock);
+		if (server->control_fd == fd)
+			server->control_fd = -1;
+		LeaveCriticalSection(&server->control_lock);
+		(void)close(fd);
+		log_message("WARN", "NanoKVM agent control 연결 종료");
+	}
+	return 0;
+}
+
+static int open_control_listener(const char* host, uint16_t port)
+{
+	const int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+	int enabled = 1;
+	(void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+	struct sockaddr_in address = { .sin_family = AF_INET, .sin_port = htons(port) };
+	if (inet_pton(AF_INET, host, &address.sin_addr) != 1 ||
+	    bind(fd, (const struct sockaddr*)&address, sizeof(address)) != 0 || listen(fd, 1) != 0)
+	{
+		(void)close(fd);
+		return -1;
+	}
+	return fd;
 }
 
 static uint64_t monotonic_milliseconds(void)
@@ -641,42 +720,39 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 {
 	Client* client = (Client*)argument;
-	FoldVncClient foldvnc = { .fd = -1 };
+	RtpClient rtp = { .fd = -1 };
 	FfmpegDecoder decoder = { .pid = -1, .input = -1, .output = -1 };
-	const uint16_t capture_width = BITMAP_CAPTURE_WIDTH;
-	const uint16_t capture_height = BITMAP_CAPTURE_HEIGHT;
 	const uint16_t width = client->server->config.width;
 	const uint16_t height = client->server->config.height;
 	bool backend_ready = false;
 
 	for (unsigned attempt = 0; attempt < 10 && !client_should_stop(client); attempt++)
 	{
-		if (foldvnc_client_connect(&foldvnc, "127.0.0.1", 7890, capture_width, capture_height,
-		                           BITMAP_CAPTURE_FPS) &&
+		if (rtp_client_open(&rtp, client->server->config.video_port) &&
 		    ffmpeg_decoder_start(&decoder, width, height, on_decoded_bitmap_frame, client))
 		{
 			backend_ready = true;
 			break;
 		}
 		ffmpeg_decoder_stop(&decoder);
-		foldvnc_client_close(&foldvnc);
+		rtp_client_close(&rtp);
 		Sleep(1000);
 	}
 	if (!backend_ready)
 	{
-		log_message("ERROR", "FoldVNC H.264 backend 또는 FFmpeg decoder를 시작할 수 없습니다");
+		log_message("ERROR", "RTP/H.264 receiver 또는 FFmpeg decoder를 시작할 수 없습니다");
 		client_stop(client);
 		goto out;
 	}
-	log_message("INFO", "FoldVNC H.264 backend와 FFmpeg BGRA decoder 시작 완료");
+	log_message("INFO", "RTP/H.264 receiver와 FFmpeg BGRA decoder 시작 완료");
+	uint32_t observed_losses = 0;
 	while (!client_should_stop(client))
 	{
 		uint8_t* data = NULL;
 		size_t length = 0;
-		bool keyframe = false;
-		if (!foldvnc_client_read_video(&foldvnc, &data, &length, &keyframe) || !data || length == 0)
+		if (!rtp_client_read_h264(&rtp, &data, &length) || !data || length == 0)
 		{
-			log_message("ERROR", "FoldVNC H.264 frame 수신 실패");
+			log_message("ERROR", "RTP/H.264 frame 수신 실패");
 			client_stop(client);
 			break;
 		}
@@ -688,24 +764,29 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 			client_stop(client);
 			break;
 		}
-		if (keyframe)
-			log_message("INFO", "FoldVNC H.264 keyframe 동기화 완료");
+		if (rtp.losses != observed_losses)
+		{
+			observed_losses = rtp.losses;
+			(void)server_send_control(client->server, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
+			log_message("WARN", "RTP frame loss 감지; NanoKVM agent에 IDR 재동기화를 요청합니다");
+		}
 	}
 
 out:
 	ffmpeg_decoder_stop(&decoder);
-	foldvnc_client_close(&foldvnc);
+	rtp_client_close(&rtp);
 	return 0;
 }
 
 static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 {
 	Client* client = (Client*)input->context;
-	const bool sent = hid_scancode(&client->hid, code, (flags & KBD_FLAGS_EXTENDED) != 0,
-	                               (flags & KBD_FLAGS_RELEASE) != 0);
+	const uint8_t payload[3] = { code, (flags & KBD_FLAGS_EXTENDED) != 0,
+		(flags & KBD_FLAGS_RELEASE) != 0 };
+	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_KEY, payload, sizeof(payload));
 	if (sent && !client->keyboard_input_logged)
 	{
-		log_message("INFO", "RDP keyboard scancode → USB HID keyboard report 전달 확인");
+		log_message("INFO", "RDP keyboard scancode → NanoKVM agent HID 전달 확인");
 		client->keyboard_input_logged = true;
 	}
 	return sent;
@@ -725,17 +806,25 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	const rdpSettings* settings = input->context->settings;
 	const uint32_t width = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
 	const uint32_t height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
-	const bool position_ok = hid_absolute(&client->hid, x, y, width, height, flags);
-	const bool wheel_ok = hid_wheel(&client->hid, flags);
+	uint8_t payload[12] = { 0 };
+	protocol_write_u16(payload, x);
+	protocol_write_u16(payload + 2, y);
+	protocol_write_u16(payload + 4, (uint16_t)width);
+	protocol_write_u16(payload + 6, (uint16_t)height);
+	protocol_write_u16(payload + 8, flags);
+	const bool position_ok = server_send_control(client->server, NANOKVM_CONTROL_POINTER_ABS,
+	                                              payload, sizeof(payload));
+	const bool wheel_ok = (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) == 0 ||
+	                      server_send_control(client->server, NANOKVM_CONTROL_WHEEL, payload + 8, 2);
 	if (position_ok && !client->pointer_input_logged)
 	{
-		log_message("INFO", "RDP absolute pointer → USB HID touch report 전달 확인");
+		log_message("INFO", "RDP absolute pointer → NanoKVM agent HID 전달 확인");
 		client->pointer_input_logged = true;
 	}
 	if (wheel_ok && (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) != 0 &&
 	    !client->wheel_input_logged)
 	{
-		log_message("INFO", "RDP wheel → USB HID mouse report 전달 확인");
+		log_message("INFO", "RDP wheel → NanoKVM agent HID 전달 확인");
 		client->wheel_input_logged = true;
 	}
 	return position_ok && wheel_ok;
@@ -798,6 +887,9 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	(void)peer;
 	Client* client = (Client*)context;
 	client_stop(client);
+	(void)server_send_control(client->server, NANOKVM_CONTROL_RELEASE_ALL, NULL, 0);
+	(void)server_send_control(client->server, NANOKVM_CONTROL_STOP_STREAM, NULL, 0);
+	client->server->stream_requested = false;
 	if (client->video_thread)
 	{
 		(void)WaitForSingleObject(client->video_thread, 3000);
@@ -890,7 +982,11 @@ static bool client_prepare_bitmap(Client* client)
 			return false;
 	}
 	client->video_thread = CreateThread(NULL, 0, bitmap_video_thread, client, 0, NULL);
-	return client->video_thread != NULL;
+	if (!client->video_thread)
+		return false;
+	client->server->stream_requested = true;
+	(void)server_send_control(client->server, NANOKVM_CONTROL_START_STREAM, NULL, 0);
+	return true;
 }
 
 static BOOL peer_post_connect(freerdp_peer* peer)
@@ -907,7 +1003,7 @@ static BOOL peer_post_connect(freerdp_peer* peer)
 	{
 		if (!client_prepare_bitmap(client))
 			return FALSE;
-		log_message("INFO", "RDP session activation 완료; FoldVNC bitmap backend 시작");
+		log_message("INFO", "RDP session activation 완료; RTP/H.264 bitmap backend 시작");
 	}
 	return TRUE;
 }
@@ -1047,7 +1143,7 @@ static void print_usage(const char* executable)
 {
 	(void)fprintf(stderr,
 	              "Usage: %s [-listen host:port] [-cert file] [-key file] [-width n] [-height n] "
-	              "[-bitrate n] [-direct-gfx]\n",
+	              "[-bitrate n] [-control-port n] [-video-port n] [-direct-gfx]\n",
 	              executable);
 }
 
@@ -1081,6 +1177,10 @@ int main(int argc, char* argv[])
 	server.config.width = DEFAULT_WIDTH;
 	server.config.height = DEFAULT_HEIGHT;
 	server.config.bitrate = DEFAULT_BITRATE;
+	server.config.control_port = 3390;
+	server.config.video_port = 5004;
+	server.control_fd = -1;
+	server.control_listener = -1;
 	for (int index = 1; index < argc; index++)
 	{
 		if (strcmp(argv[index], "-listen") == 0 && index + 1 < argc)
@@ -1098,6 +1198,10 @@ int main(int argc, char* argv[])
 			server.config.height = (uint16_t)strtoul(argv[++index], NULL, 10);
 		else if (strcmp(argv[index], "-bitrate") == 0 && index + 1 < argc)
 			server.config.bitrate = (uint16_t)strtoul(argv[++index], NULL, 10);
+		else if (strcmp(argv[index], "-control-port") == 0 && index + 1 < argc)
+			server.config.control_port = (uint16_t)strtoul(argv[++index], NULL, 10);
+		else if (strcmp(argv[index], "-video-port") == 0 && index + 1 < argc)
+			server.config.video_port = (uint16_t)strtoul(argv[++index], NULL, 10);
 		else if (strcmp(argv[index], "-direct-gfx") == 0)
 			server.config.direct_gfx = true;
 		else
@@ -1106,9 +1210,11 @@ int main(int argc, char* argv[])
 			return 2;
 		}
 	}
-	if (server.config.width == 0 || server.config.height == 0 || server.config.bitrate == 0)
+	if (server.config.width == 0 || server.config.height == 0 || server.config.bitrate == 0 ||
+	    server.config.control_port == 0 || server.config.video_port == 0)
 		return 2;
-	if (!InitializeCriticalSectionAndSpinCount(&server.lock, 4000))
+	if (!InitializeCriticalSectionAndSpinCount(&server.lock, 4000) ||
+	    !InitializeCriticalSectionAndSpinCount(&server.control_lock, 4000))
 		return 1;
 	if (!WTSRegisterWtsApiFunctionTable(FreeRDP_InitWtsApi()) ||
 	    !winpr_InitializeSSL(WINPR_SSL_INIT_DEFAULT))
@@ -1117,6 +1223,20 @@ int main(int argc, char* argv[])
 	freerdp_listener* listener = freerdp_listener_new();
 	if (!listener)
 		return 1;
+	server.control_listener = open_control_listener(server.config.bind_address, server.config.control_port);
+	if (server.control_listener < 0)
+	{
+		freerdp_listener_free(listener);
+		return 1;
+	}
+	HANDLE control = CreateThread(NULL, 0, control_thread, &server, 0, NULL);
+	if (!control)
+	{
+		(void)close(server.control_listener);
+		freerdp_listener_free(listener);
+		return 1;
+	}
+	(void)CloseHandle(control);
 	listener->info = &server;
 	listener->PeerAccepted = peer_accepted;
 	WSADATA wsa = WINPR_C_ARRAY_INIT;
@@ -1128,6 +1248,7 @@ int main(int argc, char* argv[])
 	}
 	(void)signal(SIGINT, on_signal);
 	(void)signal(SIGTERM, on_signal);
+	(void)signal(SIGPIPE, SIG_IGN);
 	(void)fprintf(stderr, "%s: INFO: TLS RDP server listening on %s:%u\n", TAG,
 	              server.config.bind_address, server.config.port);
 
@@ -1142,7 +1263,12 @@ int main(int argc, char* argv[])
 	}
 	listener->Close(listener);
 	freerdp_listener_free(listener);
+	if (server.control_fd >= 0)
+		(void)close(server.control_fd);
+	if (server.control_listener >= 0)
+		(void)close(server.control_listener);
 	WSACleanup();
+	DeleteCriticalSection(&server.control_lock);
 	DeleteCriticalSection(&server.lock);
 	return 0;
 }

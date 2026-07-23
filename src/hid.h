@@ -20,6 +20,7 @@ void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char
 bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release);
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
 	              uint16_t flags);
+bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons);
 bool hid_wheel(HidState* hid, uint16_t flags);
 void hid_release_all(HidState* hid);
 

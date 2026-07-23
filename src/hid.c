@@ -195,6 +195,21 @@ bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_
 	return write_report(hid->touch_path, report, sizeof(report));
 }
 
+bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
+{
+	if (x > 127)
+		x = 127;
+	if (x < -127)
+		x = -127;
+	if (y > 127)
+		y = 127;
+	if (y < -127)
+		y = -127;
+	hid->buttons = buttons;
+	const uint8_t report[4] = { buttons, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
+	return write_report(hid->mouse_path, report, sizeof(report));
+}
+
 bool hid_wheel(HidState* hid, uint16_t flags)
 {
 	if ((flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) == 0)

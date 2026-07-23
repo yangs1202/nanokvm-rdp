@@ -1,41 +1,56 @@
-# NanoKVM RDP bridge
+# NanoKVM RDP gateway
 
-`nanokvm-rdp`는 NanoKVM의 `libkvm.so` H.264 Annex-B output을 FreeRDP server-side
-RDPGFX AVC420으로 그대로 전송하고, 표준 RDP input을 USB HID gadget으로 변환한다.
+`nanokvm-agent`는 NanoKVM에서 `libkvm.so` H.264 Annex-B frame을 decode/re-encode 없이
+RTP/H.264 UDP로 전송하고, gateway가 보낸 control message를 USB HID report로 적용한다.
+`nanokvm-rdp-gateway`는 별도 호스트에서 TLS RDP listener, FFmpeg decode, RDP bitmap
+encode를 실행한다. 단일 NanoKVM·단일 RDP client만 지원한다.
 
-## 빌드
+## Transport
 
-로컬 unit test:
+- RDP: gateway TCP `3389`, self-signed TLS, NLA/RDP security 비활성화
+- Control: agent가 gateway TCP `3390`으로 연결한다. length-prefixed binary protocol과
+  `TCP_NODELAY`를 사용한다.
+- Video: agent가 gateway UDP `5004`로 RTP payload type 96 H.264를 전송한다. 기본 MTU는
+  1200 bytes이며 single NAL과 FU-A fragmentation을 지원한다.
+- packet sequence gap은 gateway가 `IDR_REQUEST`를 보내고, agent는 다음 IDR 전까지 P frame을
+  버린다.
+
+Control message는 `HELLO`, `START_STREAM`, `STOP_STREAM`, `IDR_REQUEST`, `KEY`,
+`POINTER_ABS`, `POINTER_REL`, `WHEEL`, `RELEASE_ALL`, `PING/PONG`, `STATS`, `ERROR`다.
+agent는 control disconnect, `STOP_STREAM`, process 종료에서 `ReleaseAll`을 실행한다.
+
+## Build and test
 
 ```sh
-cmake -S . -B build/unit -DNANOKVM_RDP_BUILD_SERVER=OFF
+cmake -S . -B build/unit -G 'Unix Makefiles' \
+  -DNANOKVM_RDP_BUILD_SERVER=OFF -DNANOKVM_RDP_BUILD_AGENT=OFF
 cmake --build build/unit --parallel 4
 ctest --test-dir build/unit --output-on-failure
+
+BUILD_DIR="$PWD/build/riscv64-agent" ./scripts/build-riscv64.sh
 ```
 
-`scripts/build-riscv64.sh`는 Zig riscv64-musl compiler, vendored FreeRDP와
-riscv64 OpenSSL prefix가 필요하다. 현재 검증된 OpenSSL source는 3.1.4이며 SHA-256은
-`840af5366ab9b522bde525826be3ef0fb0af81c6a9ebd84caa600fea1731eee3`이다.
+gateway는 Linux x86_64에서 FreeRDP server development dependency 또는 source tree를 명시해서
+빌드한다. 경로는 저장소에 하드코딩하지 않는다.
 
 ```sh
-OPENSSL_ROOT="$PWD/build/openssl-riscv64-v2" ./scripts/build-riscv64.sh
+cmake -S . -B build/gateway -G 'Unix Makefiles' \
+  -DNANOKVM_RDP_FREERDP_DIR=/path/to/FreeRDP
+cmake --build build/gateway --target nanokvm-rdp-gateway --parallel 4
 ```
 
-## 장비 서비스
+## Deployment
 
-`deploy/S100nanokvm-rdp`는 다음 동작을 의도한다.
+장비의 기존 RDP/FoldVNC service와 capture path를 동시에 실행하면 안 된다. 배포 전에 아래를
+백업하고, 문제 발생 시 복구 명령으로 기존 service를 되돌린다.
 
-- 실행 전 기존 `/etc/init.d/S99foldvnc`를 중지해 `libkvm.so` capture 충돌을 방지한다.
-- `/root/nanokvm-rdp/cert.pem` 및 `key.pem`가 없으면 장비 OpenSSL로 self-signed TLS
-  certificate를 생성한다.
-- stop 시에는 모든 HID report를 release한 뒤 FoldVNC를 다시 기동한다.
+```sh
+ssh root@10.97.11.193 'ts=$(date +%Y%m%d%H%M%S); mkdir -p /data/nanokvm-rdp-backup/$ts; cp -a /root/nanokvm-rdp /data/nanokvm-rdp-backup/$ts/; cp -a /etc/init.d/S100nanokvm-rdp /data/nanokvm-rdp-backup/$ts/'
 
-### 보안 제약
+# 복구
+ssh root@10.97.11.193 '/etc/init.d/S100nanokvm-agent stop || true; /etc/init.d/S100nanokvm-rdp start'
+```
 
-TLS만 허용하며 RDP Security와 NLA는 비활성화했다. 이 NanoKVM에는 NLA가 사용할
-계정 검증 backend가 없고, RDP client 호환성을 위해 AVC420-only PoC를 먼저 제공한다.
-따라서 `:3389`은 신뢰된 관리망에서만 노출해야 하며, 인터넷 또는 비신뢰 LAN에 직접
-공개하면 안 된다. 인증서 fingerprint를 RDP client에서 확인해야 한다.
-
-AVC420/RDPGFX를 광고하지 않는 client는 연결을 명시적으로 종료한다. bitmap fallback은
-1080p decode/re-encode 비용 때문에 이 범위에 포함하지 않는다.
+`deploy/S100nanokvm-agent`의 `GATEWAY`와 포트를 대상 host에 맞춰 배포한다. 방화벽은
+NanoKVM → gateway TCP `3390`, UDP `5004` outbound를 허용해야 한다. gateway `3389`은
+Jump Desktop이 접근할 수 있어야 한다.
