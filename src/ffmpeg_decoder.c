@@ -79,8 +79,10 @@ bool ffmpeg_decoder_start(FfmpegDecoder* decoder, uint16_t width, uint16_t heigh
 		goto fail;
 	if (decoder->pid == 0)
 	{
-		char scale[32] = { 0 };
-		(void)snprintf(scale, sizeof(scale), "scale=%u:%u", width, height);
+		char scale[128] = { 0 };
+		(void)snprintf(scale, sizeof(scale),
+		               "scale=%u:%u:force_original_aspect_ratio=decrease,pad=%u:%u:(ow-iw)/2:(oh-ih)/2:black",
+		               width, height, width, height);
 		(void)dup2(input[0], STDIN_FILENO);
 		(void)dup2(output[1], STDOUT_FILENO);
 		(void)close(input[0]);
