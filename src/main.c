@@ -50,7 +50,8 @@
 #define BITMAP_MIN_INTERVAL_MS 200U
 #define CLASSIC_TILE_WIDTH 64U
 #define CLASSIC_TILE_HEIGHT 64U
-#define CLASSIC_TILE_MAX_ENCODED 65535U
+#define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
+#define CLASSIC_BITMAP_BATCH 3U
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define STATS_LOG_INTERVAL_MS 5000U
@@ -691,6 +692,10 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	const size_t expected_length = (size_t)width * height * 4U;
 	const rdpSettings* settings = client->context.settings;
 	const uint16_t bits_per_pixel = 16;
+	BITMAP_DATA rectangles[CLASSIC_BITMAP_BATCH] = WINPR_C_ARRAY_INIT;
+	uint8_t encoded[CLASSIC_BITMAP_BATCH][CLASSIC_TILE_MAX_ENCODED] = { { 0 } };
+	BITMAP_UPDATE bitmap = WINPR_C_ARRAY_INIT;
+	uint16_t rectangle_count = 0;
 
 	if (!client->context.update || !client->context.update->BitmapUpdate ||
 	    settings == NULL || !client->interleaved || length != expected_length ||
@@ -703,35 +708,46 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 		for (uint16_t left = 0; left < width; left += CLASSIC_TILE_WIDTH)
 		{
 			const uint16_t columns = MIN(CLASSIC_TILE_WIDTH, (uint16_t)(width - left));
-			uint8_t encoded[CLASSIC_TILE_MAX_ENCODED] = { 0 };
-			uint32_t encoded_length = sizeof(encoded);
-			BITMAP_DATA rectangle = WINPR_C_ARRAY_INIT;
-			BITMAP_UPDATE bitmap = WINPR_C_ARRAY_INIT;
+			uint32_t encoded_length = CLASSIC_TILE_MAX_ENCODED;
+			BITMAP_DATA* rectangle = &rectangles[rectangle_count];
 			if ((columns % 4) != 0 ||
-			    !interleaved_compress(client->interleaved, encoded, &encoded_length, columns, rows,
+			    !interleaved_compress(client->interleaved, encoded[rectangle_count], &encoded_length, columns, rows,
 			                          bgra, PIXEL_FORMAT_BGRX32, (uint32_t)width * 4U, left, top,
 			                          NULL, bits_per_pixel))
 				return false;
-			rectangle.destLeft = left;
-			rectangle.destTop = top;
-			rectangle.destRight = left + columns - 1;
-			rectangle.destBottom = top + rows - 1;
-			rectangle.width = columns;
-			rectangle.height = rows;
-			rectangle.bitsPerPixel = bits_per_pixel;
-			rectangle.bitmapLength = WINPR_ASSERTING_INT_CAST(uint16_t, encoded_length);
-			rectangle.bitmapDataStream = encoded;
-			rectangle.compressed = TRUE;
-			rectangle.cbCompFirstRowSize = 0;
-			rectangle.cbCompMainBodySize = encoded_length;
-			rectangle.cbScanWidth = columns * 2U;
-			rectangle.cbUncompressedSize = columns * rows * 2U;
-			bitmap.number = 1;
-			bitmap.rectangles = &rectangle;
-			bitmap.skipCompression = FALSE;
-			if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
-				return false;
+			rectangle->destLeft = left;
+			rectangle->destTop = top;
+			rectangle->destRight = left + columns - 1;
+			rectangle->destBottom = top + rows - 1;
+			rectangle->width = columns;
+			rectangle->height = rows;
+			rectangle->bitsPerPixel = bits_per_pixel;
+			rectangle->bitmapLength = WINPR_ASSERTING_INT_CAST(uint16_t, encoded_length);
+			rectangle->bitmapDataStream = encoded[rectangle_count];
+			rectangle->compressed = TRUE;
+			rectangle->cbCompFirstRowSize = 0;
+			rectangle->cbCompMainBodySize = encoded_length;
+			rectangle->cbScanWidth = columns * 2U;
+			rectangle->cbUncompressedSize = columns * rows * 2U;
+			rectangle_count++;
+			if (rectangle_count == CLASSIC_BITMAP_BATCH)
+			{
+				bitmap.number = rectangle_count;
+				bitmap.rectangles = rectangles;
+				bitmap.skipCompression = FALSE;
+				if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
+					return false;
+				rectangle_count = 0;
+			}
 		}
+	}
+	if (rectangle_count > 0)
+	{
+		bitmap.number = rectangle_count;
+		bitmap.rectangles = rectangles;
+		bitmap.skipCompression = FALSE;
+		if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
+			return false;
 	}
 	return true;
 }
