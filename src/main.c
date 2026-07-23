@@ -47,7 +47,7 @@
 #define DEFAULT_HEIGHT 1080U
 #define DEFAULT_BITRATE 3000U
 #define MAX_EVENT_HANDLES 32U
-#define BITMAP_MIN_INTERVAL_MS 500U
+#define BITMAP_MIN_INTERVAL_MS 33U
 #define CLASSIC_TILE_WIDTH 64U
 #define CLASSIC_TILE_HEIGHT 64U
 #define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
@@ -1338,9 +1338,8 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 	    !freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline,
 	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxH264, server->config.direct_gfx) ||
-	    !freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec,
-	                               !server->config.direct_gfx) ||
-	    !freerdp_settings_set_bool(settings, FreeRDP_NSCodec, !server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, TRUE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled,
 	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled,
