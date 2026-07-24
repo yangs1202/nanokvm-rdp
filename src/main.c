@@ -55,7 +55,7 @@
 #define CLASSIC_TILE_WIDTH 64U
 #define CLASSIC_TILE_HEIGHT 64U
 #define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
-#define CLASSIC_BITMAP_BATCH 12U
+#define CLASSIC_BITMAP_BATCH 64U
 #define CLASSIC_PIXEL_DIFF_THRESHOLD 10U
 #define CLASSIC_CHANGED_PIXEL_THRESHOLD 8U
 #define HEARTBEAT_INTERVAL_MS 1000U
@@ -124,6 +124,7 @@ struct Client
 	uint8_t bitmap_queue_count;
 	uint8_t* previous_bitmap;
 	size_t previous_bitmap_length;
+	uint8_t* classic_encoded;
 	bool previous_bitmap_valid;
 	bool bitmap_pending;
 	HidState hid;
@@ -780,7 +781,6 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	const bool use_planar = client->planar != NULL;
 	const uint16_t bits_per_pixel = use_planar ? 32 : 16;
 	BITMAP_DATA rectangles[CLASSIC_BITMAP_BATCH] = WINPR_C_ARRAY_INIT;
-	uint8_t encoded[CLASSIC_BITMAP_BATCH][CLASSIC_TILE_MAX_ENCODED] = { { 0 } };
 	BITMAP_UPDATE bitmap = WINPR_C_ARRAY_INIT;
 	const uint32_t max_update_size =
 	    freerdp_settings_get_uint32(settings, FreeRDP_MultifragMaxRequestSize);
@@ -791,6 +791,7 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 
 	if (!client->context.update || !client->context.update->BitmapUpdate ||
 	    settings == NULL || (!client->planar && !client->interleaved) ||
+	    !client->classic_encoded ||
 	    length != expected_length ||
 	    client_should_stop(client))
 		return false;
@@ -813,17 +814,18 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 				continue;
 			BITMAP_DATA* rectangle = &rectangles[rectangle_count];
 			uint32_t encoded_length = CLASSIC_TILE_MAX_ENCODED;
-			uint8_t* encoded_data = encoded[rectangle_count];
+			uint8_t* encoded_data =
+			    client->classic_encoded + (size_t)rectangle_count * CLASSIC_TILE_MAX_ENCODED;
 			if (use_planar)
 			{
 				encoded_length = 0;
 				encoded_data = freerdp_bitmap_compress_planar(
 				    client->planar, bgra + (((size_t)top * width + left) * 4U),
 				    PIXEL_FORMAT_BGRX32, columns, rows, (uint32_t)width * 4U,
-				    encoded[rectangle_count], &encoded_length);
+				    encoded_data, &encoded_length);
 			}
 			else if ((columns % 4) != 0 ||
-			         !interleaved_compress(client->interleaved, encoded[rectangle_count],
+			         !interleaved_compress(client->interleaved, encoded_data,
 			                               &encoded_length, columns, rows, bgra,
 			                               PIXEL_FORMAT_BGRX32, (uint32_t)width * 4U,
 			                               left, top, NULL, bits_per_pixel))
@@ -840,8 +842,8 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 				bitmap.skipCompression = FALSE;
 				if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
 					return false;
-				memcpy(encoded[0], encoded_data, encoded_length);
-				encoded_data = encoded[0];
+				memcpy(client->classic_encoded, encoded_data, encoded_length);
+				encoded_data = client->classic_encoded;
 				rectangle = &rectangles[0];
 				rectangle_count = 0;
 				update_size = 1024U;
@@ -1457,6 +1459,7 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	for (size_t index = 0; index < BITMAP_QUEUE_CAPACITY; index++)
 		free(client->bitmap_queue[index]);
 	free(client->previous_bitmap);
+	free(client->classic_encoded);
 	if (client->vcm && client->vcm != INVALID_HANDLE_VALUE)
 		WTSCloseServer(client->vcm);
 	hid_release_all(&client->hid);
@@ -1514,6 +1517,9 @@ static bool client_prepare_bitmap(Client* client)
 	else
 	{
 		const uint32_t color_depth = freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth);
+		client->classic_encoded = calloc(CLASSIC_BITMAP_BATCH, CLASSIC_TILE_MAX_ENCODED);
+		if (!client->classic_encoded)
+			return false;
 		if (color_depth != 16 && color_depth != 24 && color_depth != 32)
 		{
 			log_message("ERROR", "client가 지원하지 않는 classic bitmap 색 깊이를 요청했습니다");
