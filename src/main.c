@@ -55,7 +55,7 @@
 #define CLASSIC_TILE_WIDTH 64U
 #define CLASSIC_TILE_HEIGHT 64U
 #define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
-#define CLASSIC_BITMAP_BATCH 12U
+#define CLASSIC_BITMAP_BATCH 64U
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define STATS_LOG_INTERVAL_MS 5000U
@@ -748,6 +748,9 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	BITMAP_DATA rectangles[CLASSIC_BITMAP_BATCH] = WINPR_C_ARRAY_INIT;
 	uint8_t encoded[CLASSIC_BITMAP_BATCH][CLASSIC_TILE_MAX_ENCODED] = { { 0 } };
 	BITMAP_UPDATE bitmap = WINPR_C_ARRAY_INIT;
+	const uint32_t max_update_size =
+	    freerdp_settings_get_uint32(settings, FreeRDP_MultifragMaxRequestSize);
+	uint32_t update_size = 1024U;
 	uint16_t rectangle_count = 0;
 
 	if (!client->context.update || !client->context.update->BitmapUpdate ||
@@ -793,6 +796,20 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 			}
 			if (!encoded_data || encoded_length == 0 || encoded_length > CLASSIC_TILE_MAX_ENCODED)
 				return false;
+			if (rectangle_count > 0 &&
+			    update_size + encoded_length + 16U >= max_update_size)
+			{
+				bitmap.number = rectangle_count;
+				bitmap.rectangles = rectangles;
+				bitmap.skipCompression = FALSE;
+				if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
+					return false;
+				memcpy(encoded[0], encoded_data, encoded_length);
+				encoded_data = encoded[0];
+				rectangle = &rectangles[0];
+				rectangle_count = 0;
+				update_size = 1024U;
+			}
 			rectangle->destLeft = left;
 			rectangle->destTop = top;
 			rectangle->destRight = left + columns - 1;
@@ -808,6 +825,7 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 			rectangle->cbScanWidth = columns * (bits_per_pixel / 8U);
 			rectangle->cbUncompressedSize = columns * rows * (bits_per_pixel / 8U);
 			rectangle_count++;
+			update_size += encoded_length + 16U;
 			if (rectangle_count == CLASSIC_BITMAP_BATCH)
 			{
 				bitmap.number = rectangle_count;
@@ -816,6 +834,7 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 				if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
 					return false;
 				rectangle_count = 0;
+				update_size = 1024U;
 			}
 		}
 	}
