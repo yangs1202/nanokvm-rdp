@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <pthread.h>
 #include <sys/types.h>
 
 typedef bool (*FfmpegFrameHandler)(void* context, const uint8_t* bgra, size_t length);
@@ -13,6 +15,9 @@ typedef struct
 	pid_t pid;
 	int input;
 	int output;
+	pthread_t output_thread;
+	bool output_thread_started;
+	atomic_bool output_failed;
 	uint8_t* frame;
 	size_t frame_size;
 	size_t frame_used;

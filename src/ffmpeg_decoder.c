@@ -22,8 +22,12 @@ static bool decoder_drain(FfmpegDecoder* decoder, int timeout_ms)
 	const int ready = poll(&pollfd, 1, timeout_ms);
 	if (ready < 0 && errno != EINTR)
 		return false;
-	if (ready <= 0 || (pollfd.revents & (POLLERR | POLLNVAL)) != 0)
+	if (ready <= 0)
 		return ready >= 0;
+	if ((pollfd.revents & (POLLERR | POLLNVAL)) != 0)
+		return false;
+	if ((pollfd.revents & POLLIN) == 0)
+		return (pollfd.revents & POLLHUP) == 0;
 
 	for (;;)
 	{
@@ -52,8 +56,18 @@ static bool decoder_drain(FfmpegDecoder* decoder, int timeout_ms)
 		}
 		if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
 			return true;
-		return length == 0;
+		return false;
 	}
+}
+
+static void* decoder_output_loop(void* context)
+{
+	FfmpegDecoder* decoder = context;
+	while (decoder_drain(decoder, 100))
+	{
+	}
+	atomic_store(&decoder->output_failed, true);
+	return NULL;
 }
 
 bool ffmpeg_decoder_start(FfmpegDecoder* decoder, uint16_t width, uint16_t height,
@@ -69,6 +83,7 @@ bool ffmpeg_decoder_start(FfmpegDecoder* decoder, uint16_t width, uint16_t heigh
 	decoder->frame_size = frame_size;
 	decoder->frame_handler = frame_handler;
 	decoder->frame_context = frame_context;
+	atomic_init(&decoder->output_failed, false);
 
 	int input[2] = { -1, -1 };
 	int output[2] = { -1, -1 };
@@ -106,6 +121,9 @@ bool ffmpeg_decoder_start(FfmpegDecoder* decoder, uint16_t width, uint16_t heigh
 	output[0] = -1;
 	if (!set_nonblocking(decoder->input) || !set_nonblocking(decoder->output))
 		goto fail;
+	if (pthread_create(&decoder->output_thread, NULL, decoder_output_loop, decoder) != 0)
+		goto fail;
+	decoder->output_thread_started = true;
 	return true;
 
 fail:
@@ -125,6 +143,8 @@ bool ffmpeg_decoder_push(FfmpegDecoder* decoder, const uint8_t* data, size_t len
 {
 	if (!decoder || decoder->input < 0 || !data || length == 0)
 		return false;
+	if (atomic_load(&decoder->output_failed))
+		return false;
 	while (length > 0)
 	{
 		const ssize_t written = write(decoder->input, data, length);
@@ -132,24 +152,19 @@ bool ffmpeg_decoder_push(FfmpegDecoder* decoder, const uint8_t* data, size_t len
 		{
 			data += written;
 			length -= (size_t)written;
-			if (!decoder_drain(decoder, 0))
-				return false;
 			continue;
 		}
 		if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
 			return false;
 
-		struct pollfd pollfds[2] = {
-			{ .fd = decoder->input, .events = POLLOUT },
-			{ .fd = decoder->output, .events = POLLIN },
-		};
-		const int ready = poll(pollfds, 2, 100);
+		struct pollfd pollfd = { .fd = decoder->input, .events = POLLOUT };
+		const int ready = poll(&pollfd, 1, 100);
 		if (ready < 0 && errno != EINTR)
 			return false;
-		if (ready > 0 && !decoder_drain(decoder, 0))
+		if (atomic_load(&decoder->output_failed))
 			return false;
 	}
-	return decoder_drain(decoder, 25);
+	return !atomic_load(&decoder->output_failed);
 }
 
 void ffmpeg_decoder_stop(FfmpegDecoder* decoder)
@@ -161,10 +176,13 @@ void ffmpeg_decoder_stop(FfmpegDecoder* decoder)
 		(void)close(decoder->input);
 		decoder->input = -1;
 	}
+	if (decoder->output_thread_started)
+	{
+		(void)pthread_join(decoder->output_thread, NULL);
+		decoder->output_thread_started = false;
+	}
 	if (decoder->output >= 0)
 	{
-		for (unsigned index = 0; index < 10; index++)
-			(void)decoder_drain(decoder, 100);
 		(void)close(decoder->output);
 		decoder->output = -1;
 	}
