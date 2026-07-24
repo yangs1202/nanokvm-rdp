@@ -1093,6 +1093,8 @@ static bool client_flush_pending_bitmap(Client* client)
 	size_t bitmap_length = 0;
 	bool sent = true;
 	const uint64_t now = monotonic_milliseconds();
+	if (client->bitmap_ready_event)
+		(void)ResetEvent(client->bitmap_ready_event);
 	if (client->peer && client->peer->IsWriteBlocked && client->peer->DrainOutputBuffer &&
 	    client->peer->IsWriteBlocked(client->peer))
 	{
