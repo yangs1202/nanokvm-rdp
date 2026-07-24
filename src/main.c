@@ -607,7 +607,7 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 		return true;
 	}
 	start.frameId = client->next_frame_id++;
-	start.timestamp = (UINT32)monotonic_milliseconds();
+	start.timestamp = 0;
 	end.frameId = start.frameId;
 	LeaveCriticalSection(&client->lock);
 
