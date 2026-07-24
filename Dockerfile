@@ -79,7 +79,7 @@ RUN apt-get update \
         ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /src/build/gateway/nanokvm-rdp-gateway /usr/local/bin/nanokvm-rdp-gateway
+COPY --from=builder /src/nanokvm-rdp/build/gateway/nanokvm-rdp-gateway /usr/local/bin/nanokvm-rdp-gateway
 
 EXPOSE 3389/tcp 3390/tcp 5004/udp
 
