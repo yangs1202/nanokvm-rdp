@@ -665,13 +665,21 @@ static DWORD WINAPI video_thread(LPVOID argument)
 	{
 		uint8_t* data = NULL;
 		size_t length = 0;
-		if (!rtp_client_read_h264(&rtp, &data, &length) || !data || length == 0)
+		if (!rtp_client_read_h264(&rtp, &data, &length))
 		{
+			const int error = errno;
 			if (client_should_stop(client))
 				break;
+			if (error == EAGAIN || error == EWOULDBLOCK)
+				continue;
 			log_message("ERROR", "RDPGFX RTP/H.264 frame 수신 실패");
 			client_stop(client);
 			break;
+		}
+		if (!data || length == 0)
+		{
+			free(data);
+			continue;
 		}
 		client->last_rtp_received_at = monotonic_milliseconds();
 		client->rtp_nals++;
@@ -1226,13 +1234,21 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 	{
 		uint8_t* data = NULL;
 		size_t length = 0;
-		if (!rtp_client_read_h264(&rtp, &data, &length) || !data || length == 0)
+		if (!rtp_client_read_h264(&rtp, &data, &length))
 		{
+			const int error = errno;
 			if (client_should_stop(client))
 				break;
+			if (error == EAGAIN || error == EWOULDBLOCK)
+				continue;
 			log_message("ERROR", "RTP/H.264 frame 수신 실패");
 			client_stop(client);
 			break;
+		}
+		if (!data || length == 0)
+		{
+			free(data);
+			continue;
 		}
 		client->last_rtp_received_at = monotonic_milliseconds();
 		client->rtp_nals++;
