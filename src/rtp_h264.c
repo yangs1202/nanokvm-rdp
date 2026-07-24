@@ -155,6 +155,25 @@ bool rtp_h264_reassembler_push(RtpH264Reassembler* reassembler, const uint8_t* p
 	const uint8_t type = payload[0] & 0x1fU;
 	if (type >= 1U && type <= 23U)
 		return nal_callback && nal_callback(nal_context, payload, payload_length, timestamp, marker);
+	if (type == 24U)
+	{
+		size_t offset = 1;
+		bool delivered = false;
+		while (offset + 2U <= payload_length)
+		{
+			const size_t nal_length = read_u16(payload + offset);
+			offset += 2U;
+			if (nal_length == 0 || nal_length > payload_length - offset)
+				return false;
+			const bool nal_marker = marker && offset + nal_length == payload_length;
+			if (!nal_callback ||
+			    !nal_callback(nal_context, payload + offset, nal_length, timestamp, nal_marker))
+				return false;
+			offset += nal_length;
+			delivered = true;
+		}
+		return delivered && offset == payload_length;
+	}
 	if (type != 28U || payload_length < 3)
 		return true;
 	const bool start = (payload[1] & 0x80U) != 0;

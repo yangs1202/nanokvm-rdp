@@ -22,6 +22,14 @@ typedef struct
 	unsigned losses;
 } RtpTestState;
 
+typedef struct
+{
+	uint8_t output[2][16];
+	size_t lengths[2];
+	bool markers[2];
+	size_t count;
+} RtpStapTestState;
+
 static bool collect_packet(void* context, const uint8_t* packet, size_t length)
 {
 	RtpTestState* state = context;
@@ -45,6 +53,20 @@ static bool collect_nal(void* context, const uint8_t* nal, size_t length, uint32
 static void count_loss(void* context)
 {
 	((RtpTestState*)context)->losses++;
+}
+
+static bool collect_stap_nal(void* context, const uint8_t* nal, size_t length,
+	                         uint32_t timestamp, bool marker)
+{
+	RtpStapTestState* state = context;
+	assert(timestamp == 90000U);
+	assert(state->count < 2);
+	assert(length <= sizeof(state->output[state->count]));
+	memcpy(state->output[state->count], nal, length);
+	state->lengths[state->count] = length;
+	state->markers[state->count] = marker;
+	state->count++;
+	return true;
 }
 
 static void test_h264_annexb(void)
@@ -152,6 +174,40 @@ static void test_rtp_h264_fragmentation_and_loss(void)
 	rtp_h264_reassembler_free(&reassembler);
 }
 
+static void test_rtp_h264_stap_a(void)
+{
+	const uint8_t sps[] = { 0x67, 0x42, 0x00, 0x1f };
+	const uint8_t pps[] = { 0x68, 0xce, 0x06, 0xe2 };
+	uint8_t packet[12 + 1 + 2 + sizeof(sps) + 2 + sizeof(pps)] = { 0 };
+	packet[0] = 0x80;
+	packet[1] = 0x80 | 96;
+	packet[3] = 1;
+	packet[5] = 1;
+	packet[6] = 0x5f;
+	packet[7] = 0x90;
+	packet[12] = 24;
+	packet[13] = 0;
+	packet[14] = sizeof(sps);
+	memcpy(packet + 15, sps, sizeof(sps));
+	packet[15 + sizeof(sps)] = 0;
+	packet[16 + sizeof(sps)] = sizeof(pps);
+	memcpy(packet + 17 + sizeof(sps), pps, sizeof(pps));
+
+	RtpH264Reassembler reassembler = { 0 };
+	RtpStapTestState state = { 0 };
+	rtp_h264_reassembler_init(&reassembler);
+	assert(rtp_h264_reassembler_push(&reassembler, packet, sizeof(packet), collect_stap_nal,
+	                                 &state, NULL, NULL));
+	assert(state.count == 2);
+	assert(state.lengths[0] == sizeof(sps));
+	assert(state.lengths[1] == sizeof(pps));
+	assert(memcmp(state.output[0], sps, sizeof(sps)) == 0);
+	assert(memcmp(state.output[1], pps, sizeof(pps)) == 0);
+	assert(!state.markers[0]);
+	assert(state.markers[1]);
+	rtp_h264_reassembler_free(&reassembler);
+}
+
 int main(void)
 {
 	test_h264_annexb();
@@ -160,5 +216,6 @@ int main(void)
 	test_protocol_primitives();
 	test_control_wire_message();
 	test_rtp_h264_fragmentation_and_loss();
+	test_rtp_h264_stap_a();
 	return 0;
 }
