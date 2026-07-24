@@ -56,6 +56,8 @@
 #define CLASSIC_TILE_HEIGHT 64U
 #define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
 #define CLASSIC_BITMAP_BATCH 12U
+#define CLASSIC_PIXEL_DIFF_THRESHOLD 10U
+#define CLASSIC_CHANGED_PIXEL_THRESHOLD 8U
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define STATS_LOG_INTERVAL_MS 5000U
@@ -727,14 +729,39 @@ static bool classic_tile_changed(const uint8_t* previous, const uint8_t* current
 {
 	if (!previous)
 		return true;
+	uint32_t changed_pixels = 0;
+	for (uint16_t row = 0; row < rows; row++)
+	{
+		const size_t offset = ((size_t)(top + row) * width + left) * 4U;
+		for (uint16_t column = 0; column < columns; column++)
+		{
+			const size_t pixel = offset + (size_t)column * 4U;
+			const uint8_t* before = previous + pixel;
+			const uint8_t* after = current + pixel;
+			const unsigned blue = before[0] > after[0] ? before[0] - after[0] : after[0] - before[0];
+			const unsigned green = before[1] > after[1] ? before[1] - after[1] : after[1] - before[1];
+			const unsigned red = before[2] > after[2] ? before[2] - after[2] : after[2] - before[2];
+			if (blue >= CLASSIC_PIXEL_DIFF_THRESHOLD ||
+			    green >= CLASSIC_PIXEL_DIFF_THRESHOLD || red >= CLASSIC_PIXEL_DIFF_THRESHOLD)
+			{
+				changed_pixels++;
+				if (changed_pixels >= CLASSIC_CHANGED_PIXEL_THRESHOLD)
+					return true;
+			}
+		}
+	}
+	return false;
+}
+
+static void classic_tile_copy(uint8_t* destination, const uint8_t* source, uint16_t width,
+	                          uint16_t left, uint16_t top, uint16_t columns, uint16_t rows)
+{
 	const size_t row_length = (size_t)columns * 4U;
 	for (uint16_t row = 0; row < rows; row++)
 	{
 		const size_t offset = ((size_t)(top + row) * width + left) * 4U;
-		if (memcmp(previous + offset, current + offset, row_length) != 0)
-			return true;
+		memcpy(destination + offset, source + offset, row_length);
 	}
-	return false;
 }
 
 static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
@@ -826,6 +853,7 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 			rectangle->cbUncompressedSize = columns * rows * (bits_per_pixel / 8U);
 			rectangle_count++;
 			update_size += encoded_length + 16U;
+			classic_tile_copy(client->previous_bitmap, bgra, width, left, top, columns, rows);
 			if (rectangle_count == CLASSIC_BITMAP_BATCH)
 			{
 				bitmap.number = rectangle_count;
@@ -846,7 +874,6 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 		if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
 			return false;
 	}
-	memcpy(client->previous_bitmap, bgra, expected_length);
 	client->previous_bitmap_valid = true;
 	return true;
 }
