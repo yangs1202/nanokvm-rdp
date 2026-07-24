@@ -149,7 +149,7 @@ bool ffmpeg_decoder_push(FfmpegDecoder* decoder, const uint8_t* data, size_t len
 		if (ready > 0 && !decoder_drain(decoder, 0))
 			return false;
 	}
-	return true;
+	return decoder_drain(decoder, 5);
 }
 
 void ffmpeg_decoder_stop(FfmpegDecoder* decoder)
