@@ -108,6 +108,7 @@ struct Client
 	HANDLE vcm;
 	RdpgfxServerContext* gfx;
 	HANDLE video_thread;
+	HANDLE bitmap_ready_event;
 	RFX_CONTEXT* rfx;
 	NSC_CONTEXT* nsc;
 	BITMAP_PLANAR_CONTEXT* planar;
@@ -1079,6 +1080,8 @@ static bool on_decoded_bitmap_frame(void* context, const uint8_t* bgra, size_t l
 	client->bitmap_queued_frames++;
 	client->last_decode_latency_ms = now - client->last_rtp_received_at;
 	LeaveCriticalSection(&client->lock);
+	if (client->bitmap_ready_event)
+		(void)SetEvent(client->bitmap_ready_event);
 	return true;
 }
 
@@ -1441,6 +1444,8 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 		(void)WaitForSingleObject(client->video_thread, 3000);
 		(void)CloseHandle(client->video_thread);
 	}
+	if (client->bitmap_ready_event)
+		(void)CloseHandle(client->bitmap_ready_event);
 	if (client->gfx)
 		rdpgfx_server_context_free(client->gfx);
 	if (client->rfx)
@@ -1498,6 +1503,12 @@ static bool client_prepare_bitmap(Client* client)
 	const rdpSettings* settings = client->context.settings;
 	if (!settings)
 		return false;
+	if (!client->bitmap_ready_event)
+	{
+		client->bitmap_ready_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+		if (!client->bitmap_ready_event)
+			return false;
+	}
 	client->bitmap_fallback_active = true;
 	client->bitmap_uses_rfx = bitmap_stream_rfx_supported(settings);
 	if (client->bitmap_uses_rfx)
@@ -1714,6 +1725,8 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 			break;
 		if (client->direct_gfx_active)
 			handles[count++] = WTSVirtualChannelManagerGetEventHandle(client->vcm);
+		if (client->bitmap_fallback_active && client->bitmap_ready_event)
+			handles[count++] = client->bitmap_ready_event;
 		DWORD timeout = 20;
 		if (client->bitmap_fallback_active)
 		{
