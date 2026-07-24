@@ -28,6 +28,9 @@
 #define DEFAULT_BITRATE 3000U
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
+#define CAPTURE_REINIT_DELAY_MS 2000U
+#define CAPTURE_REINIT_INTERVAL_MS 5000U
+#define CAPTURE_RETRY_SLEEP_NS 10000000L
 
 enum KvmFrameKind { KVM_FRAME_SPS = 1, KVM_FRAME_PPS = 2, KVM_FRAME_IDR = 3, KVM_FRAME_P = 4 };
 
@@ -276,11 +279,15 @@ static void usage(const char* executable)
 static void* video_loop(void* argument)
 {
 	Agent* agent = argument;
+	uint64_t empty_since = 0;
+	uint64_t last_reinit_at = 0;
 	while (!stop_requested)
 	{
 		if (!atomic_load(&agent->streaming))
 		{
-			const struct timespec pause = { .tv_sec = 0, .tv_nsec = 10000000L };
+			const struct timespec pause = { .tv_sec = 0, .tv_nsec = CAPTURE_RETRY_SLEEP_NS };
+			empty_since = 0;
+			last_reinit_at = 0;
 			(void)nanosleep(&pause, NULL);
 			continue;
 		}
@@ -292,8 +299,23 @@ static void* video_loop(void* argument)
 		{
 			if (data)
 				(void)agent->kvm.free_data(&data);
+			const uint64_t now = monotonic_milliseconds();
+			if (empty_since == 0)
+				empty_since = now;
+			if (now - empty_since >= CAPTURE_REINIT_DELAY_MS &&
+			    (last_reinit_at == 0 || now - last_reinit_at >= CAPTURE_REINIT_INTERVAL_MS))
+			{
+				agent->kvm.init(0);
+				agent->kvm.set_frame_detect(0);
+				last_reinit_at = now;
+				(void)fprintf(stderr, "%s: capture frame 없음; libkvm 재초기화\n", TAG);
+			}
+			const struct timespec pause = { .tv_sec = 0, .tv_nsec = CAPTURE_RETRY_SLEEP_NS };
+			(void)nanosleep(&pause, NULL);
 			continue;
 		}
+		empty_since = 0;
+		last_reinit_at = 0;
 		if (kind == KVM_FRAME_IDR)
 			atomic_store(&agent->wait_for_idr, false);
 		(void)atomic_fetch_add(&agent->capture_frames, 1);
