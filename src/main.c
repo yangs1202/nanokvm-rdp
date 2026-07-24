@@ -43,6 +43,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#ifndef WINPR_C_ARRAY_INIT
+#define WINPR_C_ARRAY_INIT \
+	{ \
+		0 \
+	}
+#endif
+
 #define TAG "nanokvm-rdp-gateway"
 #define DEFAULT_WIDTH 1920U
 #define DEFAULT_HEIGHT 1080U
@@ -965,7 +972,7 @@ static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length
 	if (!update->SurfaceBits || !client->bitmap_stream)
 		return false;
 	Stream_Clear(client->bitmap_stream);
-	Stream_ResetPosition(client->bitmap_stream);
+	Stream_SetPosition(client->bitmap_stream, 0);
 	if (client->bitmap_uses_rfx)
 	{
 		if (!client->rfx || !bitmap_stream_rfx_supported(settings))
@@ -1644,7 +1651,7 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 		return false;
 
 	rdpSettings* settings = peer->context->settings;
-	rdpPrivateKey* private_key = freerdp_key_new_from_file_enc(server->config.private_key, NULL);
+	rdpPrivateKey* private_key = freerdp_key_new_from_file(server->config.private_key);
 	rdpCertificate* certificate = freerdp_certificate_new_from_file(server->config.certificate);
 	if (!private_key || !certificate)
 		return false;
