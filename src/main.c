@@ -155,6 +155,8 @@ struct Client
 	uint32_t bitmap_stale_drops;
 	uint32_t bitmap_flushes;
 	uint32_t bitmap_empty_flushes;
+	uint64_t classic_tiles_sent;
+	uint64_t classic_bytes_sent;
 	uint32_t rtp_nals;
 	uint32_t rtp_access_units;
 	uint32_t rtp_idr_units;
@@ -326,6 +328,8 @@ static void server_heartbeat(Server* server)
 		uint32_t bitmap_stale_drops = 0;
 		uint32_t bitmap_flushes = 0;
 		uint32_t bitmap_empty_flushes = 0;
+		uint64_t classic_tiles_sent = 0;
+		uint64_t classic_bytes_sent = 0;
 		uint32_t rtp_nals = 0;
 		uint32_t rtp_access_units = 0;
 		uint32_t rtp_idr_units = 0;
@@ -344,6 +348,8 @@ static void server_heartbeat(Server* server)
 			bitmap_stale_drops = active->bitmap_stale_drops;
 			bitmap_flushes = active->bitmap_flushes;
 			bitmap_empty_flushes = active->bitmap_empty_flushes;
+			classic_tiles_sent = active->classic_tiles_sent;
+			classic_bytes_sent = active->classic_bytes_sent;
 			rtp_nals = active->rtp_nals;
 			rtp_access_units = active->rtp_access_units;
 			rtp_idr_units = active->rtp_idr_units;
@@ -353,15 +359,16 @@ static void server_heartbeat(Server* server)
 			LeaveCriticalSection(&active->lock);
 		}
 		LeaveCriticalSection(&server->lock);
-		char message[256] = { 0 };
+		char message[512] = { 0 };
 		(void)snprintf(message, sizeof(message),
-			               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u queued=%u queue_drop=%u stale_drop=%u flush=%u empty_flush=%u rdp_frames=%u queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
+			               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u queued=%u queue_drop=%u stale_drop=%u flush=%u empty_flush=%u rdp_frames=%u classic_tiles=%llu classic_bytes=%llu queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
 			               server->agent_sent_packets, server->agent_dropped_packets,
 			               server->agent_capture_frames, server->agent_dropped_frames,
 			               rtp_nals, rtp_access_units, rtp_idr_units, rtp_p_units, decoded_frames,
 			               bitmap_queued_frames, bitmap_queue_drops, bitmap_stale_drops, bitmap_flushes,
 			               bitmap_empty_flushes,
-			               bitmap_frames, bitmap_pending ? 1U : 0U,
+			               bitmap_frames, (unsigned long long)classic_tiles_sent,
+			               (unsigned long long)classic_bytes_sent, bitmap_pending ? 1U : 0U,
 		               usage.ru_maxrss, (unsigned long long)(server->active ?
 		               server->active->last_decode_latency_ms : 0),
 		               (unsigned long long)rdp_send_ms);
@@ -779,6 +786,8 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	    freerdp_settings_get_uint32(settings, FreeRDP_MultifragMaxRequestSize);
 	uint32_t update_size = 1024U;
 	uint16_t rectangle_count = 0;
+	uint32_t frame_tiles = 0;
+	uint64_t frame_bytes = 0;
 
 	if (!client->context.update || !client->context.update->BitmapUpdate ||
 	    settings == NULL || (!client->planar && !client->interleaved) ||
@@ -854,6 +863,8 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 			rectangle_count++;
 			update_size += encoded_length + 16U;
 			classic_tile_copy(client->previous_bitmap, bgra, width, left, top, columns, rows);
+			frame_tiles++;
+			frame_bytes += encoded_length;
 			if (rectangle_count == CLASSIC_BITMAP_BATCH)
 			{
 				bitmap.number = rectangle_count;
@@ -874,6 +885,10 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 		if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
 			return false;
 	}
+	EnterCriticalSection(&client->lock);
+	client->classic_tiles_sent += frame_tiles;
+	client->classic_bytes_sent += frame_bytes;
+	LeaveCriticalSection(&client->lock);
 	client->previous_bitmap_valid = true;
 	return true;
 }
