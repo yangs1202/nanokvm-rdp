@@ -39,6 +39,7 @@ RUN cmake -S freerdp -B build/freerdp \
         -DWITH_CUPS=OFF \
         -DWITH_PCSC=OFF \
         -DWITH_LIBUSB=OFF \
+        -DCHANNEL_URBDRC=OFF \
         -DWITH_MANPAGES=OFF \
         -DWITH_SMARTCARD_EMULATE=OFF \
         -DWITH_KRB5=OFF \
