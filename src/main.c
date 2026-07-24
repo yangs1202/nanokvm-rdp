@@ -11,6 +11,7 @@
 #include <freerdp/codec/color.h>
 #include <freerdp/codec/interleaved.h>
 #include <freerdp/codec/nsc.h>
+#include <freerdp/codec/progressive.h>
 #include <freerdp/codec/rfx.h>
 #include <freerdp/freerdp.h>
 #include <freerdp/input.h>
@@ -106,6 +107,7 @@ struct Client
 	HANDLE video_thread;
 	RFX_CONTEXT* rfx;
 	NSC_CONTEXT* nsc;
+	PROGRESSIVE_CONTEXT* progressive;
 	BITMAP_INTERLEAVED_CONTEXT* interleaved;
 	wStream* bitmap_stream;
 	CRITICAL_SECTION lock;
@@ -139,6 +141,7 @@ struct Client
 	uint8_t* pps;
 	size_t pps_length;
 	bool bitmap_uses_rfx;
+	bool gfx_uses_progressive;
 	uint16_t render_width;
 	uint16_t render_height;
 	uint32_t bitmap_frames;
@@ -166,6 +169,7 @@ static volatile sig_atomic_t stop_requested = 0;
 
 static uint64_t monotonic_milliseconds(void);
 static DWORD WINAPI video_thread(LPVOID argument);
+static DWORD WINAPI bitmap_video_thread(LPVOID argument);
 
 static void log_message(const char* level, const char* message)
 {
@@ -394,23 +398,40 @@ static void client_stop(Client* client)
 	LeaveCriticalSection(&client->lock);
 }
 
-static bool client_avc420_supported(const RDPGFX_CAPS_ADVERTISE_PDU* advertise,
-	                                RDPGFX_CAPSET* selected)
+static bool client_cap_supports_avc420(const RDPGFX_CAPSET* cap)
 {
-	for (UINT32 index = 0; index < advertise->capsSetCount; index++)
+	if (cap->version == RDPGFX_CAPVERSION_81)
+		return (cap->flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED) != 0;
+	return cap->version >= RDPGFX_CAPVERSION_10 &&
+	       (cap->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) == 0;
+}
+
+static bool client_select_gfx_cap(const RDPGFX_CAPS_ADVERTISE_PDU* advertise,
+	                              RDPGFX_CAPSET* selected, bool* use_avc420)
+{
+	const UINT32 preferred_versions[] = {
+		RDPGFX_CAPVERSION_107, RDPGFX_CAPVERSION_106, RDPGFX_CAPVERSION_106_ERR,
+		RDPGFX_CAPVERSION_105, RDPGFX_CAPVERSION_104, RDPGFX_CAPVERSION_103,
+		RDPGFX_CAPVERSION_102, RDPGFX_CAPVERSION_101, RDPGFX_CAPVERSION_10,
+		RDPGFX_CAPVERSION_81, RDPGFX_CAPVERSION_8
+	};
+
+	for (size_t pass = 0; pass < 2; pass++)
 	{
-		const RDPGFX_CAPSET* current = &advertise->capsSets[index];
-		if (current->version == RDPGFX_CAPVERSION_81 &&
-		    (current->flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED) != 0)
+		for (size_t version = 0; version < ARRAYSIZE(preferred_versions); version++)
 		{
-			*selected = *current;
-			return true;
-		}
-		if (current->version >= RDPGFX_CAPVERSION_10 &&
-		    (current->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) == 0)
-		{
-			*selected = *current;
-			return true;
+			for (UINT32 index = 0; index < advertise->capsSetCount; index++)
+			{
+				const RDPGFX_CAPSET* current = &advertise->capsSets[index];
+				if (current->version != preferred_versions[version])
+					continue;
+				const bool avc420 = client_cap_supports_avc420(current);
+				if (pass == 0 && !avc420)
+					continue;
+				*selected = *current;
+				*use_avc420 = avc420;
+				return true;
+			}
 		}
 	}
 	return false;
@@ -424,15 +445,25 @@ static UINT on_gfx_caps_advertise(RdpgfxServerContext* gfx,
 	RDPGFX_CAPS_CONFIRM_PDU confirm = WINPR_C_ARRAY_INIT;
 	RDPGFX_CREATE_SURFACE_PDU surface = WINPR_C_ARRAY_INIT;
 	RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU map = WINPR_C_ARRAY_INIT;
+	bool use_avc420 = false;
 	UINT error = CHANNEL_RC_OK;
 
 	if (!client->direct_gfx_active || client->bitmap_fallback_active)
 		return ERROR_NOT_SUPPORTED;
-	if (!client_avc420_supported(advertise, &selected))
+	for (UINT32 index = 0; index < advertise->capsSetCount; index++)
 	{
-		log_message("ERROR", "client가 RDPGFX AVC420을 지원하지 않아 session을 종료합니다");
+		char message[160];
+		(void)snprintf(message, sizeof(message),
+		               "RDPGFX client capability[%u]: version=0x%08x flags=0x%08x",
+		               index, advertise->capsSets[index].version,
+		               advertise->capsSets[index].flags);
+		log_message("INFO", message);
+	}
+	if (!client_select_gfx_cap(advertise, &selected, &use_avc420))
+	{
+		log_message("ERROR", "client가 지원 가능한 RDPGFX capability를 광고하지 않았습니다");
 		client_stop(client);
-		return ERROR_NOT_SUPPORTED;
+		return CHANNEL_RC_UNSUPPORTED_VERSION;
 	}
 
 	confirm.capsSet = &selected;
@@ -452,12 +483,23 @@ static UINT on_gfx_caps_advertise(RdpgfxServerContext* gfx,
 	map.reserved = 0;
 	if (!gfx->MapSurfaceToOutput || (error = gfx->MapSurfaceToOutput(gfx, &map)) != CHANNEL_RC_OK)
 		return error ? error : ERROR_INTERNAL_ERROR;
+	if (!use_avc420)
+	{
+		client->progressive = progressive_context_new_ex(
+		    TRUE, freerdp_settings_get_uint32(client->context.settings, FreeRDP_ThreadingFlags));
+		if (!client->progressive || !progressive_context_reset(client->progressive))
+			return ERROR_INTERNAL_ERROR;
+	}
 
 	EnterCriticalSection(&client->lock);
 	client->gfx_ready = true;
-	client->need_idr = true;
+	client->need_idr = use_avc420;
+	client->gfx_uses_progressive = !use_avc420;
+	client->bitmap_fallback_active = !use_avc420;
 	LeaveCriticalSection(&client->lock);
-	client->video_thread = CreateThread(NULL, 0, video_thread, client, 0, NULL);
+	client->video_thread = CreateThread(NULL, 0,
+	                                    use_avc420 ? video_thread : bitmap_video_thread,
+	                                    client, 0, NULL);
 	if (!client->video_thread)
 	{
 		client_stop(client);
@@ -469,7 +511,10 @@ static UINT on_gfx_caps_advertise(RdpgfxServerContext* gfx,
 		client_stop(client);
 		return ERROR_CONNECTION_ABORTED;
 	}
-	log_message("INFO", "RDPGFX AVC420 capability 확인 및 surface 초기화 완료");
+	if (use_avc420)
+		log_message("INFO", "RDPGFX AVC420 capability 확인 및 surface 초기화 완료");
+	else
+		log_message("INFO", "RDPGFX Progressive capability 확인 및 surface 초기화 완료");
 	return CHANNEL_RC_OK;
 }
 
@@ -769,6 +814,60 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	return true;
 }
 
+static bool send_progressive_frame(Client* client, const uint8_t* bgra, size_t length)
+{
+	const uint16_t width = client->render_width;
+	const uint16_t height = client->render_height;
+	const size_t expected_length = (size_t)width * height * 4U;
+	REGION16 region = WINPR_C_ARRAY_INIT;
+	RECTANGLE_16 rect = { .left = 0, .top = 0, .right = width, .bottom = height };
+	RDPGFX_SURFACE_COMMAND command = WINPR_C_ARRAY_INIT;
+	RDPGFX_START_FRAME_PDU start = WINPR_C_ARRAY_INIT;
+	RDPGFX_END_FRAME_PDU end = WINPR_C_ARRAY_INIT;
+
+	if (!client->progressive || !client->gfx || !client->gfx->SurfaceFrameCommand ||
+	    length != expected_length || client_should_stop(client))
+		return false;
+	region16_init(&region);
+	if (!region16_union_rect(&region, &region, &rect))
+	{
+		region16_uninit(&region);
+		return false;
+	}
+	const int encoded = progressive_compress(
+	    client->progressive, bgra, WINPR_ASSERTING_INT_CAST(uint32_t, length),
+	    PIXEL_FORMAT_BGRX32, width, height, (uint32_t)width * 4U, &region,
+	    &command.data, &command.length);
+	region16_uninit(&region);
+	if (encoded < 0)
+		return false;
+	if (encoded == 0)
+		return true;
+
+	EnterCriticalSection(&client->lock);
+	start.frameId = client->next_frame_id++;
+	start.timestamp = (UINT32)monotonic_milliseconds();
+	end.frameId = start.frameId;
+	LeaveCriticalSection(&client->lock);
+	command.surfaceId = 1;
+	command.codecId = RDPGFX_CODECID_CAPROGRESSIVE;
+	command.format = PIXEL_FORMAT_BGRX32;
+	command.left = 0;
+	command.top = 0;
+	command.right = width;
+	command.bottom = height;
+	command.width = width;
+	command.height = height;
+	const UINT error = client->gfx->SurfaceFrameCommand(client->gfx, &command, &start, &end);
+	command.data = NULL;
+	if (error != CHANNEL_RC_OK)
+	{
+		log_message("ERROR", "RDPGFX Progressive frame 전송 실패");
+		return false;
+	}
+	return true;
+}
+
 static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
 {
 	const uint16_t width = client->render_width;
@@ -781,6 +880,12 @@ static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length
 
 	if (!settings || !update || length != expected_length || client_should_stop(client))
 		return false;
+	if (client->gfx_uses_progressive)
+	{
+		if (!send_progressive_frame(client, bgra, length))
+			return false;
+		goto sent;
+	}
 	if (!client->bitmap_uses_rfx && !client->nsc)
 		goto sent_classic;
 	if (!update->SurfaceBits || !client->bitmap_stream)
@@ -830,9 +935,15 @@ static bool send_bitmap_frame(Client* client, const uint8_t* bgra, size_t length
 sent_classic:
 	if (!client->bitmap_uses_rfx && !client->nsc && !send_classic_bitmap_frame(client, bgra, length))
 		return false;
+sent:
 	client->bitmap_frames++;
 	if (client->bitmap_frames == 1)
-		log_message("INFO", "FoldVNC H.264 → FFmpeg BGRA → RDP bitmap 첫 frame 전송 완료");
+	{
+		if (client->gfx_uses_progressive)
+			log_message("INFO", "FoldVNC H.264 → FFmpeg BGRA → RDPGFX Progressive 첫 frame 전송 완료");
+		else
+			log_message("INFO", "FoldVNC H.264 → FFmpeg BGRA → RDP bitmap 첫 frame 전송 완료");
+	}
 	return true;
 }
 
@@ -1255,6 +1366,8 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 		rfx_context_free(client->rfx);
 	if (client->nsc)
 		nsc_context_free(client->nsc);
+	if (client->progressive)
+		progressive_context_free(client->progressive);
 	if (client->interleaved)
 		bitmap_interleaved_context_free(client->interleaved);
 	if (client->bitmap_stream)
@@ -1301,6 +1414,7 @@ static bool client_prepare_bitmap(Client* client)
 	const rdpSettings* settings = client->context.settings;
 	if (!settings)
 		return false;
+	client->bitmap_fallback_active = true;
 	client->bitmap_uses_rfx = bitmap_stream_rfx_supported(settings);
 	if (client->bitmap_uses_rfx)
 	{
@@ -1394,7 +1508,7 @@ static bool client_process_dynamic_channels(Client* client)
 		return false;
 	client->gfx_opened = true;
 	client->gfx_opened_at = monotonic_milliseconds();
-	log_message("INFO", "RDPGFX dynamic channel open 완료; AVC420 capability 대기 중");
+	log_message("INFO", "RDPGFX dynamic channel open 완료; client capability 대기 중");
 	return true;
 }
 
@@ -1414,7 +1528,7 @@ static bool client_check_gfx_timeout(Client* client)
 		return false;
 	}
 	if (client->gfx_opened)
-		log_message("INFO", "RDPGFX AVC420 capability가 없는 client를 classic bitmap backend로 전환합니다");
+		log_message("INFO", "RDPGFX capability 응답이 없는 client를 classic bitmap backend로 전환합니다");
 	else
 		log_message("INFO", "RDPGFX dynamic channel이 없는 client를 classic bitmap backend로 전환합니다");
 	return true;
@@ -1441,6 +1555,10 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 	    !freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline,
 	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxH264, server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive,
+	                               server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2,
+	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, TRUE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled,
@@ -1474,7 +1592,7 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 	log_message("INFO", "TLS RDP client 연결 수락");
 	while (!client_should_stop(client))
 	{
-		if (!client->direct_gfx_active && !client_flush_pending_bitmap(client))
+		if (client->bitmap_fallback_active && !client_flush_pending_bitmap(client))
 			break;
 		HANDLE handles[MAX_EVENT_HANDLES] = WINPR_C_ARRAY_INIT;
 		DWORD count = peer->GetEventHandles(peer, handles, ARRAYSIZE(handles));
@@ -1483,7 +1601,7 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		if (client->direct_gfx_active)
 			handles[count++] = WTSVirtualChannelManagerGetEventHandle(client->vcm);
 		DWORD timeout = 20;
-		if (!client->direct_gfx_active)
+		if (client->bitmap_fallback_active)
 		{
 			EnterCriticalSection(&client->lock);
 			const bool bitmap_pending = client->bitmap_queue_count > 0;
@@ -1512,7 +1630,7 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 			break;
 		if (!peer->CheckFileDescriptor(peer))
 			break;
-		if (!client->direct_gfx_active && !client_flush_pending_bitmap(client))
+		if (client->bitmap_fallback_active && !client_flush_pending_bitmap(client))
 			break;
 		if (client->direct_gfx_active &&
 		    (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client)))
