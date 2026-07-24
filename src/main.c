@@ -1346,14 +1346,14 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	protocol_write_u16(payload + 8, flags);
 	const bool position_ok = server_send_control(client->server, NANOKVM_CONTROL_POINTER_ABS,
 	                                              payload, sizeof(payload));
-	const bool wheel_ok = (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) == 0 ||
+	const bool wheel_ok = (flags & PTR_FLAGS_WHEEL) == 0 ||
 	                      server_send_control(client->server, NANOKVM_CONTROL_WHEEL, payload + 8, 2);
 	if (position_ok && !client->pointer_input_logged)
 	{
 		log_message("INFO", "RDP absolute pointer → NanoKVM agent HID 전달 확인");
 		client->pointer_input_logged = true;
 	}
-	if (wheel_ok && (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) != 0 &&
+	if (wheel_ok && (flags & PTR_FLAGS_WHEEL) != 0 &&
 	    !client->wheel_input_logged)
 	{
 		log_message("INFO", "RDP wheel → NanoKVM agent HID 전달 확인");
@@ -1692,6 +1692,8 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled,
 	                               server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_HasExtendedMouseEvent, TRUE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_HasHorizontalWheel, FALSE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_HasRelativeMouseEvent, TRUE) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, server->config.width) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, server->config.height) ||

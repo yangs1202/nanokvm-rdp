@@ -108,14 +108,79 @@ static void test_hid_middle_button(void)
 
 	HidState hid;
 	hid_init(&hid, "/dev/null", "/dev/null", touch_path);
-	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xc000U));
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xa000U));
 
-	const int read_fd = open(touch_path, O_RDONLY);
+	int read_fd = open(touch_path, O_RDONLY);
 	assert(read_fd >= 0);
 	uint8_t report[6] = { 0 };
 	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
+	assert(report[0] == 0x02);
+	assert(close(read_fd) == 0);
+
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0x2000U));
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xc000U));
+
+	read_fd = open(touch_path, O_RDONLY);
+	assert(read_fd >= 0);
+	memset(report, 0, sizeof(report));
+	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
 	assert(report[0] == 0x04);
 	assert(close(read_fd) == 0);
+	assert(unlink(touch_path) == 0);
+}
+
+static void test_hid_extended_buttons(void)
+{
+	char mouse_path[] = "/tmp/nanokvm-rdp-mouse-XXXXXX";
+	char touch_path[] = "/tmp/nanokvm-rdp-touch-XXXXXX";
+	const int mouse_fd = mkstemp(mouse_path);
+	const int touch_fd = mkstemp(touch_path);
+	assert(mouse_fd >= 0 && touch_fd >= 0);
+	assert(close(mouse_fd) == 0);
+	assert(close(touch_fd) == 0);
+
+	HidState hid;
+	hid_init(&hid, "/dev/null", mouse_path, touch_path);
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0x8001U));
+	int read_fd = open(touch_path, O_RDONLY);
+	assert(read_fd >= 0);
+	uint8_t report[6] = { 0 };
+	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
+	assert(report[0] == 0x08 && report[5] == 0);
+	assert(close(read_fd) == 0);
+
+	assert(hid_wheel(&hid, 0x0278U));
+	read_fd = open(mouse_path, O_RDONLY);
+	assert(read_fd >= 0);
+	uint8_t mouse_report[4] = { 0 };
+	assert(read(read_fd, mouse_report, sizeof(mouse_report)) == (ssize_t)sizeof(mouse_report));
+	assert(mouse_report[0] == 0x00 && mouse_report[3] == 1);
+	assert(close(read_fd) == 0);
+
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0));
+	read_fd = open(touch_path, O_RDONLY);
+	assert(read_fd >= 0);
+	memset(report, 0, sizeof(report));
+	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
+	assert(report[0] == 0x08 && report[5] == 0);
+	assert(close(read_fd) == 0);
+
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0x0001U));
+	read_fd = open(touch_path, O_RDONLY);
+	assert(read_fd >= 0);
+	memset(report, 0, sizeof(report));
+	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
+	assert(report[0] == 0x00 && report[5] == 0);
+	assert(close(read_fd) == 0);
+
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0x8002U));
+	read_fd = open(touch_path, O_RDONLY);
+	assert(read_fd >= 0);
+	memset(report, 0, sizeof(report));
+	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
+	assert(report[0] == 0x10 && report[5] == 0);
+	assert(close(read_fd) == 0);
+	assert(unlink(mouse_path) == 0);
 	assert(unlink(touch_path) == 0);
 }
 
@@ -213,6 +278,7 @@ int main(void)
 	test_h264_annexb();
 	test_hid_mapping();
 	test_hid_middle_button();
+	test_hid_extended_buttons();
 	test_protocol_primitives();
 	test_control_wire_message();
 	test_rtp_h264_fragmentation_and_loss();

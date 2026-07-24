@@ -8,14 +8,19 @@
 #include <unistd.h>
 
 #define KBD_FLAGS_RELEASE 0x8000
-#define PTR_FLAGS_HWHEEL 0x0400
 #define PTR_FLAGS_WHEEL 0x0200
 #define PTR_FLAGS_WHEEL_NEGATIVE 0x0100
 #define PTR_FLAGS_DOWN 0x8000
 #define PTR_FLAGS_BUTTON1 0x1000
 #define PTR_FLAGS_BUTTON2 0x2000
 #define PTR_FLAGS_BUTTON3 0x4000
+#define PTR_XFLAGS_BUTTON1 0x0001
+#define PTR_XFLAGS_BUTTON2 0x0002
 #define WHEEL_ROTATION_MASK 0x01FF
+#define HID_MOUSE_BUTTONS_MASK 0x07
+#define HID_TOUCH_BUTTONS_MASK 0x1F
+#define HID_TOUCH_XBUTTON1 0x08
+#define HID_TOUCH_XBUTTON2 0x10
 
 static bool write_report(const char* path, const uint8_t* report, size_t length)
 {
@@ -161,14 +166,7 @@ bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release)
 
 static uint8_t touch_buttons(uint8_t buttons)
 {
-	uint8_t report = 0;
-	if ((buttons & 0x01U) != 0)
-		report |= 0x01;
-	if ((buttons & 0x02U) != 0)
-		report |= 0x10;
-	if ((buttons & 0x04U) != 0)
-		report |= 0x04;
-	return report;
+	return buttons & HID_TOUCH_BUTTONS_MASK;
 }
 
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
@@ -195,6 +193,20 @@ bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_
 		else
 			hid->buttons &= (uint8_t)~0x04U;
 	}
+	if ((flags & PTR_XFLAGS_BUTTON1) != 0)
+	{
+		if ((flags & PTR_FLAGS_DOWN) != 0)
+			hid->buttons |= HID_TOUCH_XBUTTON1;
+		else
+			hid->buttons &= (uint8_t)~HID_TOUCH_XBUTTON1;
+	}
+	if ((flags & PTR_XFLAGS_BUTTON2) != 0)
+	{
+		if ((flags & PTR_FLAGS_DOWN) != 0)
+			hid->buttons |= HID_TOUCH_XBUTTON2;
+		else
+			hid->buttons &= (uint8_t)~HID_TOUCH_XBUTTON2;
+	}
 
 	hid->last_x = hid_scale_absolute(x, width);
 	hid->last_y = hid_scale_absolute(y, height);
@@ -214,14 +226,14 @@ bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 		y = 127;
 	if (y < -127)
 		y = -127;
-	hid->buttons = buttons;
-	const uint8_t report[4] = { buttons, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
+	hid->mouse_buttons = buttons & HID_MOUSE_BUTTONS_MASK;
+	const uint8_t report[4] = { hid->mouse_buttons, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
 	return write_report(hid->mouse_path, report, sizeof(report));
 }
 
 bool hid_wheel(HidState* hid, uint16_t flags)
 {
-	if ((flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) == 0)
+	if ((flags & PTR_FLAGS_WHEEL) == 0)
 		return true;
 	int delta = (int)(flags & WHEEL_ROTATION_MASK);
 	if ((flags & PTR_FLAGS_WHEEL_NEGATIVE) != 0)
@@ -233,7 +245,7 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 		detents = 127;
 	if (detents < -127)
 		detents = -127;
-	const uint8_t report[4] = { 0, 0, 0, (uint8_t)(int8_t)detents };
+	const uint8_t report[4] = { hid->mouse_buttons, 0, 0, (uint8_t)(int8_t)detents };
 	return write_report(hid->mouse_path, report, sizeof(report));
 }
 
@@ -242,6 +254,7 @@ void hid_release_all(HidState* hid)
 	memset(hid->usages, 0, sizeof(hid->usages));
 	hid->modifiers = 0;
 	hid->buttons = 0;
+	hid->mouse_buttons = 0;
 	const uint8_t keyboard[8] = { 0 };
 	const uint8_t mouse[4] = { 0 };
 	const uint8_t touch[6] = { 0, (uint8_t)(hid->last_x & 0xffU),
