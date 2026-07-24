@@ -1549,6 +1549,7 @@ static bool client_prepare_bitmap(Client* client)
 			    !freerdp_bitmap_planar_context_reset(client->planar, CLASSIC_TILE_WIDTH,
 			                                         CLASSIC_TILE_HEIGHT))
 				return false;
+			freerdp_planar_topdown_image(client->planar, TRUE);
 			log_message("INFO", "RemoteFX/NSCodec 없이 32-bit RDP6 Planar BitmapUpdate 경로를 사용합니다");
 		}
 		else
