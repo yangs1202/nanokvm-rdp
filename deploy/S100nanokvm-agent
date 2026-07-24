@@ -11,6 +11,7 @@ WIDTH=1920
 HEIGHT=1080
 BITRATE=3000
 STOCK_KVM_INIT=/kvmapp/system/init.d/S95nanokvm
+FOLDVNC_INIT=/etc/init.d/S99foldvnc
 LEGACY_PIDFILE="$APP_DIR/nanokvm-rdp.pid"
 
 is_running() {
@@ -34,6 +35,7 @@ start() {
         return 0
     fi
     stop_legacy_rdp
+    [ -x "$FOLDVNC_INIT" ] && "$FOLDVNC_INIT" stop
     [ -x "$STOCK_KVM_INIT" ] && "$STOCK_KVM_INIT" stop
     export LD_LIBRARY_PATH=/kvmapp/server/dl_lib:/tmp/server/dl_lib
     nohup "$DAEMON" -gateway "$GATEWAY" -control-port "$CONTROL_PORT" -video-port "$VIDEO_PORT" \
