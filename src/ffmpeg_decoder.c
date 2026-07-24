@@ -107,8 +107,8 @@ bool ffmpeg_decoder_start(FfmpegDecoder* decoder, uint16_t width, uint16_t heigh
 		execlp("ffmpeg", "ffmpeg", "-loglevel", "error", "-fflags", "nobuffer", "-avioflags",
 		      "direct", "-probesize", "32", "-analyzeduration", "0", "-threads", "1",
 		      "-flags", "low_delay", "-f", "h264", "-i", "pipe:0", "-an", "-pix_fmt", "bgra",
-		      "-vf", scale, "-fps_mode", "passthrough", "-flush_packets", "1", "-f", "rawvideo",
-		      "pipe:1", (char*)NULL);
+		      "-vf", scale, "-r", "30", "-fps_mode", "passthrough", "-flush_packets", "1", "-f",
+		      "rawvideo", "pipe:1", (char*)NULL);
 		_exit(127);
 	}
 	(void)close(input[0]);
