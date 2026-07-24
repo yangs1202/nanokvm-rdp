@@ -11,6 +11,7 @@
 #include <freerdp/codec/color.h>
 #include <freerdp/codec/interleaved.h>
 #include <freerdp/codec/nsc.h>
+#include <freerdp/codec/planar.h>
 #include <freerdp/codec/progressive.h>
 #include <freerdp/codec/rfx.h>
 #include <freerdp/freerdp.h>
@@ -107,6 +108,7 @@ struct Client
 	HANDLE video_thread;
 	RFX_CONTEXT* rfx;
 	NSC_CONTEXT* nsc;
+	BITMAP_PLANAR_CONTEXT* planar;
 	PROGRESSIVE_CONTEXT* progressive;
 	BITMAP_INTERLEAVED_CONTEXT* interleaved;
 	wStream* bitmap_stream;
@@ -741,14 +743,16 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	const uint16_t height = client->render_height;
 	const size_t expected_length = (size_t)width * height * 4U;
 	const rdpSettings* settings = client->context.settings;
-	const uint16_t bits_per_pixel = 16;
+	const bool use_planar = client->planar != NULL;
+	const uint16_t bits_per_pixel = use_planar ? 32 : 16;
 	BITMAP_DATA rectangles[CLASSIC_BITMAP_BATCH] = WINPR_C_ARRAY_INIT;
 	uint8_t encoded[CLASSIC_BITMAP_BATCH][CLASSIC_TILE_MAX_ENCODED] = { { 0 } };
 	BITMAP_UPDATE bitmap = WINPR_C_ARRAY_INIT;
 	uint16_t rectangle_count = 0;
 
 	if (!client->context.update || !client->context.update->BitmapUpdate ||
-	    settings == NULL || !client->interleaved || length != expected_length ||
+	    settings == NULL || (!client->planar && !client->interleaved) ||
+	    length != expected_length ||
 	    client_should_stop(client))
 		return false;
 	if (!client->previous_bitmap)
@@ -768,12 +772,26 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 			if (client->previous_bitmap_valid &&
 			    !classic_tile_changed(client->previous_bitmap, bgra, width, left, top, columns, rows))
 				continue;
-			uint32_t encoded_length = CLASSIC_TILE_MAX_ENCODED;
 			BITMAP_DATA* rectangle = &rectangles[rectangle_count];
-			if ((columns % 4) != 0 ||
-			    !interleaved_compress(client->interleaved, encoded[rectangle_count], &encoded_length, columns, rows,
-			                          bgra, PIXEL_FORMAT_BGRX32, (uint32_t)width * 4U, left, top,
-			                          NULL, bits_per_pixel))
+			uint32_t encoded_length = CLASSIC_TILE_MAX_ENCODED;
+			uint8_t* encoded_data = encoded[rectangle_count];
+			if (use_planar)
+			{
+				encoded_length = 0;
+				encoded_data = freerdp_bitmap_compress_planar(
+				    client->planar, bgra + (((size_t)top * width + left) * 4U),
+				    PIXEL_FORMAT_BGRX32, columns, rows, (uint32_t)width * 4U,
+				    encoded[rectangle_count], &encoded_length);
+			}
+			else if ((columns % 4) != 0 ||
+			         !interleaved_compress(client->interleaved, encoded[rectangle_count],
+			                               &encoded_length, columns, rows, bgra,
+			                               PIXEL_FORMAT_BGRX32, (uint32_t)width * 4U,
+			                               left, top, NULL, bits_per_pixel))
+			{
+				encoded_data = NULL;
+			}
+			if (!encoded_data || encoded_length == 0 || encoded_length > CLASSIC_TILE_MAX_ENCODED)
 				return false;
 			rectangle->destLeft = left;
 			rectangle->destTop = top;
@@ -783,12 +801,12 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 			rectangle->height = rows;
 			rectangle->bitsPerPixel = bits_per_pixel;
 			rectangle->bitmapLength = WINPR_ASSERTING_INT_CAST(uint16_t, encoded_length);
-			rectangle->bitmapDataStream = encoded[rectangle_count];
+			rectangle->bitmapDataStream = encoded_data;
 			rectangle->compressed = TRUE;
 			rectangle->cbCompFirstRowSize = 0;
 			rectangle->cbCompMainBodySize = encoded_length;
-			rectangle->cbScanWidth = columns * 2U;
-			rectangle->cbUncompressedSize = columns * rows * 2U;
+			rectangle->cbScanWidth = columns * (bits_per_pixel / 8U);
+			rectangle->cbUncompressedSize = columns * rows * (bits_per_pixel / 8U);
 			rectangle_count++;
 			if (rectangle_count == CLASSIC_BITMAP_BATCH)
 			{
@@ -1366,6 +1384,8 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 		rfx_context_free(client->rfx);
 	if (client->nsc)
 		nsc_context_free(client->nsc);
+	if (client->planar)
+		freerdp_bitmap_planar_context_free(client->planar);
 	if (client->progressive)
 		progressive_context_free(client->progressive);
 	if (client->interleaved)
@@ -1433,22 +1453,34 @@ static bool client_prepare_bitmap(Client* client)
 	else
 	{
 		const uint32_t color_depth = freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth);
-		if (color_depth == 24 &&
-		    !freerdp_settings_set_uint32((rdpSettings*)settings, FreeRDP_ColorDepth, 16))
-			return false;
 		if (color_depth != 16 && color_depth != 24 && color_depth != 32)
 		{
 			log_message("ERROR", "client가 지원하지 않는 classic bitmap 색 깊이를 요청했습니다");
 			return false;
 		}
-		char message[128];
-		(void)snprintf(message, sizeof(message),
-		               "RemoteFX/NSCodec 없이 %u-bit classic BitmapUpdate 경로를 사용합니다",
-		               color_depth == 24 ? 16 : color_depth);
-		log_message("INFO", message);
-		client->interleaved = bitmap_interleaved_context_new(TRUE);
-		if (!client->interleaved)
-			return false;
+		if (color_depth == 32)
+		{
+			DWORD planar_flags = PLANAR_FORMAT_HEADER_RLE;
+			if (freerdp_settings_get_bool(settings, FreeRDP_DrawAllowSkipAlpha))
+				planar_flags |= PLANAR_FORMAT_HEADER_NA;
+			client->planar = freerdp_bitmap_planar_context_new(
+			    planar_flags, CLASSIC_TILE_WIDTH, CLASSIC_TILE_HEIGHT);
+			if (!client->planar ||
+			    !freerdp_bitmap_planar_context_reset(client->planar, CLASSIC_TILE_WIDTH,
+			                                         CLASSIC_TILE_HEIGHT))
+				return false;
+			log_message("INFO", "RemoteFX/NSCodec 없이 32-bit RDP6 Planar BitmapUpdate 경로를 사용합니다");
+		}
+		else
+		{
+			if (color_depth == 24 &&
+			    !freerdp_settings_set_uint32((rdpSettings*)settings, FreeRDP_ColorDepth, 16))
+				return false;
+			client->interleaved = bitmap_interleaved_context_new(TRUE);
+			if (!client->interleaved)
+				return false;
+			log_message("INFO", "RemoteFX/NSCodec 없이 16-bit interleaved BitmapUpdate 경로를 사용합니다");
+		}
 	}
 	if (client->bitmap_uses_rfx || client->nsc)
 	{
