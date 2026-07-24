@@ -1414,20 +1414,26 @@ static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 			goto fail;
 	}
 
+	return TRUE;
+
+fail:
+	return FALSE;
+}
+
+static bool client_claim_active(Client* client)
+{
+	Server* server = client->server;
 	EnterCriticalSection(&server->lock);
 	if (server->active)
 	{
 		LeaveCriticalSection(&server->lock);
 		log_message("WARN", "single-client 제한으로 새 RDP 연결을 거부합니다");
-		goto fail;
+		return false;
 	}
 	server->active = client;
 	client->owns_active_client = true;
 	LeaveCriticalSection(&server->lock);
-	return TRUE;
-
-fail:
-	return FALSE;
+	return true;
 }
 
 static void client_context_free(freerdp_peer* peer, rdpContext* context)
@@ -1566,6 +1572,8 @@ static BOOL peer_post_connect(freerdp_peer* peer)
 	if (!client_force_source_desktop_size(client))
 		return FALSE;
 	if (!client_set_render_size(client))
+		return FALSE;
+	if (!client_claim_active(client))
 		return FALSE;
 	if (client->server->config.direct_gfx)
 	{
