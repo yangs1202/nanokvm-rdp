@@ -96,10 +96,10 @@ Useful gateway options:
 -control-port n    -video-port n  -direct-gfx
 ```
 
-Start the agent by supplying the gateway IPv4 address:
+Start the agent by supplying the gateway hostname or IPv4 address:
 
 ```sh
-./build/agent/nanokvm-agent -gateway 192.0.2.10 \
+./build/agent/nanokvm-agent -gateway nanokvm-gw.yangs.sh \
   -control-port 3390 -video-port 5004 \
   -width 1920 -height 1080 -bitrate 3000
 ```

@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
@@ -110,6 +111,19 @@ static bool kvm_load(KvmApi* api)
 	return true;
 }
 
+static bool resolve_gateway(const char* gateway, struct in_addr* address)
+{
+	if (inet_pton(AF_INET, gateway, address) == 1)
+		return true;
+	struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+	struct addrinfo* results = NULL;
+	if (getaddrinfo(gateway, NULL, &hints, &results) != 0 || !results)
+		return false;
+	*address = ((const struct sockaddr_in*)results->ai_addr)->sin_addr;
+	freeaddrinfo(results);
+	return true;
+}
+
 static bool connect_control(Agent* agent)
 {
 	const int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -118,12 +132,13 @@ static bool connect_control(Agent* agent)
 	int enabled = 1;
 	(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
 	struct sockaddr_in address = { .sin_family = AF_INET, .sin_port = htons(agent->control_port) };
-	if (inet_pton(AF_INET, agent->gateway, &address.sin_addr) != 1 ||
+	if (!resolve_gateway(agent->gateway, &address.sin_addr) ||
 	    connect(fd, (const struct sockaddr*)&address, sizeof(address)) != 0)
 	{
 		(void)close(fd);
 		return false;
 	}
+	agent->video_address.sin_addr = address.sin_addr;
 	uint8_t hello[8] = { 0 };
 	protocol_write_u16(hello, agent->width);
 	protocol_write_u16(hello + 2, agent->height);
@@ -273,7 +288,7 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 
 static void usage(const char* executable)
 {
-	(void)fprintf(stderr, "Usage: %s -gateway IPv4 [-control-port n] [-video-port n] [-width n] [-height n] [-bitrate n]\n", executable);
+	(void)fprintf(stderr, "Usage: %s -gateway host-or-ipv4 [-control-port n] [-video-port n] [-width n] [-height n] [-bitrate n]\n", executable);
 }
 
 static void* video_loop(void* argument)
@@ -368,7 +383,7 @@ int main(int argc, char* argv[])
 	agent.video_fd = socket(AF_INET, SOCK_DGRAM, 0);
 	agent.video_address.sin_family = AF_INET;
 	agent.video_address.sin_port = htons(agent.video_port);
-	if (agent.video_fd < 0 || inet_pton(AF_INET, agent.gateway, &agent.video_address.sin_addr) != 1)
+	if (agent.video_fd < 0)
 		return 1;
 	rtp_h264_packetizer_init(&agent.packetizer, RTP_H264_DEFAULT_MTU, (uint32_t)getpid());
 	hid_init(&agent.hid, NULL, NULL, NULL);
