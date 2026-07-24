@@ -54,7 +54,8 @@
 #define CLASSIC_TILE_WIDTH 64U
 #define CLASSIC_TILE_HEIGHT 64U
 #define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
-#define CLASSIC_BITMAP_BATCH 64U
+#define CLASSIC_BITMAP_BATCH 1U
+#define CLASSIC_MAX_UPDATE_SIZE (32U * 1024U)
 #define CLASSIC_PIXEL_DIFF_THRESHOLD 10U
 #define CLASSIC_CHANGED_PIXEL_THRESHOLD 8U
 #define HEARTBEAT_INTERVAL_MS 1000U
@@ -780,8 +781,10 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	const uint16_t bits_per_pixel = 16;
 	BITMAP_DATA rectangles[CLASSIC_BITMAP_BATCH] = WINPR_C_ARRAY_INIT;
 	BITMAP_UPDATE bitmap = WINPR_C_ARRAY_INIT;
-	const uint32_t max_update_size =
+	const uint32_t negotiated_update_size =
 	    freerdp_settings_get_uint32(settings, FreeRDP_MultifragMaxRequestSize);
+	const uint32_t max_update_size =
+	    negotiated_update_size < CLASSIC_MAX_UPDATE_SIZE ? negotiated_update_size : CLASSIC_MAX_UPDATE_SIZE;
 	uint32_t update_size = 1024U;
 	uint16_t rectangle_count = 0;
 	uint32_t frame_tiles = 0;
