@@ -1403,7 +1403,7 @@ static bool client_prepare_gfx(Client* client)
 	client->gfx->custom = client;
 	client->gfx->CapsAdvertise = on_gfx_caps_advertise;
 	client->gfx->FrameAcknowledge = on_gfx_frame_ack;
-	if (!client->gfx->Initialize || !client->gfx->Initialize(client->gfx, FALSE))
+	if (!client->gfx->Initialize || !client->gfx->Initialize(client->gfx, TRUE))
 		return false;
 	client->direct_gfx_active = true;
 	return true;
@@ -1500,15 +1500,30 @@ static bool client_process_dynamic_channels(Client* client)
 	if (!WTSVirtualChannelManagerCheckFileDescriptor(client->vcm))
 		return false;
 
-	if (!client->gfx || client->gfx_opened ||
-	    WTSVirtualChannelManagerGetDrdynvcState(client->vcm) != DRDYNVC_STATE_READY)
+	if (!client->gfx)
 		return true;
-
-	if (!client->gfx->Open || !client->gfx->Open(client->gfx))
-		return false;
-	client->gfx_opened = true;
-	client->gfx_opened_at = monotonic_milliseconds();
-	log_message("INFO", "RDPGFX dynamic channel open 완료; client capability 대기 중");
+	if (!client->gfx_opened &&
+	    WTSVirtualChannelManagerGetDrdynvcState(client->vcm) == DRDYNVC_STATE_READY)
+	{
+		if (!client->gfx->Open || !client->gfx->Open(client->gfx))
+			return false;
+		client->gfx_opened = true;
+		client->gfx_opened_at = monotonic_milliseconds();
+		log_message("INFO", "RDPGFX dynamic channel open 완료; client capability 대기 중");
+	}
+	if (client->gfx_opened)
+	{
+		HANDLE event = rdpgfx_server_get_event_handle(client->gfx);
+		if (event && WaitForSingleObject(event, 0) == WAIT_OBJECT_0)
+		{
+			const UINT error = rdpgfx_server_handle_messages(client->gfx);
+			if (error != CHANNEL_RC_OK)
+			{
+				log_message("ERROR", "RDPGFX channel message 처리 실패");
+				return false;
+			}
+		}
+	}
 	return true;
 }
 
