@@ -106,8 +106,6 @@ static bool kvm_load(KvmApi* api)
 	*(void**)(&api->set_frame_detect) = dlsym(api->handle, "set_frame_detact");
 	if (!api->init || !api->read_image || !api->free_data || !api->set_frame_detect)
 		return false;
-	api->init(0);
-	api->set_frame_detect(0);
 	return true;
 }
 
@@ -294,6 +292,7 @@ static void usage(const char* executable)
 static void* video_loop(void* argument)
 {
 	Agent* agent = argument;
+	bool capture_initialized = false;
 	uint64_t empty_since = 0;
 	uint64_t last_reinit_at = 0;
 	while (!stop_requested)
@@ -305,6 +304,14 @@ static void* video_loop(void* argument)
 			last_reinit_at = 0;
 			(void)nanosleep(&pause, NULL);
 			continue;
+		}
+		if (!capture_initialized)
+		{
+			(void)fprintf(stderr, "%s: gateway control 연결 후 libkvm 초기화 시작\n", TAG);
+			agent->kvm.init(0);
+			agent->kvm.set_frame_detect(0);
+			capture_initialized = true;
+			(void)fprintf(stderr, "%s: libkvm 초기화 완료\n", TAG);
 		}
 		uint8_t* data = NULL;
 		uint32_t length = 0;
