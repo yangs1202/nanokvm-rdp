@@ -1363,13 +1363,6 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	                                              payload, sizeof(payload));
 	const bool wheel_ok = (flags & PTR_FLAGS_WHEEL) == 0 ||
 	                      server_send_control(client->server, NANOKVM_CONTROL_WHEEL, payload + 8, 2);
-	if ((flags & PTR_FLAGS_WHEEL) != 0)
-	{
-		char dbg[128];
-		(void)snprintf(dbg, sizeof(dbg), "WHEEL(abs) t=%lu flags=0x%04x pos_ok=%d wheel_ok=%d",
-		               (unsigned long)GetTickCount64(), flags, position_ok ? 1 : 0, wheel_ok ? 1 : 0);
-		log_message("INFO", dbg);
-	}
 	if (position_ok && !client->pointer_input_logged)
 	{
 		log_message("INFO", "RDP absolute pointer → NanoKVM agent HID 전달 확인");
@@ -1424,13 +1417,6 @@ static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT1
 	const bool wheel_ok = (flags & PTR_FLAGS_WHEEL) == 0 ||
 	                      server_send_control(client->server, NANOKVM_CONTROL_WHEEL,
 	                                           wheel_payload, sizeof(wheel_payload));
-	if ((flags & PTR_FLAGS_WHEEL) != 0)
-	{
-		char dbg[128];
-		(void)snprintf(dbg, sizeof(dbg), "WHEEL(rel) t=%lu flags=0x%04x pos_ok=%d wheel_ok=%d",
-		               (unsigned long)GetTickCount64(), flags, position_ok ? 1 : 0, wheel_ok ? 1 : 0);
-		log_message("INFO", dbg);
-	}
 	if (wheel_ok && (flags & PTR_FLAGS_WHEEL) != 0 &&
 	    !client->wheel_input_logged)
 	{
