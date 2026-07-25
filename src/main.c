@@ -1410,7 +1410,20 @@ static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT1
 	protocol_write_u16(payload, (uint16_t)x_delta);
 	protocol_write_u16(payload + 2, (uint16_t)y_delta);
 	payload[4] = client->relative_buttons;
-	return server_send_control(client->server, NANOKVM_CONTROL_POINTER_REL, payload, sizeof(payload));
+	const bool position_ok = server_send_control(client->server, NANOKVM_CONTROL_POINTER_REL,
+	                                              payload, sizeof(payload));
+	uint8_t wheel_payload[2] = { 0 };
+	protocol_write_u16(wheel_payload, flags);
+	const bool wheel_ok = (flags & PTR_FLAGS_WHEEL) == 0 ||
+	                      server_send_control(client->server, NANOKVM_CONTROL_WHEEL,
+	                                           wheel_payload, sizeof(wheel_payload));
+	if (wheel_ok && (flags & PTR_FLAGS_WHEEL) != 0 &&
+	    !client->wheel_input_logged)
+	{
+		log_message("INFO", "RDP relative wheel → NanoKVM agent HID 전달 확인");
+		client->wheel_input_logged = true;
+	}
+	return position_ok && wheel_ok;
 }
 
 static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
