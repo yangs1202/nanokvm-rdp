@@ -30,6 +30,7 @@
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define CAPTURE_RETRY_SLEEP_NS 10000000L
+#define CAPTURE_FAIL_LIMIT 50U
 
 enum KvmFrameKind { KVM_FRAME_SPS = 1, KVM_FRAME_PPS = 2, KVM_FRAME_IDR = 3, KVM_FRAME_P = 4 };
 
@@ -291,6 +292,7 @@ static void* video_loop(void* argument)
 {
 	Agent* agent = argument;
 	bool capture_initialized = false;
+	unsigned capture_fail_count = 0;
 	while (!stop_requested)
 	{
 		if (!atomic_load(&agent->streaming))
@@ -301,6 +303,7 @@ static void* video_loop(void* argument)
 		}
 		if (!capture_initialized)
 		{
+			capture_fail_count = 0;
 			(void)fprintf(stderr, "%s: gateway control 연결 후 libkvm 초기화 시작\n", TAG);
 			agent->kvm.init(0);
 			agent->kvm.set_frame_detect(0);
@@ -315,10 +318,18 @@ static void* video_loop(void* argument)
 		{
 			if (data)
 				(void)agent->kvm.free_data(&data);
+			capture_fail_count++;
+			if (capture_fail_count >= CAPTURE_FAIL_LIMIT)
+			{
+				capture_initialized = false;
+				(void)fprintf(stderr, "%s: capture %u회 연속 실패, 파이프라인 재초기화\n", TAG,
+				              capture_fail_count);
+			}
 			const struct timespec pause = { .tv_sec = 0, .tv_nsec = CAPTURE_RETRY_SLEEP_NS };
 			(void)nanosleep(&pause, NULL);
 			continue;
 		}
+		capture_fail_count = 0;
 		if (kind == KVM_FRAME_IDR)
 			atomic_store(&agent->wait_for_idr, false);
 		(void)atomic_fetch_add(&agent->capture_frames, 1);
