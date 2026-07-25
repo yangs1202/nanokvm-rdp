@@ -246,13 +246,28 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 		detents = 127;
 	if (detents < -127)
 		detents = -127;
-	const uint8_t report[4] = { hid->mouse_buttons, 0, 0, (uint8_t)(int8_t)detents };
-	const bool ok = write_report(hid->mouse_path, report, sizeof(report));
+
+	const int step = detents >= 0 ? 1 : -1;
+	const int count = detents == 0 ? 0 : (detents > 0 ? detents : -detents);
+	bool ok = true;
+	for (int i = 0; i < count; i++)
+	{
+		const uint8_t report[4] = { hid->mouse_buttons, 0, 0, (uint8_t)(int8_t)step };
+		const bool w = write_report(hid->mouse_path, report, sizeof(report));
+		if (!w)
+			ok = false;
+		if (i + 1 < count)
+		{
+			struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000000L };
+			(void)nanosleep(&pause, NULL);
+		}
+	}
+
 	struct timespec ts;
 	(void)clock_gettime(CLOCK_MONOTONIC, &ts);
 	const uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
-	(void)fprintf(stderr, "WHEEL t=%llu flags=0x%04x delta=%d detents=%d buttons=0x%02x write=%d\n",
-	              (unsigned long long)ms, flags, delta, detents, hid->mouse_buttons, ok ? 1 : 0);
+	(void)fprintf(stderr, "WHEEL t=%llu flags=0x%04x delta=%d detents=%d sent=%d buttons=0x%02x write=%d\n",
+	              (unsigned long long)ms, flags, delta, detents, count, hid->mouse_buttons, ok ? 1 : 0);
 	return ok;
 }
 
