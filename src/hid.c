@@ -258,7 +258,7 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 			ok = false;
 		if (i + 1 < count)
 		{
-			struct timespec pause = { .tv_sec = 0, .tv_nsec = 8000000L };
+			struct timespec pause = { .tv_sec = 0, .tv_nsec = 1000000L };
 			(void)nanosleep(&pause, NULL);
 		}
 	}
