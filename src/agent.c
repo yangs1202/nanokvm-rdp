@@ -414,13 +414,22 @@ int main(int argc, char* argv[])
 		struct timeval timeout = { .tv_sec = 0, .tv_usec = 5000 };
 		if (select(agent.control_fd + 1, &readable, NULL, NULL, &timeout) > 0)
 		{
-			NanokvmControlMessage message = { 0 };
-			if (!protocol_receive(agent.control_fd, &message))
+			for (;;)
 			{
-				disconnect_control(&agent);
-				continue;
+				NanokvmControlMessage message = { 0 };
+				if (!protocol_receive(agent.control_fd, &message))
+				{
+					disconnect_control(&agent);
+					break;
+				}
+				handle_control(&agent, &message);
+				fd_set pending;
+				FD_ZERO(&pending);
+				FD_SET(agent.control_fd, &pending);
+				struct timeval immediate = { 0 };
+				if (select(agent.control_fd + 1, &pending, NULL, NULL, &immediate) <= 0)
+					break;
 			}
-			handle_control(&agent, &message);
 		}
 		const uint64_t now = monotonic_milliseconds();
 		if (now - agent.last_pong_at > HEARTBEAT_TIMEOUT_MS ||
