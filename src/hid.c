@@ -246,7 +246,10 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 	if (detents < -127)
 		detents = -127;
 	const uint8_t report[4] = { hid->mouse_buttons, 0, 0, (uint8_t)(int8_t)detents };
-	return write_report(hid->mouse_path, report, sizeof(report));
+	const bool ok = write_report(hid->mouse_path, report, sizeof(report));
+	(void)fprintf(stderr, "WHEEL flags=0x%04x delta=%d detents=%d buttons=0x%02x write=%d\n",
+	              flags, delta, detents, hid->mouse_buttons, ok ? 1 : 0);
+	return ok;
 }
 
 void hid_release_all(HidState* hid)
