@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define KBD_FLAGS_RELEASE 0x8000
@@ -247,8 +248,11 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 		detents = -127;
 	const uint8_t report[4] = { hid->mouse_buttons, 0, 0, (uint8_t)(int8_t)detents };
 	const bool ok = write_report(hid->mouse_path, report, sizeof(report));
-	(void)fprintf(stderr, "WHEEL flags=0x%04x delta=%d detents=%d buttons=0x%02x write=%d\n",
-	              flags, delta, detents, hid->mouse_buttons, ok ? 1 : 0);
+	struct timespec ts;
+	(void)clock_gettime(CLOCK_MONOTONIC, &ts);
+	const uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+	(void)fprintf(stderr, "WHEEL t=%llu flags=0x%04x delta=%d detents=%d buttons=0x%02x write=%d\n",
+	              (unsigned long long)ms, flags, delta, detents, hid->mouse_buttons, ok ? 1 : 0);
 	return ok;
 }
 
