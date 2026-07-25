@@ -1351,6 +1351,11 @@ static bool client_set_render_size(Client* client)
 static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 {
 	Client* client = (Client*)input->context;
+	/* DIAG(trackpad-scroll): WHEEL/HWHEEL 비트는 항상 로그, 일반 move는 1/100 샘플링 */
+	static unsigned diag_move = 0;
+	if ((flags & 0x0600U) != 0 || (diag_move++ % 100U) == 0)
+		(void)fprintf(stderr, "%s: DIAG on_mouse flags=0x%04x rot=%u x=%u y=%u\n", TAG, flags,
+		              flags & 0x01ffU, x, y);
 	const uint16_t width = client->server->config.width;
 	const uint16_t height = client->server->config.height;
 	uint8_t payload[12] = { 0 };
@@ -1385,6 +1390,10 @@ static BOOL on_extended_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT16 y_delta)
 {
 	Client* client = (Client*)input->context;
+	/* DIAG(trackpad-scroll): WHEEL/HWHEEL 비트는 항상 로그 */
+	if ((flags & 0x0600U) != 0)
+		(void)fprintf(stderr, "%s: DIAG on_relative_mouse flags=0x%04x rot=%u dx=%d dy=%d\n", TAG,
+		              flags, flags & 0x01ffU, (int)x_delta, (int)y_delta);
 	if ((flags & PTR_FLAGS_BUTTON1) != 0)
 	{
 		if ((flags & PTR_FLAGS_DOWN) != 0)
