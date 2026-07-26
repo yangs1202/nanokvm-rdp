@@ -1364,9 +1364,13 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	protocol_write_u16(payload + 4, width);
 	protocol_write_u16(payload + 6, height);
 	protocol_write_u16(payload + 8, flags);
-	const bool position_ok = server_send_control(client->server, NANOKVM_CONTROL_POINTER_ABS,
+	/* wheel 전용 이벤트(x=y=0)에서는 POINTER_ABS(0,0) touch report를 보내지 않는다.
+	 * touch report가 HID gadget/USB를 점유해 wheel report가 밀리는 간섭을 방지. */
+	const bool has_wheel = (flags & 0x0600U) != 0;
+	const bool position_ok = has_wheel ||
+	                         server_send_control(client->server, NANOKVM_CONTROL_POINTER_ABS,
 	                                              payload, sizeof(payload));
-	const bool wheel_ok = (flags & PTR_FLAGS_WHEEL) == 0 ||
+	const bool wheel_ok = !has_wheel ||
 	                      server_send_control(client->server, NANOKVM_CONTROL_WHEEL, payload + 8, 2);
 	if (position_ok && !client->pointer_input_logged)
 	{
