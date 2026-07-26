@@ -1326,10 +1326,43 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 
 static BOOL on_unicode_keyboard(rdpInput* input, UINT16 flags, UINT16 code)
 {
-	(void)input;
-	(void)flags;
-	(void)code;
-	return TRUE;
+	Client* client = (Client*)input->context;
+	if ((flags & KBD_FLAGS_RELEASE) != 0)
+		return TRUE;
+	if (code == 0 || (code >= 0xd800U && code <= 0xdfffU))
+	{
+		char message[128];
+		(void)snprintf(message, sizeof(message),
+		               "지원하지 않는 RDP Unicode keyboard code unit U+%04X", code);
+		log_message("WARN", message);
+		return FALSE;
+	}
+
+	uint8_t payload[3] = { 0 };
+	uint16_t length = 0;
+	if (code <= 0x007fU)
+	{
+		payload[0] = (uint8_t)code;
+		length = 1;
+	}
+	else if (code <= 0x07ffU)
+	{
+		payload[0] = (uint8_t)(0xc0U | (code >> 6U));
+		payload[1] = (uint8_t)(0x80U | (code & 0x3fU));
+		length = 2;
+	}
+	else
+	{
+		payload[0] = (uint8_t)(0xe0U | (code >> 12U));
+		payload[1] = (uint8_t)(0x80U | ((code >> 6U) & 0x3fU));
+		payload[2] = (uint8_t)(0x80U | (code & 0x3fU));
+		length = 3;
+	}
+
+	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_TEXT_UTF8, payload, length);
+	if (!sent)
+		log_message("WARN", "RDP Unicode keyboard text를 NanoKVM agent에 전달하지 못했습니다");
+	return sent;
 }
 
 static bool client_force_source_desktop_size(Client* client)

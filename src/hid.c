@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define KBD_FLAGS_RELEASE 0x8000
@@ -162,6 +163,275 @@ bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release)
 	else
 		hid->usages[usage] = !release;
 	return send_keyboard(hid);
+}
+
+typedef struct
+{
+	uint8_t modifier;
+	uint8_t usage;
+} HidTextKey;
+
+static bool ascii_to_hid(uint8_t character, HidTextKey* key)
+{
+	if (character >= 'a' && character <= 'z')
+	{
+		key->modifier = 0;
+		key->usage = (uint8_t)(0x04U + character - 'a');
+		return true;
+	}
+	if (character >= 'A' && character <= 'Z')
+	{
+		key->modifier = 0x02;
+		key->usage = (uint8_t)(0x04U + character - 'A');
+		return true;
+	}
+	if (character >= '1' && character <= '9')
+	{
+		key->modifier = 0;
+		key->usage = (uint8_t)(0x1eU + character - '1');
+		return true;
+	}
+	if (character == '0')
+	{
+		key->modifier = 0;
+		key->usage = 0x27;
+		return true;
+	}
+
+	switch (character)
+	{
+		case '\b': key->modifier = 0; key->usage = 0x2a; return true;
+		case '\t': key->modifier = 0; key->usage = 0x2b; return true;
+		case '\n': case '\r': key->modifier = 0; key->usage = 0x28; return true;
+		case '\x1b': key->modifier = 0; key->usage = 0x29; return true;
+		case ' ': key->modifier = 0; key->usage = 0x2c; return true;
+		case '-': key->modifier = 0; key->usage = 0x2d; return true;
+		case '_': key->modifier = 0x02; key->usage = 0x2d; return true;
+		case '=': key->modifier = 0; key->usage = 0x2e; return true;
+		case '+': key->modifier = 0x02; key->usage = 0x2e; return true;
+		case '[': key->modifier = 0; key->usage = 0x2f; return true;
+		case '{': key->modifier = 0x02; key->usage = 0x2f; return true;
+		case ']': key->modifier = 0; key->usage = 0x30; return true;
+		case '}': key->modifier = 0x02; key->usage = 0x30; return true;
+		case '\\': key->modifier = 0; key->usage = 0x31; return true;
+		case '|': key->modifier = 0x02; key->usage = 0x31; return true;
+		case ';': key->modifier = 0; key->usage = 0x33; return true;
+		case ':': key->modifier = 0x02; key->usage = 0x33; return true;
+		case '\'': key->modifier = 0; key->usage = 0x34; return true;
+		case '"': key->modifier = 0x02; key->usage = 0x34; return true;
+		case '`': key->modifier = 0; key->usage = 0x35; return true;
+		case '~': key->modifier = 0x02; key->usage = 0x35; return true;
+		case ',': key->modifier = 0; key->usage = 0x36; return true;
+		case '<': key->modifier = 0x02; key->usage = 0x36; return true;
+		case '.': key->modifier = 0; key->usage = 0x37; return true;
+		case '>': key->modifier = 0x02; key->usage = 0x37; return true;
+		case '/': key->modifier = 0; key->usage = 0x38; return true;
+		case '?': key->modifier = 0x02; key->usage = 0x38; return true;
+		case '!': key->modifier = 0x02; key->usage = 0x1e; return true;
+		case '@': key->modifier = 0x02; key->usage = 0x1f; return true;
+		case '#': key->modifier = 0x02; key->usage = 0x20; return true;
+		case '$': key->modifier = 0x02; key->usage = 0x21; return true;
+		case '%': key->modifier = 0x02; key->usage = 0x22; return true;
+		case '^': key->modifier = 0x02; key->usage = 0x23; return true;
+		case '&': key->modifier = 0x02; key->usage = 0x24; return true;
+		case '*': key->modifier = 0x02; key->usage = 0x25; return true;
+		case '(': key->modifier = 0x02; key->usage = 0x26; return true;
+		case ')': key->modifier = 0x02; key->usage = 0x27; return true;
+		default: return false;
+	}
+}
+
+static const char* hangul_jamo_sequence(uint32_t codepoint)
+{
+	switch (codepoint)
+	{
+		case 0x3131: return "r"; case 0x3132: return "R"; case 0x3133: return "rt";
+		case 0x3134: return "s"; case 0x3135: return "sw"; case 0x3136: return "sg";
+		case 0x3137: return "e"; case 0x3138: return "E"; case 0x3139: return "f";
+		case 0x313a: return "fr"; case 0x313b: return "fa"; case 0x313c: return "fq";
+		case 0x313d: return "ft"; case 0x313e: return "fx"; case 0x313f: return "fv";
+		case 0x3140: return "fg"; case 0x3141: return "a"; case 0x3142: return "q";
+		case 0x3143: return "Q"; case 0x3144: return "qt"; case 0x3145: return "t";
+		case 0x3146: return "T"; case 0x3147: return "d"; case 0x3148: return "w";
+		case 0x3149: return "W"; case 0x314a: return "c"; case 0x314b: return "z";
+		case 0x314c: return "x"; case 0x314d: return "v"; case 0x314e: return "g";
+		case 0x314f: return "k"; case 0x3150: return "o"; case 0x3151: return "i";
+		case 0x3152: return "O"; case 0x3153: return "j"; case 0x3154: return "p";
+		case 0x3155: return "u"; case 0x3156: return "P"; case 0x3157: return "h";
+		case 0x3158: return "hk"; case 0x3159: return "ho"; case 0x315a: return "hl";
+		case 0x315b: return "y"; case 0x315c: return "n"; case 0x315d: return "nj";
+		case 0x315e: return "np"; case 0x315f: return "nl"; case 0x3160: return "b";
+		case 0x3161: return "m"; case 0x3162: return "ml"; case 0x3163: return "l";
+		default: return NULL;
+	}
+}
+
+static bool codepoint_to_hangul_sequences(uint32_t codepoint, const char** lead, const char** vowel,
+                                           const char** trail)
+{
+	static const char* const lead_keys[] = {
+		"r", "R", "s", "e", "E", "f", "a", "q", "Q", "t", "T", "d", "w", "W", "c", "z", "x", "v", "g",
+	};
+	static const char* const vowel_keys[] = {
+		"k", "o", "i", "O", "j", "p", "u", "P", "h", "hk", "ho", "hl", "y", "n", "nj", "np", "nl", "b", "m", "ml", "l",
+	};
+	static const char* const trail_keys[] = {
+		"", "r", "R", "rt", "s", "sw", "sg", "e", "f", "fr", "fa", "fq", "ft", "fx", "fv", "fg", "a", "q", "qt", "t", "T", "d", "w", "c", "z", "x", "v", "g",
+	};
+
+	if (codepoint < 0xac00 || codepoint > 0xd7a3)
+		return false;
+	const uint32_t offset = codepoint - 0xac00;
+	const uint32_t lead_index = offset / (21U * 28U);
+	const uint32_t vowel_index = (offset % (21U * 28U)) / 28U;
+	const uint32_t trail_index = offset % 28U;
+	*lead = lead_keys[lead_index];
+	*vowel = vowel_keys[vowel_index];
+	*trail = trail_keys[trail_index];
+	return true;
+}
+
+
+static bool is_utf8_continuation(uint8_t byte)
+{
+	return (byte & 0xc0U) == 0x80U;
+}
+
+static bool utf8_decode(const uint8_t* text, size_t length, size_t* offset, uint32_t* codepoint)
+{
+	if (*offset >= length)
+		return false;
+	const uint8_t first = text[(*offset)++];
+	if (first < 0x80U)
+	{
+		*codepoint = first;
+		return true;
+	}
+	if (first >= 0xc2U && first <= 0xdfU)
+	{
+		if (*offset >= length || !is_utf8_continuation(text[*offset]))
+			return false;
+		*codepoint = ((uint32_t)(first & 0x1fU) << 6U) | (text[(*offset)++] & 0x3fU);
+		return true;
+	}
+	if (first >= 0xe0U && first <= 0xefU)
+	{
+		if (*offset + 1U >= length || !is_utf8_continuation(text[*offset]) ||
+		    !is_utf8_continuation(text[*offset + 1U]) ||
+		    (first == 0xe0U && text[*offset] < 0xa0U) ||
+		    (first == 0xedU && text[*offset] > 0x9fU))
+			return false;
+		*codepoint = ((uint32_t)(first & 0x0fU) << 12U) |
+		             ((uint32_t)(text[(*offset)++] & 0x3fU) << 6U) |
+		             (text[(*offset)++] & 0x3fU);
+		return true;
+	}
+	if (first >= 0xf0U && first <= 0xf4U)
+	{
+		if (*offset + 2U >= length || !is_utf8_continuation(text[*offset]) ||
+		    !is_utf8_continuation(text[*offset + 1U]) || !is_utf8_continuation(text[*offset + 2U]) ||
+		    (first == 0xf0U && text[*offset] < 0x90U) ||
+		    (first == 0xf4U && text[*offset] > 0x8fU))
+			return false;
+		*codepoint = ((uint32_t)(first & 0x07U) << 18U) |
+		             ((uint32_t)(text[(*offset)++] & 0x3fU) << 12U) |
+		             ((uint32_t)(text[(*offset)++] & 0x3fU) << 6U) |
+		             (text[(*offset)++] & 0x3fU);
+		return true;
+	}
+	return false;
+}
+
+static bool text_supported(const uint8_t* text, size_t length)
+{
+	for (size_t offset = 0; offset < length;)
+	{
+		uint32_t codepoint = 0;
+		HidTextKey key = { 0 };
+		const char* lead = NULL;
+		const char* vowel = NULL;
+		const char* trail = NULL;
+		if (!utf8_decode(text, length, &offset, &codepoint) ||
+		    !((codepoint != 0 && codepoint <= 0x7fU && ascii_to_hid((uint8_t)codepoint, &key)) ||
+		      codepoint_to_hangul_sequences(codepoint, &lead, &vowel, &trail) ||
+		      hangul_jamo_sequence(codepoint) != NULL))
+			return false;
+	}
+	return true;
+}
+
+static void sleep_milliseconds(long milliseconds)
+{
+	const struct timespec duration = { .tv_sec = milliseconds / 1000L,
+	                                  .tv_nsec = (milliseconds % 1000L) * 1000000L };
+	(void)nanosleep(&duration, NULL);
+}
+
+static bool tap_text_key(HidState* hid, HidTextKey key)
+{
+	hid->modifiers = key.modifier;
+	hid->usages[key.usage] = true;
+	if (!send_keyboard(hid))
+		return false;
+	sleep_milliseconds(8);
+	hid->modifiers = 0;
+	hid->usages[key.usage] = false;
+	if (!send_keyboard(hid))
+		return false;
+	sleep_milliseconds(2);
+	return true;
+}
+
+static bool type_ascii_sequence(HidState* hid, const char* sequence)
+{
+	for (; *sequence != '\0'; sequence++)
+	{
+		HidTextKey key = { 0 };
+		if (!ascii_to_hid((uint8_t)*sequence, &key) || !tap_text_key(hid, key))
+			return false;
+	}
+	return true;
+}
+
+static bool type_codepoint(HidState* hid, uint32_t codepoint)
+{
+	HidTextKey key = { 0 };
+	if (codepoint <= 0x7fU && ascii_to_hid((uint8_t)codepoint, &key))
+		return tap_text_key(hid, key);
+
+	const char* lead = NULL;
+	const char* vowel = NULL;
+	const char* trail = NULL;
+	if (codepoint_to_hangul_sequences(codepoint, &lead, &vowel, &trail))
+		return type_ascii_sequence(hid, lead) && type_ascii_sequence(hid, vowel) &&
+		       type_ascii_sequence(hid, trail);
+
+	const char* sequence = hangul_jamo_sequence(codepoint);
+	return sequence && type_ascii_sequence(hid, sequence);
+}
+
+bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
+{
+	if (!hid || !text || length == 0 || !text_supported(text, length))
+		return false;
+
+	memset(hid->usages, 0, sizeof(hid->usages));
+	hid->modifiers = 0;
+	if (!send_keyboard(hid))
+		return false;
+
+	for (size_t offset = 0; offset < length;)
+	{
+		uint32_t codepoint = 0;
+		if (!utf8_decode(text, length, &offset, &codepoint) || !type_codepoint(hid, codepoint))
+		{
+			memset(hid->usages, 0, sizeof(hid->usages));
+			hid->modifiers = 0;
+			(void)send_keyboard(hid);
+			return false;
+		}
+	}
+	return true;
 }
 
 static uint8_t touch_buttons(uint8_t buttons)

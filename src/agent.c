@@ -262,6 +262,14 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 				(void)hid_scancode(&agent->hid, message->payload[0], message->payload[1] != 0,
 				                   message->payload[2] != 0);
 			break;
+		case NANOKVM_CONTROL_TEXT_UTF8:
+			if (message->length > 0 && !hid_type_utf8(&agent->hid, message->payload, message->length))
+			{
+				hid_release_all(&agent->hid);
+				(void)fprintf(stderr, "%s: 지원하지 않는 모바일 Unicode text 또는 HID write 실패 (bytes=%u)\n",
+				              TAG, message->length);
+			}
+			break;
 		case NANOKVM_CONTROL_POINTER_ABS:
 			if (message->length == 12)
 				(void)hid_absolute(&agent->hid, protocol_read_u16(message->payload),

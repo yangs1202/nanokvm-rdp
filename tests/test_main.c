@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 typedef struct
@@ -150,11 +151,11 @@ static void test_hid_extended_buttons(void)
 	assert(close(read_fd) == 0);
 
 	assert(hid_wheel(&hid, 0x0278U));
-	read_fd = open(mouse_path, O_RDONLY);
+	read_fd = open(touch_path, O_RDONLY);
 	assert(read_fd >= 0);
-	uint8_t mouse_report[4] = { 0 };
-	assert(read(read_fd, mouse_report, sizeof(mouse_report)) == (ssize_t)sizeof(mouse_report));
-	assert(mouse_report[0] == 0x00 && mouse_report[3] == 1);
+	uint8_t wheel_report[6] = { 0 };
+	assert(read(read_fd, wheel_report, sizeof(wheel_report)) == (ssize_t)sizeof(wheel_report));
+	assert(wheel_report[0] == 0x08 && wheel_report[5] == 1);
 	assert(close(read_fd) == 0);
 
 	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0));
@@ -184,6 +185,56 @@ static void test_hid_extended_buttons(void)
 	assert(unlink(touch_path) == 0);
 }
 
+static void test_hid_text_utf8(void)
+{
+	char keyboard_path[] = "/tmp/nanokvm-rdp-keyboard-XXXXXX";
+	const int temp_fd = mkstemp(keyboard_path);
+	assert(temp_fd >= 0);
+	assert(close(temp_fd) == 0);
+	assert(unlink(keyboard_path) == 0);
+	assert(mkfifo(keyboard_path, 0600) == 0);
+	const int read_fd = open(keyboard_path, O_RDONLY | O_NONBLOCK);
+	assert(read_fd >= 0);
+
+	HidState hid;
+	hid_init(&hid, keyboard_path, "/dev/null", "/dev/null");
+	const uint8_t text[] = "aA!\t\b한글";
+	assert(hid_type_utf8(&hid, text, sizeof(text) - 1U));
+
+	uint8_t reports[23][8] = { { 0 } };
+	for (size_t index = 0; index < sizeof(reports) / sizeof(reports[0]); index++)
+	{
+		size_t offset = 0;
+		while (offset < sizeof(reports[index]))
+		{
+			const ssize_t result = read(read_fd, reports[index] + offset,
+			                            sizeof(reports[index]) - offset);
+			assert(result > 0);
+			offset += (size_t)result;
+		}
+	}
+	assert(reports[0][0] == 0 && reports[0][2] == 0);
+	assert(reports[1][0] == 0 && reports[1][2] == 0x04);
+	assert(reports[2][0] == 0 && reports[2][2] == 0);
+	assert(reports[3][0] == 0x02 && reports[3][2] == 0x04);
+	assert(reports[5][0] == 0x02 && reports[5][2] == 0x1e);
+	assert(reports[7][0] == 0 && reports[7][2] == 0x2b);
+	assert(reports[9][0] == 0 && reports[9][2] == 0x2a);
+	assert(reports[11][0] == 0 && reports[11][2] == 0x0a);
+	assert(reports[13][0] == 0 && reports[13][2] == 0x0e);
+	assert(reports[15][0] == 0 && reports[15][2] == 0x16);
+	assert(reports[17][0] == 0 && reports[17][2] == 0x15);
+	assert(reports[19][0] == 0 && reports[19][2] == 0x10);
+	assert(reports[21][0] == 0 && reports[21][2] == 0x09);
+	assert(reports[22][0] == 0 && reports[22][2] == 0);
+
+	assert(!hid_type_utf8(&hid, (const uint8_t*)"🙂", strlen("🙂")));
+	const uint8_t truncated[] = { 0xed, 0xa0, 0x80 };
+	assert(!hid_type_utf8(&hid, truncated, sizeof(truncated)));
+	assert(close(read_fd) == 0);
+	assert(unlink(keyboard_path) == 0);
+}
+
 static void test_protocol_primitives(void)
 {
 	uint8_t bytes[4] = { 0 };
@@ -204,6 +255,12 @@ static void test_control_wire_message(void)
 	assert(received.type == NANOKVM_CONTROL_KEY);
 	assert(received.length == sizeof(payload));
 	assert(memcmp(received.payload, payload, sizeof(payload)) == 0);
+	const uint8_t text[] = "한";
+	assert(protocol_send(sockets[0], NANOKVM_CONTROL_TEXT_UTF8, text, sizeof(text) - 1U));
+	assert(protocol_receive(sockets[1], &received));
+	assert(received.type == NANOKVM_CONTROL_TEXT_UTF8);
+	assert(received.length == sizeof(text) - 1U);
+	assert(memcmp(received.payload, text, sizeof(text) - 1U) == 0);
 	assert(close(sockets[0]) == 0);
 	assert(close(sockets[1]) == 0);
 }
@@ -279,6 +336,7 @@ int main(void)
 	test_hid_mapping();
 	test_hid_middle_button();
 	test_hid_extended_buttons();
+	test_hid_text_utf8();
 	test_protocol_primitives();
 	test_control_wire_message();
 	test_rtp_h264_fragmentation_and_loss();
