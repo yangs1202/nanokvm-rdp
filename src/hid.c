@@ -25,10 +25,14 @@
 
 static bool write_report(const char* path, const uint8_t* report, size_t length)
 {
-	const int fd = open(path, O_WRONLY | O_CLOEXEC);
+	const int fd = open(path, O_WRONLY | O_CLOEXEC | O_NONBLOCK);
 	if (fd < 0)
 		return false;
-	const ssize_t written = write(fd, report, length);
+	ssize_t written = -1;
+	do
+	{
+		written = write(fd, report, length);
+	} while (written < 0 && errno == EINTR);
 	const int saved_errno = errno;
 	(void)close(fd);
 	errno = saved_errno;
@@ -46,6 +50,13 @@ void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char
 	               touch ? touch : "/dev/hidg2");
 	hid->last_x = 0x3fff;
 	hid->last_y = 0x3fff;
+}
+
+static void reset_keyboard_state(HidState* hid, bool desynced)
+{
+	memset(hid->usages, 0, sizeof(hid->usages));
+	hid->modifiers = 0;
+	hid->keyboard_desynced = desynced;
 }
 
 uint16_t hid_scale_absolute(uint16_t value, uint32_t dimension)
@@ -77,7 +88,20 @@ static bool send_keyboard(HidState* hid)
 		if (hid->usages[usage])
 			report[index++] = (uint8_t)usage;
 	}
-	return write_report(hid->keyboard_path, report, sizeof(report));
+	if (hid->keyboard_desynced)
+	{
+		const uint8_t release[8] = { 0 };
+		if (!write_report(hid->keyboard_path, release, sizeof(release)))
+		{
+			reset_keyboard_state(hid, true);
+			return false;
+		}
+		hid->keyboard_desynced = false;
+	}
+	if (write_report(hid->keyboard_path, report, sizeof(report)))
+		return true;
+	reset_keyboard_state(hid, true);
+	return false;
 }
 
 bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t* modifier)
@@ -420,8 +444,7 @@ bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
 	if (!hid || !text || length == 0 || !text_supported(text, length))
 		return false;
 
-	memset(hid->usages, 0, sizeof(hid->usages));
-	hid->modifiers = 0;
+	reset_keyboard_state(hid, false);
 	if (!send_keyboard(hid))
 		return false;
 
@@ -430,8 +453,7 @@ bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
 		uint32_t codepoint = 0;
 		if (!utf8_decode(text, length, &offset, &codepoint) || !type_codepoint(hid, codepoint))
 		{
-			memset(hid->usages, 0, sizeof(hid->usages));
-			hid->modifiers = 0;
+			reset_keyboard_state(hid, false);
 			(void)send_keyboard(hid);
 			return false;
 		}
@@ -532,8 +554,7 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 
 void hid_release_all(HidState* hid)
 {
-	memset(hid->usages, 0, sizeof(hid->usages));
-	hid->modifiers = 0;
+	reset_keyboard_state(hid, false);
 	hid->buttons = 0;
 	hid->mouse_buttons = 0;
 	const uint8_t keyboard[8] = { 0 };
@@ -541,7 +562,8 @@ void hid_release_all(HidState* hid)
 	const uint8_t touch[6] = { 0, (uint8_t)(hid->last_x & 0xffU),
 		(uint8_t)(hid->last_x >> 8U), (uint8_t)(hid->last_y & 0xffU),
 		(uint8_t)(hid->last_y >> 8U), 0 };
-	(void)write_report(hid->keyboard_path, keyboard, sizeof(keyboard));
+	if (!write_report(hid->keyboard_path, keyboard, sizeof(keyboard)))
+		hid->keyboard_desynced = true;
 	(void)write_report(hid->mouse_path, mouse, sizeof(mouse));
 	(void)write_report(hid->touch_path, touch, sizeof(touch));
 }

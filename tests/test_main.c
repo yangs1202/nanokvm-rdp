@@ -235,6 +235,49 @@ static void test_hid_text_utf8(void)
 	assert(unlink(keyboard_path) == 0);
 }
 
+static void test_hid_keyboard_write_recovery(void)
+{
+	char keyboard_path[] = "/tmp/nanokvm-rdp-keyboard-recovery-XXXXXX";
+	const int temp_fd = mkstemp(keyboard_path);
+	assert(temp_fd >= 0);
+	assert(close(temp_fd) == 0);
+	assert(unlink(keyboard_path) == 0);
+	assert(mkfifo(keyboard_path, 0600) == 0);
+
+	HidState hid;
+	hid_init(&hid, keyboard_path, "/dev/null", "/dev/null");
+	assert(!hid_scancode(&hid, 0x1e, false, false));
+
+	const int read_fd = open(keyboard_path, O_RDONLY | O_NONBLOCK);
+	assert(read_fd >= 0);
+	assert(hid_scancode(&hid, 0x30, false, false));
+
+	uint8_t release_report[8] = { 0 };
+	uint8_t key_report[8] = { 0 };
+	size_t offset = 0;
+	while (offset < sizeof(release_report))
+	{
+		const ssize_t result = read(read_fd, release_report + offset,
+		                            sizeof(release_report) - offset);
+		assert(result > 0);
+		offset += (size_t)result;
+	}
+	offset = 0;
+	while (offset < sizeof(key_report))
+	{
+		const ssize_t result = read(read_fd, key_report + offset, sizeof(key_report) - offset);
+		assert(result > 0);
+		offset += (size_t)result;
+	}
+
+	assert(release_report[0] == 0 && release_report[2] == 0);
+	assert(key_report[0] == 0 && key_report[2] == 0x05);
+	assert(key_report[3] == 0);
+
+	assert(close(read_fd) == 0);
+	assert(unlink(keyboard_path) == 0);
+}
+
 static void test_protocol_primitives(void)
 {
 	uint8_t bytes[4] = { 0 };
@@ -337,6 +380,7 @@ int main(void)
 	test_hid_middle_button();
 	test_hid_extended_buttons();
 	test_hid_text_utf8();
+	test_hid_keyboard_write_recovery();
 	test_protocol_primitives();
 	test_control_wire_message();
 	test_rtp_h264_fragmentation_and_loss();

@@ -13,6 +13,7 @@ typedef struct
 	uint16_t last_y;
 	uint8_t buttons;
 	uint8_t mouse_buttons;
+	bool keyboard_desynced;
 	char keyboard_path[128];
 	char mouse_path[128];
 	char touch_path[128];
