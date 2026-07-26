@@ -4,6 +4,8 @@ APP_DIR=/root/nanokvm-rdp
 DAEMON="$APP_DIR/nanokvm-agent"
 PIDFILE="$APP_DIR/nanokvm-agent.pid"
 LOGFILE="$APP_DIR/nanokvm-agent.log"
+WATCHDOG="$APP_DIR/nanokvm-agent.watchdog.sh"
+STOPFILE="$APP_DIR/nanokvm-agent.stop"
 GATEWAY=nanokvm-gw.yangs.sh
 CONTROL_PORT=3390
 VIDEO_PORT=5004
@@ -25,6 +27,25 @@ stop_legacy_rdp() {
     rm -f "$LEGACY_PIDFILE"
 }
 
+write_watchdog() {
+    cat > "$WATCHDOG" <<EOF
+#!/bin/sh
+export LD_LIBRARY_PATH=/kvmapp/server/dl_lib:/tmp/server/dl_lib
+trap 'exit 0' INT TERM
+while :; do
+    [ -e "$STOPFILE" ] && exit 0
+    "$DAEMON" -gateway "$GATEWAY" -control-port "$CONTROL_PORT" \\
+        -video-port "$VIDEO_PORT" -width "$WIDTH" -height "$HEIGHT" \\
+        -bitrate "$BITRATE"
+    rc=\$?
+    [ -e "$STOPFILE" ] && exit 0
+    echo "nanokvm-agent exited rc=\$rc, 1초 후 watchdog 재시작"
+    sleep 1
+done
+EOF
+    chmod +x "$WATCHDOG"
+}
+
 start() {
     printf 'Starting NanoKVM gateway agent: '
     [ -x "$DAEMON" ] || { echo "FAIL ($DAEMON missing)"; return 1; }
@@ -37,9 +58,9 @@ start() {
     killall foldvnc-oledd 2>/dev/null || true
     killall kvm_system 2>/dev/null || true
     killall NanoKVM-Server 2>/dev/null || true
-    export LD_LIBRARY_PATH=/kvmapp/server/dl_lib:/tmp/server/dl_lib
-    nohup "$DAEMON" -gateway "$GATEWAY" -control-port "$CONTROL_PORT" -video-port "$VIDEO_PORT" \
-        -width "$WIDTH" -height "$HEIGHT" -bitrate "$BITRATE" >> "$LOGFILE" 2>&1 &
+    rm -f "$STOPFILE"
+    write_watchdog
+    nohup "$WATCHDOG" >> "$LOGFILE" 2>&1 &
     echo $! > "$PIDFILE"
     sleep 1
     is_running && { echo "OK (pid $(cat "$PIDFILE"))"; return 0; }
@@ -49,11 +70,14 @@ start() {
 
 stop() {
     printf 'Stopping NanoKVM gateway agent: '
+    touch "$STOPFILE"
     if is_running; then
         kill "$(cat "$PIDFILE")" 2>/dev/null || true
-        sleep 1
     fi
+    pkill -f "$DAEMON" 2>/dev/null || true
+    sleep 1
     is_running && kill -9 "$(cat "$PIDFILE")" 2>/dev/null || true
+    pkill -9 -f "$DAEMON" 2>/dev/null || true
     rm -f "$PIDFILE"
     echo OK
 }
