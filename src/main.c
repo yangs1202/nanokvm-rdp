@@ -308,6 +308,7 @@ static void server_heartbeat(Server* server)
 	const uint64_t now = monotonic_milliseconds();
 	bool send_ping = false;
 	bool timeout = false;
+	freerdp_peer* stale_peer = NULL;
 	EnterCriticalSection(&server->control_lock);
 	if (server->control_fd >= 0)
 	{
@@ -319,10 +320,30 @@ static void server_heartbeat(Server* server)
 			(void)shutdown(server->control_fd, SHUT_RDWR);
 	}
 	LeaveCriticalSection(&server->control_lock);
+	if (timeout)
+	{
+		/* agent가 멈추면 비디오도 멈추므로 기존 RDP client 세션도 의미가 없다.
+		 * active client를 강제 종료하지 않으면 single-client 슬롯이 점유된 채
+		 * 남아 이후 재접속이 모두 listener에서 거부된다. */
+		EnterCriticalSection(&server->lock);
+		if (server->active && server->active->peer)
+		{
+			stale_peer = server->active->peer;
+			/* 중복 disconnect 방지: active는 client_context_free가 정리한다. */
+			server->active = NULL;
+		}
+		LeaveCriticalSection(&server->lock);
+		if (stale_peer && stale_peer->Disconnect)
+		{
+			stale_peer->Disconnect(stale_peer);
+			log_message("WARN", "NanoKVM agent heartbeat timeout; active RDP client 연결을 종료합니다");
+		}
+		else
+			log_message("WARN", "NanoKVM agent heartbeat timeout; control 연결을 종료합니다");
+		(void)server_set_stream_requested(server, false);
+	}
 	if (send_ping && !timeout)
 		(void)server_send_control(server, NANOKVM_CONTROL_PING, NULL, 0);
-	if (timeout)
-		log_message("WARN", "NanoKVM agent heartbeat timeout; HID ReleaseAll을 요청하고 control 연결을 종료합니다");
 	if (now - server->last_stats_log_at < STATS_LOG_INTERVAL_MS)
 		return;
 	server->last_stats_log_at = now;
