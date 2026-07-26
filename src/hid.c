@@ -321,9 +321,11 @@ static bool utf8_decode(const uint8_t* text, size_t length, size_t* offset, uint
 		    (first == 0xe0U && text[*offset] < 0xa0U) ||
 		    (first == 0xedU && text[*offset] > 0x9fU))
 			return false;
+		const uint8_t second = text[(*offset)++];
+		const uint8_t third = text[(*offset)++];
 		*codepoint = ((uint32_t)(first & 0x0fU) << 12U) |
-		             ((uint32_t)(text[(*offset)++] & 0x3fU) << 6U) |
-		             (text[(*offset)++] & 0x3fU);
+		             ((uint32_t)(second & 0x3fU) << 6U) |
+		             (third & 0x3fU);
 		return true;
 	}
 	if (first >= 0xf0U && first <= 0xf4U)
@@ -333,10 +335,13 @@ static bool utf8_decode(const uint8_t* text, size_t length, size_t* offset, uint
 		    (first == 0xf0U && text[*offset] < 0x90U) ||
 		    (first == 0xf4U && text[*offset] > 0x8fU))
 			return false;
+		const uint8_t second = text[(*offset)++];
+		const uint8_t third = text[(*offset)++];
+		const uint8_t fourth = text[(*offset)++];
 		*codepoint = ((uint32_t)(first & 0x07U) << 18U) |
-		             ((uint32_t)(text[(*offset)++] & 0x3fU) << 12U) |
-		             ((uint32_t)(text[(*offset)++] & 0x3fU) << 6U) |
-		             (text[(*offset)++] & 0x3fU);
+		             ((uint32_t)(second & 0x3fU) << 12U) |
+		             ((uint32_t)(third & 0x3fU) << 6U) |
+		             (fourth & 0x3fU);
 		return true;
 	}
 	return false;
