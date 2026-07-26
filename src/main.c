@@ -1405,6 +1405,34 @@ static bool client_set_render_size(Client* client)
 	return true;
 }
 
+static BOOL client_release_all_inputs(Client* client, const char* reason)
+{
+	client->relative_buttons = 0;
+	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_RELEASE_ALL, NULL, 0);
+	if (sent && reason)
+	{
+		char message[128];
+		(void)snprintf(message, sizeof(message),
+		               "RDP input state resync: %s → RELEASE_ALL 전송", reason);
+		log_message("INFO", message);
+	}
+	return sent;
+}
+
+static BOOL on_synchronize(rdpInput* input, UINT32 flags)
+{
+	(void)flags;
+	Client* client = (Client*)input->context;
+	return client_release_all_inputs(client, "SynchronizeEvent");
+}
+
+static BOOL on_focus_in(rdpInput* input, UINT16 toggle_states)
+{
+	(void)toggle_states;
+	Client* client = (Client*)input->context;
+	return client_release_all_inputs(client, "FocusInEvent");
+}
+
 static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 {
 	Client* client = (Client*)input->context;
@@ -1533,7 +1561,7 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	client_stop(client);
 	if (client->owns_active_client)
 	{
-		(void)server_send_control(client->server, NANOKVM_CONTROL_RELEASE_ALL, NULL, 0);
+		(void)client_release_all_inputs(client, NULL);
 		(void)server_set_stream_requested(client->server, false);
 	}
 	if (client->video_thread)
@@ -1781,11 +1809,13 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 		return false;
 
 	peer->PostConnect = peer_post_connect;
+	peer->context->input->SynchronizeEvent = on_synchronize;
 	peer->context->input->KeyboardEvent = on_keyboard;
 	peer->context->input->UnicodeKeyboardEvent = on_unicode_keyboard;
 	peer->context->input->MouseEvent = on_mouse;
 	peer->context->input->RelMouseEvent = on_relative_mouse;
 	peer->context->input->ExtendedMouseEvent = on_extended_mouse;
+	peer->context->input->FocusInEvent = on_focus_in;
 	return peer->Initialize(peer) == TRUE;
 }
 
