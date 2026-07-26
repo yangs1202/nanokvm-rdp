@@ -32,6 +32,11 @@
 #define CAPTURE_RETRY_SLEEP_NS 10000000L
 #define CAPTURE_DEINIT_GRACE_NS 600000000L
 #define CAPTURE_FAIL_LIMIT 50U
+/* kvmv_deinit()이 SIGSEGV이므로 capture 실패 시 init 재호출로만 회복한다.
+ * 하지만 파이프라인이 꼬인 상태에서는 init 재호출로 안 풀리고 50회 실패 루프가
+ * 무한 반복한다. 이 횟수를 넘기면 프로세스를 종료해 init 스크립트가 깨끗한
+ * 커널 ISP/VI 상태에서 재시작하도록 한다. */
+#define CAPTURE_REINIT_LIMIT 3U
 
 enum KvmFrameKind { KVM_FRAME_SPS = 1, KVM_FRAME_PPS = 2, KVM_FRAME_IDR = 3, KVM_FRAME_P = 4 };
 
@@ -320,6 +325,7 @@ static void* video_loop(void* argument)
 	Agent* agent = argument;
 	bool capture_initialized = false;
 	unsigned capture_fail_count = 0;
+	unsigned capture_reinit_count = 0;
 	while (!stop_requested)
 	{
 		if (atomic_exchange(&agent->capture_deinit_requested, false))
@@ -350,8 +356,19 @@ static void* video_loop(void* argument)
 			capture_fail_count++;
 			if (capture_fail_count >= CAPTURE_FAIL_LIMIT)
 			{
-				(void)fprintf(stderr, "%s: capture %u회 연속 실패, 파이프라인 deinit 후 재초기화\n", TAG,
-				              capture_fail_count);
+				capture_reinit_count++;
+				if (capture_reinit_count > CAPTURE_REINIT_LIMIT)
+				{
+					(void)fprintf(stderr,
+					              "%s: capture 재초기화 %u회 후에도 회복 불가, 프로세스 재시작\n", TAG,
+					              capture_reinit_count - 1U);
+					capture_deinit(&capture_initialized);
+					stop_requested = 1;
+					break;
+				}
+				(void)fprintf(stderr,
+				              "%s: capture %u회 연속 실패, 파이프라인 재초기화 (%u/%u)\n", TAG,
+				              capture_fail_count, capture_reinit_count, CAPTURE_REINIT_LIMIT);
 				capture_deinit_and_pause(&capture_initialized);
 				capture_fail_count = 0;
 			}
@@ -360,6 +377,7 @@ static void* video_loop(void* argument)
 			continue;
 		}
 		capture_fail_count = 0;
+		capture_reinit_count = 0;
 		if (kind == KVM_FRAME_IDR)
 			atomic_store(&agent->wait_for_idr, false);
 		(void)atomic_fetch_add(&agent->capture_frames, 1);
