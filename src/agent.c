@@ -30,6 +30,7 @@
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define CAPTURE_RETRY_SLEEP_NS 10000000L
+#define CAPTURE_DEINIT_GRACE_NS 600000000L
 #define CAPTURE_FAIL_LIMIT 50U
 
 enum KvmFrameKind { KVM_FRAME_SPS = 1, KVM_FRAME_PPS = 2, KVM_FRAME_IDR = 3, KVM_FRAME_P = 4 };
@@ -38,6 +39,7 @@ typedef struct
 {
 	void* handle;
 	void (*init)(uint8_t level);
+	void (*deinit)(void);
 	int (*read_image)(uint16_t width, uint16_t height, uint8_t type, uint16_t quality,
 	                  uint8_t** data, uint32_t* length);
 	int (*free_data)(uint8_t** data);
@@ -60,6 +62,7 @@ typedef struct
 	RtpH264Packetizer packetizer;
 	atomic_bool streaming;
 	atomic_bool wait_for_idr;
+	atomic_bool capture_deinit_requested;
 	uint32_t timestamp;
 	atomic_uint_fast32_t sent_packets;
 	atomic_uint_fast32_t dropped_packets;
@@ -100,7 +103,11 @@ static bool kvm_load(KvmApi* api)
 	if (!api->handle)
 		return false;
 	*(void**)(&api->init) = dlsym(api->handle, "kvmv_init");
+	*(void**)(&api->deinit) = dlsym(api->handle, "kvmv_deinit");
 	*(void**)(&api->read_image) = dlsym(api->handle, "kvmv_read_img");
+
+	if (!api->deinit)
+		(void)fprintf(stderr, "%s: libkvm.so에 kvmv_deinit이 없어 capture cleanup을 사용할 수 없습니다\n", TAG);
 	*(void**)(&api->free_data) = dlsym(api->handle, "free_kvmv_data");
 	*(void**)(&api->set_frame_detect) = dlsym(api->handle, "set_frame_detact");
 	if (!api->init || !api->read_image || !api->free_data || !api->set_frame_detect)
@@ -161,6 +168,7 @@ static void disconnect_control(Agent* agent)
 	agent->control_fd = -1;
 	atomic_store(&agent->streaming, false);
 	atomic_store(&agent->wait_for_idr, true);
+	atomic_store(&agent->capture_deinit_requested, true);
 }
 
 static bool send_stats(Agent* agent)
@@ -242,6 +250,7 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 			break;
 		case NANOKVM_CONTROL_STOP_STREAM:
 			atomic_store(&agent->streaming, false);
+			atomic_store(&agent->capture_deinit_requested, true);
 			hid_release_all(&agent->hid);
 			(void)fprintf(stderr, "%s: STOP_STREAM 수신\n", TAG);
 			break;
@@ -288,6 +297,34 @@ static void usage(const char* executable)
 	(void)fprintf(stderr, "Usage: %s -gateway host-or-ipv4 [-control-port n] [-video-port n] [-width n] [-height n] [-bitrate n]\n", executable);
 }
 
+static void capture_deinit(Agent* agent, bool* capture_initialized)
+{
+	if (!*capture_initialized)
+		return;
+	if (!agent->kvm.deinit)
+	{
+		(void)fprintf(stderr, "%s: kvmv_deinit이 없어 capture cleanup을 건너뜁니다\n", TAG);
+		return;
+	}
+	(void)fprintf(stderr, "%s: libkvm deinit 시작\n", TAG);
+	agent->kvm.deinit();
+	*capture_initialized = false;
+	(void)fprintf(stderr, "%s: libkvm deinit 완료\n", TAG);
+}
+
+static void capture_pause(void)
+{
+	const struct timespec pause = { .tv_sec = 0, .tv_nsec = CAPTURE_DEINIT_GRACE_NS };
+	(void)nanosleep(&pause, NULL);
+}
+
+static void capture_deinit_and_pause(Agent* agent, bool* capture_initialized)
+{
+	capture_deinit(agent, capture_initialized);
+	if (!*capture_initialized)
+		capture_pause();
+}
+
 static void* video_loop(void* argument)
 {
 	Agent* agent = argument;
@@ -295,6 +332,8 @@ static void* video_loop(void* argument)
 	unsigned capture_fail_count = 0;
 	while (!stop_requested)
 	{
+		if (atomic_exchange(&agent->capture_deinit_requested, false))
+			capture_deinit_and_pause(agent, &capture_initialized);
 		if (!atomic_load(&agent->streaming))
 		{
 			const struct timespec pause = { .tv_sec = 0, .tv_nsec = CAPTURE_RETRY_SLEEP_NS };
@@ -321,9 +360,10 @@ static void* video_loop(void* argument)
 			capture_fail_count++;
 			if (capture_fail_count >= CAPTURE_FAIL_LIMIT)
 			{
-				capture_initialized = false;
-				(void)fprintf(stderr, "%s: capture %u회 연속 실패, 파이프라인 재초기화\n", TAG,
+				(void)fprintf(stderr, "%s: capture %u회 연속 실패, 파이프라인 deinit 후 재초기화\n", TAG,
 				              capture_fail_count);
+				capture_deinit_and_pause(agent, &capture_initialized);
+				capture_fail_count = 0;
 			}
 			const struct timespec pause = { .tv_sec = 0, .tv_nsec = CAPTURE_RETRY_SLEEP_NS };
 			(void)nanosleep(&pause, NULL);
@@ -345,6 +385,7 @@ static void* video_loop(void* argument)
 		agent->timestamp += 9000U;
 		(void)agent->kvm.free_data(&data);
 	}
+	capture_deinit(agent, &capture_initialized);
 	return NULL;
 }
 
@@ -388,6 +429,7 @@ int main(int argc, char* argv[])
 	hid_init(&agent.hid, NULL, NULL, NULL);
 	atomic_init(&agent.streaming, false);
 	atomic_init(&agent.wait_for_idr, true);
+	atomic_init(&agent.capture_deinit_requested, false);
 	atomic_init(&agent.sent_packets, 0);
 	atomic_init(&agent.dropped_packets, 0);
 	atomic_init(&agent.capture_frames, 0);
