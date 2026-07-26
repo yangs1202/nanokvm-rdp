@@ -241,10 +241,12 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 	int detents = delta / 120;
 	if (detents == 0 && delta != 0)
 		detents = delta > 0 ? 1 : -1;
-	if (detents > 127)
-		detents = 127;
-	if (detents < -127)
-		detents = -127;
+	if (detents > 1)
+		detents = 1;
+	if (detents < -1)
+		detents = -1;
+	/* HID wheel은 한 이벤트당 ±1 노치만 전달. 트랙패드의 큰 delta는 클램프하고,
+	 * 트랙패드의 연속 이벤트로 자연스럽게 여러 노치를 스크롤한다. */
 	const uint8_t report[4] = { hid->mouse_buttons, 0, 0, (uint8_t)(int8_t)detents };
 	return write_report(hid->mouse_path, report, sizeof(report));
 }

@@ -297,18 +297,29 @@ static void usage(const char* executable)
 	(void)fprintf(stderr, "Usage: %s -gateway host-or-ipv4 [-control-port n] [-video-port n] [-width n] [-height n] [-bitrate n]\n", executable);
 }
 
-static void capture_deinit(Agent* agent, bool* capture_initialized)
+static void capture_deinit(Agent* agent, bool* capture_initialized, bool* capture_produced)
 {
 	if (!*capture_initialized)
 		return;
+	if (!*capture_produced)
+	{
+		/* read_image가 한 번도 프레임을 생산하지 않은 init 직후 상태에서는
+		 * libkvm 파이프라인이 settle되지 않아 kvmv_deinit()이 SIGSEGV를 일으킨다.
+		 * 스트림이 실제로 전송된 적이 없으므로 deinit 없이 플래그만 리셋. */
+		(void)fprintf(stderr, "%s: read_image 미생산 상태, kvmv_deinit 생략\n", TAG);
+		*capture_initialized = false;
+		return;
+	}
 	if (!agent->kvm.deinit)
 	{
 		(void)fprintf(stderr, "%s: kvmv_deinit이 없어 capture cleanup을 건너뜁니다\n", TAG);
+		*capture_initialized = false;
 		return;
 	}
 	(void)fprintf(stderr, "%s: libkvm deinit 시작\n", TAG);
 	agent->kvm.deinit();
 	*capture_initialized = false;
+	*capture_produced = false;
 	(void)fprintf(stderr, "%s: libkvm deinit 완료\n", TAG);
 }
 
@@ -318,9 +329,9 @@ static void capture_pause(void)
 	(void)nanosleep(&pause, NULL);
 }
 
-static void capture_deinit_and_pause(Agent* agent, bool* capture_initialized)
+static void capture_deinit_and_pause(Agent* agent, bool* capture_initialized, bool* capture_produced)
 {
-	capture_deinit(agent, capture_initialized);
+	capture_deinit(agent, capture_initialized, capture_produced);
 	if (!*capture_initialized)
 		capture_pause();
 }
@@ -329,11 +340,12 @@ static void* video_loop(void* argument)
 {
 	Agent* agent = argument;
 	bool capture_initialized = false;
+	bool capture_produced = false;
 	unsigned capture_fail_count = 0;
 	while (!stop_requested)
 	{
 		if (atomic_exchange(&agent->capture_deinit_requested, false))
-			capture_deinit_and_pause(agent, &capture_initialized);
+			capture_deinit_and_pause(agent, &capture_initialized, &capture_produced);
 		if (!atomic_load(&agent->streaming))
 		{
 			const struct timespec pause = { .tv_sec = 0, .tv_nsec = CAPTURE_RETRY_SLEEP_NS };
@@ -362,7 +374,7 @@ static void* video_loop(void* argument)
 			{
 				(void)fprintf(stderr, "%s: capture %u회 연속 실패, 파이프라인 deinit 후 재초기화\n", TAG,
 				              capture_fail_count);
-				capture_deinit_and_pause(agent, &capture_initialized);
+				capture_deinit_and_pause(agent, &capture_initialized, &capture_produced);
 				capture_fail_count = 0;
 			}
 			const struct timespec pause = { .tv_sec = 0, .tv_nsec = CAPTURE_RETRY_SLEEP_NS };
@@ -370,6 +382,7 @@ static void* video_loop(void* argument)
 			continue;
 		}
 		capture_fail_count = 0;
+		capture_produced = true;
 		if (kind == KVM_FRAME_IDR)
 			atomic_store(&agent->wait_for_idr, false);
 		(void)atomic_fetch_add(&agent->capture_frames, 1);
@@ -385,7 +398,7 @@ static void* video_loop(void* argument)
 		agent->timestamp += 9000U;
 		(void)agent->kvm.free_data(&data);
 	}
-	capture_deinit(agent, &capture_initialized);
+	capture_deinit(agent, &capture_initialized, &capture_produced);
 	return NULL;
 }
 
