@@ -702,6 +702,15 @@ static DWORD WINAPI video_thread(LPVOID argument)
 			free(data);
 			continue;
 		}
+		if (rtp.losses != observed_losses)
+		{
+			observed_losses = rtp.losses;
+			EnterCriticalSection(&client->lock);
+			client->need_idr = true;
+			LeaveCriticalSection(&client->lock);
+			(void)server_send_control(client->server, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
+			log_message("WARN", "RDPGFX RTP frame loss 감지; NanoKVM agent에 IDR 재동기화를 요청합니다");
+		}
 		client->last_rtp_received_at = monotonic_milliseconds();
 		client->rtp_nals++;
 		client->rtp_access_units++;
@@ -739,12 +748,6 @@ static DWORD WINAPI video_thread(LPVOID argument)
 			free(owned);
 		}
 		free(data);
-		if (rtp.losses != observed_losses)
-		{
-			observed_losses = rtp.losses;
-			(void)server_send_control(client->server, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
-			log_message("WARN", "RDPGFX RTP frame loss 감지; NanoKVM agent에 IDR 재동기화를 요청합니다");
-		}
 	}
 	rtp_client_close(&rtp);
 	return 0;
