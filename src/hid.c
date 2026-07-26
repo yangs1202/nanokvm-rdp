@@ -228,6 +228,8 @@ bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 		y = -127;
 	hid->mouse_buttons = buttons & HID_MOUSE_BUTTONS_MASK;
 	const uint8_t report[4] = { hid->mouse_buttons, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
+	(void)fprintf(stderr, "nanokvm-agent: DIAG hid_relative buttons=0x%02x mb=0x%02x\n", buttons,
+	              hid->mouse_buttons);
 	return write_report(hid->mouse_path, report, sizeof(report));
 }
 
@@ -248,6 +250,8 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 	/* HID wheel은 한 이벤트당 ±1 노치만 전달. 트랙패드의 큰 delta는 클램프하고,
 	 * 트랙패드의 연속 이벤트로 자연스럽게 여러 노치를 스크롤한다. */
 	const uint8_t report[4] = { hid->mouse_buttons, 0, 0, (uint8_t)(int8_t)detents };
+	(void)fprintf(stderr, "nanokvm-agent: DIAG hid_wheel flags=0x%04x mb=0x%02x detents=%d\n", flags,
+	              hid->mouse_buttons, detents);
 	return write_report(hid->mouse_path, report, sizeof(report));
 }
 
