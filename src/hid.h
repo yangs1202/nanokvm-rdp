@@ -5,8 +5,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define HID_VIRTUAL_SCANCODE_HANGUL 0x90
-
 typedef struct
 {
 	uint8_t modifiers;
@@ -33,7 +31,7 @@ void hid_release_all(HidState* hid);
 uint16_t hid_scale_absolute(uint16_t value, uint32_t dimension);
 uint16_t hid_clamp_absolute(uint16_t value, uint16_t dimension);
 void hid_map_scancode(uint8_t code, bool extended, bool swap_alt_command,
-                      bool right_alt_as_hangul,
+                      bool right_alt_as_capslock,
                       uint8_t* mapped_code, bool* mapped_extended);
 bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t* modifier);
 

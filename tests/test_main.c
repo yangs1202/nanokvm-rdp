@@ -107,9 +107,9 @@ static void test_hid_mapping(void)
 	hid_map_scancode(0x38, false, false, false, &mapped_code, &mapped_extended);
 	assert(mapped_code == 0x38 && !mapped_extended);
 	hid_map_scancode(0x38, true, true, true, &mapped_code, &mapped_extended);
-	assert(mapped_code == HID_VIRTUAL_SCANCODE_HANGUL && !mapped_extended);
-	assert(hid_translate_scancode(HID_VIRTUAL_SCANCODE_HANGUL, false, &usage, &modifier));
-	assert(usage == 0x90 && modifier == 0);
+	assert(mapped_code == 0x3a && !mapped_extended);
+	assert(hid_translate_scancode(0x3a, false, &usage, &modifier));
+	assert(usage == 0x39 && modifier == 0);
 	assert(hid_scale_absolute(0, 1920) == 1);
 	assert(hid_scale_absolute(1919, 1920) == 0x7fff);
 	assert(hid_clamp_absolute(1200, 1920) == 1200);
