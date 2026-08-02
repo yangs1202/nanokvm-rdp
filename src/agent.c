@@ -143,11 +143,12 @@ static bool connect_control(Agent* agent)
 		return false;
 	}
 	agent->video_address.sin_addr = address.sin_addr;
-	uint8_t hello[8] = { 0 };
+	uint8_t hello[NANOKVM_HELLO_CAPABILITIES_PAYLOAD_SIZE] = { 0 };
 	protocol_write_u16(hello, agent->width);
 	protocol_write_u16(hello + 2, agent->height);
 	protocol_write_u16(hello + 4, agent->video_port);
 	protocol_write_u16(hello + 6, RTP_H264_DEFAULT_MTU);
+	hello[8] = NANOKVM_AGENT_CAPABILITY_KEY_ACK;
 	if (!protocol_send(fd, NANOKVM_CONTROL_HELLO, hello, sizeof(hello)))
 	{
 		(void)close(fd);
@@ -258,9 +259,18 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 			atomic_store(&agent->wait_for_idr, true);
 			break;
 		case NANOKVM_CONTROL_KEY:
-			if (message->length == 3)
+			if (message->length == NANOKVM_KEY_PAYLOAD_SIZE)
 				(void)hid_scancode(&agent->hid, message->payload[0], message->payload[1] != 0,
 				                   message->payload[2] != 0);
+			else if (message->length == NANOKVM_KEY_ACK_REQUEST_PAYLOAD_SIZE)
+			{
+				const bool succeeded = hid_scancode(&agent->hid, message->payload[0],
+				                                   message->payload[1] != 0, message->payload[2] != 0);
+				uint8_t ack[NANOKVM_KEY_ACK_PAYLOAD_SIZE] = { 0 };
+				memcpy(ack, message->payload + 3, sizeof(uint32_t));
+				ack[4] = succeeded ? 1 : 0;
+				(void)protocol_send(agent->control_fd, NANOKVM_CONTROL_KEY_ACK, ack, sizeof(ack));
+			}
 			break;
 		case NANOKVM_CONTROL_TEXT_UTF8:
 			if (message->length > 0 && !hid_type_utf8(&agent->hid, message->payload, message->length))

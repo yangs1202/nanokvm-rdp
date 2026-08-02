@@ -68,6 +68,7 @@
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define STATS_LOG_INTERVAL_MS 5000U
+#define KEY_ACK_TIMEOUT_MS 1000U
 
 typedef struct
 {
@@ -96,9 +97,16 @@ struct Server
 	ServerConfig config;
 	CRITICAL_SECTION lock;
 	CRITICAL_SECTION control_lock;
+	CRITICAL_SECTION key_ack_lock;
+	HANDLE key_ack_event;
 	int control_listener;
 	int control_fd;
 	bool stream_requested;
+	bool agent_supports_key_ack;
+	uint32_t next_key_sequence;
+	uint32_t waiting_key_sequence;
+	bool key_ack_received;
+	bool key_ack_success;
 	uint64_t last_agent_activity_at;
 	uint64_t last_ping_at;
 	uint64_t last_stats_log_at;
@@ -202,23 +210,76 @@ static bool server_send_control(Server* server, uint8_t type, const void* payloa
 	return sent;
 }
 
+static void server_cancel_key_ack(Server* server)
+{
+	EnterCriticalSection(&server->key_ack_lock);
+	server->waiting_key_sequence = 0;
+	server->key_ack_received = false;
+	server->key_ack_success = false;
+	(void)SetEvent(server->key_ack_event);
+	LeaveCriticalSection(&server->key_ack_lock);
+}
+
 static bool server_send_key_sequence(Server* server, const uint8_t payloads[][3], size_t count)
 {
 	bool sent = false;
 	EnterCriticalSection(&server->control_lock);
 	if (server->control_fd >= 0)
 	{
+		const bool use_ack = server->agent_supports_key_ack;
 		sent = true;
 		for (size_t index = 0; index < count; index++)
 		{
-			if (!protocol_send(server->control_fd, NANOKVM_CONTROL_KEY, payloads[index],
-			                   sizeof(payloads[index])))
+			uint8_t ack_payload[NANOKVM_KEY_ACK_REQUEST_PAYLOAD_SIZE] = { 0 };
+			const void* payload = payloads[index];
+			uint16_t length = NANOKVM_KEY_PAYLOAD_SIZE;
+			uint32_t sequence = 0;
+			if (use_ack)
+			{
+				EnterCriticalSection(&server->key_ack_lock);
+				sequence = ++server->next_key_sequence;
+				if (sequence == 0)
+					sequence = ++server->next_key_sequence;
+				server->waiting_key_sequence = sequence;
+				server->key_ack_received = false;
+				server->key_ack_success = false;
+				(void)ResetEvent(server->key_ack_event);
+				LeaveCriticalSection(&server->key_ack_lock);
+
+				memcpy(ack_payload, payloads[index], NANOKVM_KEY_PAYLOAD_SIZE);
+				protocol_write_u32(ack_payload + NANOKVM_KEY_PAYLOAD_SIZE, sequence);
+				payload = ack_payload;
+				length = sizeof(ack_payload);
+			}
+			if (!protocol_send(server->control_fd, NANOKVM_CONTROL_KEY, payload, length))
 			{
 				sent = false;
 				break;
 			}
+			if (use_ack)
+			{
+				const DWORD wait_result = WaitForSingleObject(server->key_ack_event, KEY_ACK_TIMEOUT_MS);
+				bool ack_received = false;
+				bool ack_success = false;
+				EnterCriticalSection(&server->key_ack_lock);
+				if (wait_result == WAIT_OBJECT_0 && server->waiting_key_sequence == sequence)
+				{
+					ack_received = server->key_ack_received;
+					ack_success = server->key_ack_success;
+				}
+				LeaveCriticalSection(&server->key_ack_lock);
+				if (!ack_received || !ack_success)
+				{
+					log_message("ERROR", ack_received ?
+					            "NanoKVM agent HID KEY ACK 실패" :
+					            "NanoKVM agent HID KEY ACK timeout");
+					sent = false;
+					break;
+				}
+			}
 		}
 	}
+	server_cancel_key_ack(server);
 	LeaveCriticalSection(&server->control_lock);
 	return sent;
 }
@@ -257,7 +318,9 @@ static DWORD WINAPI control_thread(LPVOID argument)
 		int enabled = 1;
 		(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
 		NanokvmControlMessage hello = { 0 };
-		if (!protocol_receive(fd, &hello) || hello.type != NANOKVM_CONTROL_HELLO || hello.length != 8)
+		if (!protocol_receive(fd, &hello) || hello.type != NANOKVM_CONTROL_HELLO ||
+		    (hello.length != NANOKVM_HELLO_BASE_PAYLOAD_SIZE &&
+		     hello.length != NANOKVM_HELLO_CAPABILITIES_PAYLOAD_SIZE))
 		{
 			(void)close(fd);
 			continue;
@@ -266,6 +329,8 @@ static DWORD WINAPI control_thread(LPVOID argument)
 		if (server->control_fd >= 0)
 			(void)close(server->control_fd);
 		server->control_fd = fd;
+		server->agent_supports_key_ack = hello.length == NANOKVM_HELLO_CAPABILITIES_PAYLOAD_SIZE &&
+		                                 (hello.payload[8] & NANOKVM_AGENT_CAPABILITY_KEY_ACK) != 0;
 		server->last_agent_activity_at = monotonic_milliseconds();
 		server->last_ping_at = server->last_agent_activity_at;
 		const bool start = server->stream_requested;
@@ -280,6 +345,20 @@ static DWORD WINAPI control_thread(LPVOID argument)
 			NanokvmControlMessage message = { 0 };
 			if (!protocol_receive(fd, &message))
 				break;
+			if (message.type == NANOKVM_CONTROL_KEY_ACK &&
+			    message.length == NANOKVM_KEY_ACK_PAYLOAD_SIZE)
+			{
+				const uint32_t sequence = protocol_read_u32(message.payload);
+				EnterCriticalSection(&server->key_ack_lock);
+				if (server->waiting_key_sequence == sequence)
+				{
+					server->key_ack_received = true;
+					server->key_ack_success = message.payload[4] != 0;
+					(void)SetEvent(server->key_ack_event);
+				}
+				LeaveCriticalSection(&server->key_ack_lock);
+				continue;
+			}
 			EnterCriticalSection(&server->control_lock);
 			server->last_agent_activity_at = monotonic_milliseconds();
 			if (message.type == NANOKVM_CONTROL_STATS &&
@@ -294,9 +373,13 @@ static DWORD WINAPI control_thread(LPVOID argument)
 			if (message.type == NANOKVM_CONTROL_PING)
 				(void)server_send_control(server, NANOKVM_CONTROL_PONG, NULL, 0);
 		}
+		server_cancel_key_ack(server);
 		EnterCriticalSection(&server->control_lock);
 		if (server->control_fd == fd)
+		{
 			server->control_fd = -1;
+			server->agent_supports_key_ack = false;
+		}
 		LeaveCriticalSection(&server->control_lock);
 		(void)close(fd);
 		log_message("WARN", "NanoKVM agent control 연결 종료");
@@ -2032,7 +2115,8 @@ int main(int argc, char* argv[])
 	    server.config.control_port == 0 || server.config.video_port == 0)
 		return 2;
 	if (!InitializeCriticalSectionAndSpinCount(&server.lock, 4000) ||
-	    !InitializeCriticalSectionAndSpinCount(&server.control_lock, 4000))
+	    !InitializeCriticalSectionAndSpinCount(&server.control_lock, 4000) ||
+	    !InitializeCriticalSectionAndSpinCount(&server.key_ack_lock, 4000))
 		return 1;
 	if (!WTSRegisterWtsApiFunctionTable(FreeRDP_InitWtsApi()) ||
 	    !winpr_InitializeSSL(WINPR_SSL_INIT_DEFAULT))
@@ -2047,9 +2131,17 @@ int main(int argc, char* argv[])
 		freerdp_listener_free(listener);
 		return 1;
 	}
+	server.key_ack_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (!server.key_ack_event)
+	{
+		(void)close(server.control_listener);
+		freerdp_listener_free(listener);
+		return 1;
+	}
 	HANDLE control = CreateThread(NULL, 0, control_thread, &server, 0, NULL);
 	if (!control)
 	{
+		(void)CloseHandle(server.key_ack_event);
 		(void)close(server.control_listener);
 		freerdp_listener_free(listener);
 		return 1;
@@ -2086,7 +2178,9 @@ int main(int argc, char* argv[])
 		(void)close(server.control_fd);
 	if (server.control_listener >= 0)
 		(void)close(server.control_listener);
+	(void)CloseHandle(server.key_ack_event);
 	WSACleanup();
+	DeleteCriticalSection(&server.key_ack_lock);
 	DeleteCriticalSection(&server.control_lock);
 	DeleteCriticalSection(&server.lock);
 	return 0;
