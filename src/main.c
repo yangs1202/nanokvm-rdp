@@ -1333,6 +1333,18 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 		               mapped_code, (unsigned)mapped_extended);
 		log_message("INFO", message);
 	}
+	const bool capslock_tap = client->server->config.right_alt_as_capslock &&
+	                         raw_extended && (code == 0x38 || code == 0x5c) &&
+	                         mapped_code == 0x3a && !mapped_extended;
+	if (capslock_tap)
+	{
+		if ((flags & KBD_FLAGS_RELEASE) != 0)
+			return TRUE;
+		const uint8_t press[3] = { mapped_code, false, 0 };
+		const uint8_t release[3] = { mapped_code, false, 1 };
+		return server_send_control(client->server, NANOKVM_CONTROL_KEY, press, sizeof(press)) &&
+		       server_send_control(client->server, NANOKVM_CONTROL_KEY, release, sizeof(release));
+	}
 	const uint8_t payload[3] = { mapped_code, mapped_extended,
 		(flags & KBD_FLAGS_RELEASE) != 0 };
 	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_KEY, payload, sizeof(payload));
