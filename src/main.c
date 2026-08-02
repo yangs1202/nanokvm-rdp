@@ -1323,6 +1323,15 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 	hid_map_scancode(code, mapped_extended, client->server->config.swap_alt_command,
 	                 client->server->config.right_alt_as_capslock,
 	                 &mapped_code, &mapped_extended);
+	if (code == 0x38 || (mapped_extended && (code == 0x5b || code == 0x5c)) || code == 0x3a)
+	{
+		char message[160];
+		(void)snprintf(message, sizeof(message),
+		               "RDP modifier diagnostic raw=0x%02X extended=%u release=%u mapped=0x%02X extended=%u",
+		               code, (unsigned)mapped_extended, (unsigned)((flags & KBD_FLAGS_RELEASE) != 0),
+		               mapped_code, (unsigned)mapped_extended);
+		log_message("INFO", message);
+	}
 	const uint8_t payload[3] = { mapped_code, mapped_extended,
 		(flags & KBD_FLAGS_RELEASE) != 0 };
 	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_KEY, payload, sizeof(payload));
