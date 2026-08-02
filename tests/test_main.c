@@ -88,12 +88,24 @@ static void test_hid_mapping(void)
 {
 	uint8_t usage = 0;
 	uint8_t modifier = 0;
+	uint8_t mapped_code = 0;
+	bool mapped_extended = false;
 	assert(hid_translate_scancode(0x1e, false, &usage, &modifier));
 	assert(usage == 0x04 && modifier == 0);
 	assert(hid_translate_scancode(0x1d, true, &usage, &modifier));
 	assert(usage == 0 && modifier == 0x10);
 	assert(hid_translate_scancode(0x4b, true, &usage, &modifier));
 	assert(usage == 0x50 && modifier == 0);
+	hid_map_scancode(0x38, false, true, &mapped_code, &mapped_extended);
+	assert(mapped_code == 0x5b && mapped_extended);
+	hid_map_scancode(0x38, true, true, &mapped_code, &mapped_extended);
+	assert(mapped_code == 0x5c && mapped_extended);
+	hid_map_scancode(0x5b, true, true, &mapped_code, &mapped_extended);
+	assert(mapped_code == 0x38 && !mapped_extended);
+	hid_map_scancode(0x5c, true, true, &mapped_code, &mapped_extended);
+	assert(mapped_code == 0x38 && mapped_extended);
+	hid_map_scancode(0x38, false, false, &mapped_code, &mapped_extended);
+	assert(mapped_code == 0x38 && !mapped_extended);
 	assert(hid_scale_absolute(0, 1920) == 1);
 	assert(hid_scale_absolute(1919, 1920) == 0x7fff);
 	assert(hid_clamp_absolute(1200, 1920) == 1200);

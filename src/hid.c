@@ -78,6 +78,30 @@ uint16_t hid_clamp_absolute(uint16_t value, uint16_t dimension)
 	return value < dimension ? value : (uint16_t)(dimension - 1U);
 }
 
+void hid_map_scancode(uint8_t code, bool extended, bool swap_alt_command,
+                      uint8_t* mapped_code, bool* mapped_extended)
+{
+	*mapped_code = code;
+	*mapped_extended = extended;
+	if (!swap_alt_command)
+		return;
+	if (code == 0x38)
+	{
+		*mapped_code = extended ? 0x5c : 0x5b;
+		*mapped_extended = true;
+	}
+	else if (extended && code == 0x5b)
+	{
+		*mapped_code = 0x38;
+		*mapped_extended = false;
+	}
+	else if (extended && code == 0x5c)
+	{
+		*mapped_code = 0x38;
+		*mapped_extended = true;
+	}
+}
+
 static bool send_keyboard(HidState* hid)
 {
 	uint8_t report[8] = { 0 };

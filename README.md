@@ -93,8 +93,11 @@ Useful gateway options:
 ```text
 -listen host:port  -cert file  -key file
 -width n           -height n  -bitrate n
--control-port n    -video-port n  -direct-gfx
+-control-port n    -video-port n  -swap-alt-command  -direct-gfx
 ```
+
+`-swap-alt-command` exchanges `Alt` and `Command/GUI` scancodes, preserving left/right keys.
+The option is disabled by default; when enabled, `AltGr` also exchanges with right `Command/GUI`.
 
 Start the agent by supplying the gateway hostname or IPv4 address:
 
