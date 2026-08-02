@@ -108,6 +108,8 @@ static void test_hid_mapping(void)
 	assert(mapped_code == 0x38 && !mapped_extended);
 	hid_map_scancode(0x38, true, true, true, &mapped_code, &mapped_extended);
 	assert(mapped_code == 0x3a && !mapped_extended);
+	hid_map_scancode(0x5c, true, true, true, &mapped_code, &mapped_extended);
+	assert(mapped_code == 0x3a && !mapped_extended);
 	assert(hid_translate_scancode(0x3a, false, &usage, &modifier));
 	assert(usage == 0x39 && modifier == 0);
 	assert(hid_scale_absolute(0, 1920) == 1);

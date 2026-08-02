@@ -84,7 +84,7 @@ void hid_map_scancode(uint8_t code, bool extended, bool swap_alt_command,
 {
 	*mapped_code = code;
 	*mapped_extended = extended;
-	if (right_alt_as_capslock && extended && code == 0x38)
+	if (right_alt_as_capslock && extended && (code == 0x38 || code == 0x5c))
 	{
 		*mapped_code = 0x3a;
 		*mapped_extended = false;

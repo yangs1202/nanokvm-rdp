@@ -1318,8 +1318,9 @@ out:
 static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 {
 	Client* client = (Client*)input->context;
+	const bool raw_extended = (flags & KBD_FLAGS_EXTENDED) != 0;
 	uint8_t mapped_code = code;
-	bool mapped_extended = (flags & KBD_FLAGS_EXTENDED) != 0;
+	bool mapped_extended = raw_extended;
 	hid_map_scancode(code, mapped_extended, client->server->config.swap_alt_command,
 	                 client->server->config.right_alt_as_capslock,
 	                 &mapped_code, &mapped_extended);
@@ -1328,7 +1329,7 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 		char message[160];
 		(void)snprintf(message, sizeof(message),
 		               "RDP modifier diagnostic raw=0x%02X extended=%u release=%u mapped=0x%02X extended=%u",
-		               code, (unsigned)mapped_extended, (unsigned)((flags & KBD_FLAGS_RELEASE) != 0),
+		               code, (unsigned)raw_extended, (unsigned)((flags & KBD_FLAGS_RELEASE) != 0),
 		               mapped_code, (unsigned)mapped_extended);
 		log_message("INFO", message);
 	}
