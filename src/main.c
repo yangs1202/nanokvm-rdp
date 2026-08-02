@@ -202,6 +202,27 @@ static bool server_send_control(Server* server, uint8_t type, const void* payloa
 	return sent;
 }
 
+static bool server_send_key_sequence(Server* server, const uint8_t payloads[][3], size_t count)
+{
+	bool sent = false;
+	EnterCriticalSection(&server->control_lock);
+	if (server->control_fd >= 0)
+	{
+		sent = true;
+		for (size_t index = 0; index < count; index++)
+		{
+			if (!protocol_send(server->control_fd, NANOKVM_CONTROL_KEY, payloads[index],
+			                   sizeof(payloads[index])))
+			{
+				sent = false;
+				break;
+			}
+		}
+	}
+	LeaveCriticalSection(&server->control_lock);
+	return sent;
+}
+
 static bool server_set_stream_requested(Server* server, bool requested)
 {
 	bool sent = false;
@@ -1327,18 +1348,11 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 	{
 		if ((flags & KBD_FLAGS_RELEASE) != 0)
 			return TRUE;
-		const uint8_t command_down[3] = { 0x5b, true, 0 };
-		const uint8_t space_down[3] = { 0x39, false, 0 };
-		const uint8_t space_up[3] = { 0x39, false, 1 };
-		const uint8_t command_up[3] = { 0x5b, true, 1 };
-		return server_send_control(client->server, NANOKVM_CONTROL_KEY, command_down,
-		                           sizeof(command_down)) &&
-		       server_send_control(client->server, NANOKVM_CONTROL_KEY, space_down,
-		                           sizeof(space_down)) &&
-		       server_send_control(client->server, NANOKVM_CONTROL_KEY, space_up,
-		                           sizeof(space_up)) &&
-		       server_send_control(client->server, NANOKVM_CONTROL_KEY, command_up,
-		                           sizeof(command_up));
+		const uint8_t sequence[][3] = {
+			{ 0x5b, true, 0 }, { 0x39, false, 0 }, { 0x39, false, 1 }, { 0x5b, true, 1 }
+		};
+		return server_send_key_sequence(client->server, sequence,
+		                               sizeof(sequence) / sizeof(sequence[0]));
 	}
 	hid_map_scancode(code, mapped_extended, client->server->config.swap_alt_command,
 	                 &mapped_code, &mapped_extended);
