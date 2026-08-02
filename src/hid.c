@@ -79,10 +79,17 @@ uint16_t hid_clamp_absolute(uint16_t value, uint16_t dimension)
 }
 
 void hid_map_scancode(uint8_t code, bool extended, bool swap_alt_command,
+                      bool right_alt_as_hangul,
                       uint8_t* mapped_code, bool* mapped_extended)
 {
 	*mapped_code = code;
 	*mapped_extended = extended;
+	if (right_alt_as_hangul && extended && code == 0x38)
+	{
+		*mapped_code = HID_VIRTUAL_SCANCODE_HANGUL;
+		*mapped_extended = false;
+		return;
+	}
 	if (!swap_alt_command)
 		return;
 	if (code == 0x38)
@@ -156,6 +163,11 @@ bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t
 
 	*usage = 0;
 	*modifier = 0;
+	if (!extended && code == HID_VIRTUAL_SCANCODE_HANGUL)
+	{
+		*usage = 0x90;
+		return true;
+	}
 	if (extended)
 	{
 		switch (code)

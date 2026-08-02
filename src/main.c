@@ -84,6 +84,7 @@ typedef struct
 	uint16_t control_port;
 	uint16_t video_port;
 	bool swap_alt_command;
+	bool right_alt_as_hangul;
 	bool direct_gfx;
 } ServerConfig;
 
@@ -1320,6 +1321,7 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 	uint8_t mapped_code = code;
 	bool mapped_extended = (flags & KBD_FLAGS_EXTENDED) != 0;
 	hid_map_scancode(code, mapped_extended, client->server->config.swap_alt_command,
+	                 client->server->config.right_alt_as_hangul,
 	                 &mapped_code, &mapped_extended);
 	const uint8_t payload[3] = { mapped_code, mapped_extended,
 		(flags & KBD_FLAGS_RELEASE) != 0 };
@@ -1912,7 +1914,8 @@ static void print_usage(const char* executable)
 {
 	(void)fprintf(stderr,
 	              "Usage: %s [-listen host:port] [-cert file] [-key file] [-width n] [-height n] "
-	              "[-bitrate n] [-control-port n] [-video-port n] [-swap-alt-command] [-direct-gfx]\n",
+	              "[-bitrate n] [-control-port n] [-video-port n] [-swap-alt-command] "
+	              "[-right-alt-as-hangul] [-direct-gfx]\n",
 	              executable);
 }
 
@@ -1973,6 +1976,8 @@ int main(int argc, char* argv[])
 			server.config.video_port = (uint16_t)strtoul(argv[++index], NULL, 10);
 		else if (strcmp(argv[index], "-swap-alt-command") == 0)
 			server.config.swap_alt_command = true;
+		else if (strcmp(argv[index], "-right-alt-as-hangul") == 0)
+			server.config.right_alt_as_hangul = true;
 		else if (strcmp(argv[index], "-direct-gfx") == 0)
 			server.config.direct_gfx = true;
 		else
