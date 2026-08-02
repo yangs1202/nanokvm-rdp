@@ -41,6 +41,7 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef WINPR_C_ARRAY_INIT
@@ -1324,26 +1325,29 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 	hid_map_scancode(code, mapped_extended, client->server->config.swap_alt_command,
 	                 client->server->config.right_alt_as_capslock,
 	                 &mapped_code, &mapped_extended);
-	if (code == 0x38 || (mapped_extended && (code == 0x5b || code == 0x5c)) || code == 0x3a)
-	{
-		char message[160];
-		(void)snprintf(message, sizeof(message),
-		               "RDP modifier diagnostic raw=0x%02X extended=%u release=%u mapped=0x%02X extended=%u",
-		               code, (unsigned)raw_extended, (unsigned)((flags & KBD_FLAGS_RELEASE) != 0),
-		               mapped_code, (unsigned)mapped_extended);
-		log_message("INFO", message);
-	}
 	const bool capslock_tap = client->server->config.right_alt_as_capslock &&
 	                         raw_extended && (code == 0x38 || code == 0x5c) &&
 	                         mapped_code == 0x3a && !mapped_extended;
+	if (code == 0x38 || (raw_extended && (code == 0x5b || code == 0x5c)) || code == 0x3a)
+	{
+		char message[160];
+		(void)snprintf(message, sizeof(message),
+		               "RDP modifier diagnostic raw=0x%02X extended=%u release=%u mapped=0x%02X extended=%u tap=%u",
+		               code, (unsigned)raw_extended, (unsigned)((flags & KBD_FLAGS_RELEASE) != 0),
+		               mapped_code, (unsigned)mapped_extended, (unsigned)capslock_tap);
+		log_message("INFO", message);
+	}
 	if (capslock_tap)
 	{
 		if ((flags & KBD_FLAGS_RELEASE) != 0)
 			return TRUE;
 		const uint8_t press[3] = { mapped_code, false, 0 };
 		const uint8_t release[3] = { mapped_code, false, 1 };
-		return server_send_control(client->server, NANOKVM_CONTROL_KEY, press, sizeof(press)) &&
-		       server_send_control(client->server, NANOKVM_CONTROL_KEY, release, sizeof(release));
+		if (!server_send_control(client->server, NANOKVM_CONTROL_KEY, press, sizeof(press)))
+			return FALSE;
+		const struct timespec hold = { .tv_sec = 0, .tv_nsec = 100000000L };
+		(void)nanosleep(&hold, NULL);
+		return server_send_control(client->server, NANOKVM_CONTROL_KEY, release, sizeof(release));
 	}
 	const uint8_t payload[3] = { mapped_code, mapped_extended,
 		(flags & KBD_FLAGS_RELEASE) != 0 };
