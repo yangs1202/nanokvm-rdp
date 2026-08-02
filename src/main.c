@@ -1551,13 +1551,6 @@ static BOOL client_release_all_inputs(Client* client, const char* reason)
 	return sent;
 }
 
-static BOOL on_synchronize(rdpInput* input, UINT32 flags)
-{
-	(void)flags;
-	Client* client = (Client*)input->context;
-	return client_release_all_inputs(client, "SynchronizeEvent");
-}
-
 static BOOL on_focus_in(rdpInput* input, UINT16 toggle_states)
 {
 	(void)toggle_states;
@@ -1941,7 +1934,6 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 		return false;
 
 	peer->PostConnect = peer_post_connect;
-	peer->context->input->SynchronizeEvent = on_synchronize;
 	peer->context->input->KeyboardEvent = on_keyboard;
 	peer->context->input->UnicodeKeyboardEvent = on_unicode_keyboard;
 	peer->context->input->MouseEvent = on_mouse;
