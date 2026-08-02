@@ -93,14 +93,14 @@ Useful gateway options:
 ```text
 -listen host:port  -cert file  -key file
 -width n           -height n  -bitrate n
--control-port n    -video-port n  -swap-alt-command  -right-alt-as-capslock
+-control-port n    -video-port n  -swap-alt-command  -right-alt-as-command-space
 -direct-gfx
 ```
 
 `-swap-alt-command` exchanges `Alt` and `Command/GUI` scancodes, preserving left/right keys.
 The option is disabled by default; when enabled, `AltGr` also exchanges with right `Command/GUI`.
-`-right-alt-as-capslock` maps right `Alt/Option` to the `Caps Lock` key and takes precedence over
-the right-side `Alt/Command` exchange.
+`-right-alt-as-command-space` maps right `Alt/Option` to a synthetic `Command + Space` chord and
+takes precedence over the right-side `Alt/Command` exchange.
 
 Start the agent by supplying the gateway hostname or IPv4 address:
 

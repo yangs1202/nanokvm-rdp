@@ -41,7 +41,6 @@
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
-#include <time.h>
 #include <unistd.h>
 
 #ifndef WINPR_C_ARRAY_INIT
@@ -85,7 +84,7 @@ typedef struct
 	uint16_t control_port;
 	uint16_t video_port;
 	bool swap_alt_command;
-	bool right_alt_as_capslock;
+	bool right_alt_as_command_space;
 	bool direct_gfx;
 } ServerConfig;
 
@@ -1322,32 +1321,35 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 	const bool raw_extended = (flags & KBD_FLAGS_EXTENDED) != 0;
 	uint8_t mapped_code = code;
 	bool mapped_extended = raw_extended;
+	const bool command_space = client->server->config.right_alt_as_command_space &&
+	                           raw_extended && (code == 0x38 || code == 0x5c);
+	if (command_space)
+	{
+		if ((flags & KBD_FLAGS_RELEASE) != 0)
+			return TRUE;
+		const uint8_t command_down[3] = { 0x5b, true, 0 };
+		const uint8_t space_down[3] = { 0x39, false, 0 };
+		const uint8_t space_up[3] = { 0x39, false, 1 };
+		const uint8_t command_up[3] = { 0x5b, true, 1 };
+		return server_send_control(client->server, NANOKVM_CONTROL_KEY, command_down,
+		                           sizeof(command_down)) &&
+		       server_send_control(client->server, NANOKVM_CONTROL_KEY, space_down,
+		                           sizeof(space_down)) &&
+		       server_send_control(client->server, NANOKVM_CONTROL_KEY, space_up,
+		                           sizeof(space_up)) &&
+		       server_send_control(client->server, NANOKVM_CONTROL_KEY, command_up,
+		                           sizeof(command_up));
+	}
 	hid_map_scancode(code, mapped_extended, client->server->config.swap_alt_command,
-	                 client->server->config.right_alt_as_capslock,
 	                 &mapped_code, &mapped_extended);
-	const bool capslock_tap = client->server->config.right_alt_as_capslock &&
-	                         raw_extended && (code == 0x38 || code == 0x5c) &&
-	                         mapped_code == 0x3a && !mapped_extended;
 	if (code == 0x38 || (raw_extended && (code == 0x5b || code == 0x5c)) || code == 0x3a)
 	{
 		char message[160];
 		(void)snprintf(message, sizeof(message),
-		               "RDP modifier diagnostic raw=0x%02X extended=%u release=%u mapped=0x%02X extended=%u tap=%u",
+		               "RDP modifier diagnostic raw=0x%02X extended=%u release=%u mapped=0x%02X extended=%u",
 		               code, (unsigned)raw_extended, (unsigned)((flags & KBD_FLAGS_RELEASE) != 0),
-		               mapped_code, (unsigned)mapped_extended, (unsigned)capslock_tap);
+		               mapped_code, (unsigned)mapped_extended);
 		log_message("INFO", message);
-	}
-	if (capslock_tap)
-	{
-		if ((flags & KBD_FLAGS_RELEASE) != 0)
-			return TRUE;
-		const uint8_t press[3] = { mapped_code, false, 0 };
-		const uint8_t release[3] = { mapped_code, false, 1 };
-		if (!server_send_control(client->server, NANOKVM_CONTROL_KEY, press, sizeof(press)))
-			return FALSE;
-		const struct timespec hold = { .tv_sec = 0, .tv_nsec = 100000000L };
-		(void)nanosleep(&hold, NULL);
-		return server_send_control(client->server, NANOKVM_CONTROL_KEY, release, sizeof(release));
 	}
 	const uint8_t payload[3] = { mapped_code, mapped_extended,
 		(flags & KBD_FLAGS_RELEASE) != 0 };
@@ -1941,7 +1943,7 @@ static void print_usage(const char* executable)
 	(void)fprintf(stderr,
 	              "Usage: %s [-listen host:port] [-cert file] [-key file] [-width n] [-height n] "
 	              "[-bitrate n] [-control-port n] [-video-port n] [-swap-alt-command] "
-	              "[-right-alt-as-capslock] [-direct-gfx]\n",
+	              "[-right-alt-as-command-space] [-direct-gfx]\n",
 	              executable);
 }
 
@@ -2002,8 +2004,8 @@ int main(int argc, char* argv[])
 			server.config.video_port = (uint16_t)strtoul(argv[++index], NULL, 10);
 		else if (strcmp(argv[index], "-swap-alt-command") == 0)
 			server.config.swap_alt_command = true;
-		else if (strcmp(argv[index], "-right-alt-as-capslock") == 0)
-			server.config.right_alt_as_capslock = true;
+		else if (strcmp(argv[index], "-right-alt-as-command-space") == 0)
+			server.config.right_alt_as_command_space = true;
 		else if (strcmp(argv[index], "-direct-gfx") == 0)
 			server.config.direct_gfx = true;
 		else
