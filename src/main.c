@@ -218,6 +218,109 @@ static void server_cancel_key_ack(Server* server)
 	LeaveCriticalSection(&server->key_ack_lock);
 }
 
+static bool server_set_stream_requested(Server* server, bool requested)
+{
+	bool sent = false;
+	EnterCriticalSection(&server->control_lock);
+	server->stream_requested = requested;
+	if (server->control_fd >= 0)
+		sent = protocol_send(server->control_fd,
+		                     requested ? NANOKVM_CONTROL_START_STREAM : NANOKVM_CONTROL_STOP_STREAM,
+		                     NULL, 0);
+	LeaveCriticalSection(&server->control_lock);
+	log_message(sent ? "INFO" : "ERROR", requested ? "NanoKVM agent에 START_STREAM 전송"
+	                                                : "NanoKVM agent에 STOP_STREAM 전송");
+	return sent;
+}
+
+static void on_signal(int signal_number)
+{
+	(void)signal_number;
+	stop_requested = 1;
+}
+
+static DWORD WINAPI control_thread(LPVOID argument)
+{
+	Server* server = (Server*)argument;
+	while (!stop_requested)
+	{
+		struct sockaddr_in address = { 0 };
+		socklen_t length = sizeof(address);
+		const int fd = accept(server->control_listener, (struct sockaddr*)&address, &length);
+		if (fd < 0)
+			continue;
+		int enabled = 1;
+		(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+		NanokvmControlMessage hello = { 0 };
+		if (!protocol_receive(fd, &hello) || hello.type != NANOKVM_CONTROL_HELLO ||
+		    (hello.length != NANOKVM_HELLO_BASE_PAYLOAD_SIZE &&
+		     hello.length != NANOKVM_HELLO_CAPABILITIES_PAYLOAD_SIZE))
+		{
+			(void)close(fd);
+			continue;
+		}
+		EnterCriticalSection(&server->control_lock);
+		if (server->control_fd >= 0)
+			(void)close(server->control_fd);
+		server->control_fd = fd;
+		server->agent_supports_key_ack = hello.length == NANOKVM_HELLO_CAPABILITIES_PAYLOAD_SIZE &&
+		                                 (hello.payload[8] & NANOKVM_AGENT_CAPABILITY_KEY_ACK) != 0;
+		server->last_agent_activity_at = monotonic_milliseconds();
+		server->last_ping_at = server->last_agent_activity_at;
+		const bool start = server->stream_requested;
+		LeaveCriticalSection(&server->control_lock);
+	if (start && !server_send_control(server, NANOKVM_CONTROL_START_STREAM, NULL, 0))
+	{
+		log_message("ERROR", "재연결 NanoKVM agent에 START_STREAM을 보낼 수 없습니다");
+	}
+		log_message("INFO", "NanoKVM agent control 연결 수락");
+		for (;;)
+		{
+			NanokvmControlMessage message = { 0 };
+			if (!protocol_receive(fd, &message))
+				break;
+			if (message.type == NANOKVM_CONTROL_KEY_ACK &&
+			    message.length == NANOKVM_KEY_ACK_PAYLOAD_SIZE)
+			{
+				const uint32_t sequence = protocol_read_u32(message.payload);
+				EnterCriticalSection(&server->key_ack_lock);
+				if (server->waiting_key_sequence == sequence)
+				{
+					server->key_ack_received = true;
+					server->key_ack_success = message.payload[4] != 0;
+					(void)SetEvent(server->key_ack_event);
+				}
+				LeaveCriticalSection(&server->key_ack_lock);
+				continue;
+			}
+			EnterCriticalSection(&server->control_lock);
+			server->last_agent_activity_at = monotonic_milliseconds();
+			if (message.type == NANOKVM_CONTROL_STATS &&
+			    message.length == NANOKVM_STATS_PAYLOAD_SIZE)
+			{
+				server->agent_sent_packets = protocol_read_u32(message.payload);
+				server->agent_dropped_packets = protocol_read_u32(message.payload + 4);
+				server->agent_capture_frames = protocol_read_u32(message.payload + 8);
+				server->agent_dropped_frames = protocol_read_u32(message.payload + 12);
+			}
+			LeaveCriticalSection(&server->control_lock);
+			if (message.type == NANOKVM_CONTROL_PING)
+				(void)server_send_control(server, NANOKVM_CONTROL_PONG, NULL, 0);
+		}
+		server_cancel_key_ack(server);
+		EnterCriticalSection(&server->control_lock);
+		if (server->control_fd == fd)
+		{
+			server->control_fd = -1;
+			server->agent_supports_key_ack = false;
+		}
+		LeaveCriticalSection(&server->control_lock);
+		(void)close(fd);
+		log_message("WARN", "NanoKVM agent control 연결 종료");
+	}
+	return 0;
+}
+
 static int open_control_listener(const char* host, uint16_t port)
 {
 	const int fd = socket(AF_INET, SOCK_STREAM, 0);
