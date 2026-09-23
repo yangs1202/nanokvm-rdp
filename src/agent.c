@@ -94,8 +94,10 @@ static uint64_t monotonic_milliseconds(void)
 	return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 }
 
-static bool kvm_load(KvmApi* api)
+static bool kvm_ensure_loaded(KvmApi* api)
 {
+	if (api->handle)
+		return api->init && api->read_image && api->free_data && api->set_frame_detect;
 	const char* candidates[] = { "/kvmapp/server/dl_lib/libkvm.so", "/tmp/server/dl_lib/libkvm.so",
 		"libkvm.so" };
 	for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index++)
@@ -346,18 +348,25 @@ static void* video_loop(void* argument)
 	unsigned capture_reinit_count = 0;
 	while (!stop_requested)
 	{
-		if (atomic_exchange(&agent->capture_deinit_requested, false))
-			capture_deinit_and_pause(&capture_initialized);
 		if (!atomic_load(&agent->streaming))
 		{
 			const struct timespec pause = { .tv_sec = 0, .tv_nsec = CAPTURE_RETRY_SLEEP_NS };
 			(void)nanosleep(&pause, NULL);
 			continue;
 		}
+		if (atomic_exchange(&agent->capture_deinit_requested, false))
+			capture_deinit_and_pause(&capture_initialized);
 		if (!capture_initialized)
 		{
 			capture_fail_count = 0;
-			(void)fprintf(stderr, "%s: gateway control 연결 후 libkvm 초기화 시작\n", TAG);
+			if (!kvm_ensure_loaded(&agent->kvm))
+			{
+				(void)fprintf(stderr, "%s: libkvm.so를 열 수 없습니다\n", TAG);
+				const struct timespec pause = { .tv_sec = 1, .tv_nsec = 0 };
+				(void)nanosleep(&pause, NULL);
+				continue;
+			}
+			(void)fprintf(stderr, "%s: START_STREAM 이후 libkvm 초기화 시작\n", TAG);
 			agent->kvm.init(0);
 			agent->kvm.set_frame_detect(0);
 			capture_initialized = true;
@@ -440,11 +449,6 @@ int main(int argc, char* argv[])
 	{
 		usage(argv[0]);
 		return 2;
-	}
-	if (!kvm_load(&agent.kvm))
-	{
-		(void)fprintf(stderr, "%s: libkvm.so를 열 수 없습니다\n", TAG);
-		return 1;
 	}
 	agent.video_fd = socket(AF_INET, SOCK_DGRAM, 0);
 	agent.video_address.sin_family = AF_INET;
