@@ -99,7 +99,7 @@ Useful gateway options:
 
 The gateway advertises Korean keyboard layout `0x00000412` and forwards physical scan codes.
 Right Alt and Right GUI are tapped as HID Caps Lock so a Korean IME can switch languages.
-The absolute mouse carries the left, right, and middle buttons plus the vertical wheel. Side buttons and horizontal wheel events use the relative mouse's fourth and fifth buttons.
+The absolute mouse carries the left, right, and middle buttons plus the vertical wheel. Horizontal wheel events use the relative mouse wheel byte.
 
 Start the agent by supplying the gateway hostname or IPv4 address:
 

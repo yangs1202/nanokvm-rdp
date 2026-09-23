@@ -19,10 +19,8 @@
 #define PTR_XFLAGS_BUTTON1 0x0001
 #define PTR_XFLAGS_BUTTON2 0x0002
 #define WHEEL_ROTATION_MASK 0x01FF
-#define HID_MOUSE_BUTTONS_MASK 0x1F
+#define HID_MOUSE_BUTTONS_MASK 0x07
 #define HID_TOUCH_BUTTONS_MASK 0x07
-#define HID_TOUCH_BUTTON4 0x08
-#define HID_TOUCH_BUTTON5 0x10
 #define HID_MODIFIER_RIGHT_ALT 0x40
 #define HID_USAGE_CAPS_LOCK 0x39
 
@@ -518,11 +516,6 @@ static uint8_t touch_buttons(uint8_t buttons)
 	return (uint8_t)(buttons & HID_TOUCH_BUTTONS_MASK);
 }
 
-static uint8_t relative_buttons(uint8_t buttons)
-{
-	return (uint8_t)(buttons & HID_MOUSE_BUTTONS_MASK);
-}
-
 static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)
 {
 	report[1] = (uint8_t)(x & 0xffU);
@@ -555,29 +548,12 @@ bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_
 		else
 			hid->buttons &= (uint8_t)~0x04U;
 	}
-	if ((flags & PTR_XFLAGS_BUTTON1) != 0)
-	{
-		if ((flags & PTR_FLAGS_DOWN) != 0)
-			hid->buttons |= HID_TOUCH_BUTTON4;
-		else
-			hid->buttons &= (uint8_t)~HID_TOUCH_BUTTON4;
-	}
-	if ((flags & PTR_XFLAGS_BUTTON2) != 0)
-	{
-		if ((flags & PTR_FLAGS_DOWN) != 0)
-			hid->buttons |= HID_TOUCH_BUTTON5;
-		else
-			hid->buttons &= (uint8_t)~HID_TOUCH_BUTTON5;
-	}
 
 	hid->last_x = hid_scale_absolute(x, width);
 	hid->last_y = hid_scale_absolute(y, height);
 	uint8_t report[6] = { touch_buttons(hid->buttons), 0, 0, 0, 0, 0 };
 	write_touch_position(report, hid->last_x, hid->last_y);
-	const bool touch_sent = write_report(hid->touch_path, report, sizeof(report));
-	/* hidg2는 버튼 3개만 담는다. 4/5번 버튼은 hidg1의 5버튼 상대 마우스로 보낸다. */
-	const uint8_t relative[4] = { relative_buttons(hid->buttons), 0, 0, 0 };
-	return write_report(hid->mouse_path, relative, sizeof(relative)) && touch_sent;
+	return write_report(hid->touch_path, report, sizeof(report));
 }
 
 bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
@@ -590,7 +566,7 @@ bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 		y = 127;
 	if (y < -127)
 		y = -127;
-	hid->mouse_buttons = relative_buttons(buttons);
+	hid->mouse_buttons = buttons & HID_MOUSE_BUTTONS_MASK;
 	const uint8_t report[4] = { hid->mouse_buttons, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
 	return write_report(hid->mouse_path, report, sizeof(report));
 }
@@ -617,16 +593,13 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 	if (!vertical && !horizontal)
 		return true;
 	int detents = wheel_detents(flags);
-	/* 절대 마우스 디스크립터는 세로 휠만 있다. 가로 휠은 상대 마우스 버튼 4/5로 보낸다. */
+	/* 이 장치의 hidg1은 버튼 3개와 휠 바이트를 가진다. 가로 휠은 그 휠 바이트로 보낸다. */
 	if (horizontal && !vertical)
 	{
 		if (detents == 0)
 			return true;
-		const uint8_t side = detents > 0 ? HID_TOUCH_BUTTON5 : HID_TOUCH_BUTTON4;
-		const uint8_t down[4] = { (uint8_t)(relative_buttons(hid->buttons) | side), 0, 0, 0 };
-		const uint8_t up[4] = { relative_buttons(hid->buttons), 0, 0, 0 };
-		return write_report(hid->mouse_path, down, sizeof(down)) &&
-		       write_report(hid->mouse_path, up, sizeof(up));
+		const uint8_t report[4] = { hid->mouse_buttons, 0, 0, (uint8_t)(int8_t)detents };
+		return write_report(hid->mouse_path, report, sizeof(report));
 	}
 	uint8_t report[6] = { touch_buttons(hid->buttons), 0, 0, 0, 0, (uint8_t)(int8_t)detents };
 	write_touch_position(report, hid->last_x, hid->last_y);

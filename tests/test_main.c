@@ -239,26 +239,23 @@ static void test_hid_horizontal_wheel(void)
 	const int mouse_fd = mkstemp(mouse_path);
 	assert(mouse_fd >= 0);
 	assert(close(mouse_fd) == 0);
-	assert(unlink(mouse_path) == 0);
-	assert(mkfifo(mouse_path, 0600) == 0);
-	const int read_fd = open(mouse_path, O_RDONLY | O_NONBLOCK);
-	assert(read_fd >= 0);
 
 	HidState hid;
 	hid_init(&hid, "/dev/null", mouse_path, "/dev/null");
 	assert(hid_wheel(&hid, 0x0478U));
-	uint8_t down[4] = { 0 };
-	uint8_t up[4] = { 0 };
-	assert(read(read_fd, down, sizeof(down)) == (ssize_t)sizeof(down));
-	assert(read(read_fd, up, sizeof(up)) == (ssize_t)sizeof(up));
-	assert(down[0] == 0x10 && up[0] == 0);
+	int read_fd = open(mouse_path, O_RDONLY);
+	assert(read_fd >= 0);
+	uint8_t report[4] = { 0 };
+	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
+	assert(report[0] == 0 && report[1] == 0 && report[2] == 0 && report[3] == 1);
+	assert(close(read_fd) == 0);
 
 	assert(hid_wheel(&hid, 0x0578U));
-	memset(down, 0, sizeof(down));
-	memset(up, 0, sizeof(up));
-	assert(read(read_fd, down, sizeof(down)) == (ssize_t)sizeof(down));
-	assert(read(read_fd, up, sizeof(up)) == (ssize_t)sizeof(up));
-	assert(down[0] == 0x08 && up[0] == 0);
+	read_fd = open(mouse_path, O_RDONLY);
+	assert(read_fd >= 0);
+	memset(report, 0, sizeof(report));
+	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
+	assert(report[0] == 0 && report[3] == 0xff);
 	assert(close(read_fd) == 0);
 	assert(unlink(mouse_path) == 0);
 }
