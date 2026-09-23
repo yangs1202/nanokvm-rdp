@@ -30,6 +30,7 @@ void hid_release_all(HidState* hid);
 
 uint16_t hid_scale_absolute(uint16_t value, uint32_t dimension);
 uint16_t hid_clamp_absolute(uint16_t value, uint16_t dimension);
+uint16_t hid_pointer_flags_from_extended(uint16_t flags);
 void hid_map_scancode(uint8_t code, bool extended, bool swap_alt_command,
                       uint8_t* mapped_code, bool* mapped_extended);
 bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t* modifier);

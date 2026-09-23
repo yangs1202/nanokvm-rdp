@@ -79,6 +79,16 @@ uint16_t hid_clamp_absolute(uint16_t value, uint16_t dimension)
 	return value < dimension ? value : (uint16_t)(dimension - 1U);
 }
 
+uint16_t hid_pointer_flags_from_extended(uint16_t flags)
+{
+	/* RDP extended mouse의 X1은 가운데 버튼이다. X2는 이 가젯이 받지 않는다. */
+	uint16_t mapped = (uint16_t)(flags & (PTR_FLAGS_DOWN | PTR_FLAGS_WHEEL |
+	                                      PTR_FLAGS_WHEEL_NEGATIVE | PTR_FLAGS_HWHEEL));
+	if ((flags & PTR_XFLAGS_BUTTON1) != 0)
+		mapped |= PTR_FLAGS_BUTTON3;
+	return mapped;
+}
+
 void hid_map_scancode(uint8_t code, bool extended, bool swap_alt_command,
                       uint8_t* mapped_code, bool* mapped_extended)
 {

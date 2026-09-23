@@ -1513,7 +1513,7 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 
 static BOOL on_extended_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 {
-	return on_mouse(input, flags, x, y);
+	return on_mouse(input, hid_pointer_flags_from_extended(flags), x, y);
 }
 
 static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT16 y_delta)

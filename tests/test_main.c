@@ -133,6 +133,9 @@ static void test_hid_mapping(void)
 	assert(hid_scale_absolute(1919, 1920) == 0x7fff);
 	assert(hid_clamp_absolute(1200, 1920) == 1200);
 	assert(hid_clamp_absolute(3000, 1920) == 1919);
+	assert(hid_pointer_flags_from_extended(0x8001U) == 0xc000U);
+	assert(hid_pointer_flags_from_extended(0x0001U) == 0x4000U);
+	assert(hid_pointer_flags_from_extended(0x8002U) == 0x8000U);
 
 	HidState hid;
 	hid_init(&hid, keyboard_path, "/dev/null", "/dev/null");
