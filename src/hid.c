@@ -19,9 +19,12 @@
 #define PTR_XFLAGS_BUTTON1 0x0001
 #define PTR_XFLAGS_BUTTON2 0x0002
 #define WHEEL_ROTATION_MASK 0x01FF
-#define HID_MOUSE_BUTTONS_MASK 0x07
+#define HID_MOUSE_BUTTONS_MASK 0x1F
 #define HID_TOUCH_BUTTONS_MASK 0x07
-#define HID_MODIFIER_LEFT_SHIFT 0x02
+#define HID_TOUCH_BUTTON4 0x08
+#define HID_TOUCH_BUTTON5 0x10
+#define HID_MODIFIER_RIGHT_ALT 0x40
+#define HID_USAGE_CAPS_LOCK 0x39
 
 static bool write_report(const char* path, const uint8_t* report, size_t length)
 {
@@ -83,14 +86,6 @@ void hid_map_scancode(uint8_t code, bool extended, bool swap_alt_command,
 {
 	*mapped_code = code;
 	*mapped_extended = extended;
-	/* 한국어 USB 키보드의 한/영은 HID Caps Lock(0x39)이다.
-	 * macOS RDP는 이 키를 Right Alt(E0 38)로 보낸다. */
-	if (extended && (code == 0x38 || code == 0x5c))
-	{
-		*mapped_code = 0x3a;
-		*mapped_extended = false;
-		return;
-	}
 	if (!swap_alt_command)
 		return;
 	if (code == 0x38)
@@ -136,6 +131,15 @@ static bool send_keyboard(HidState* hid)
 	return false;
 }
 
+static bool tap_usage(HidState* hid, uint8_t usage)
+{
+	hid->usages[usage] = true;
+	if (!send_keyboard(hid))
+		return false;
+	hid->usages[usage] = false;
+	return send_keyboard(hid);
+}
+
 bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t* modifier)
 {
 	static const uint8_t normal[128] = {
@@ -176,7 +180,7 @@ bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t
 			case 0x1d: *modifier = 0x10; return true;
 			case 0x35: *usage = 0x54; return true;
 			case 0x37: *usage = 0x46; return true;
-			case 0x38: *usage = 0x39; return true;
+			case 0x38: *modifier = HID_MODIFIER_RIGHT_ALT; return true;
 			case 0x47: *usage = 0x4a; return true;
 			case 0x48: *usage = 0x52; return true;
 			case 0x49: *usage = 0x4b; return true;
@@ -188,7 +192,7 @@ bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t
 			case 0x52: *usage = 0x49; return true;
 			case 0x53: *usage = 0x4c; return true;
 			case 0x5b: *modifier = 0x08; return true;
-			case 0x5c: *usage = 0x39; return true;
+			case 0x5c: *modifier = 0x80; return true;
 			case 0x5d: *usage = 0x65; return true;
 			case 0x5e: *usage = 0x66; return true;
 			case 0x5f: *usage = 0x82; return true;
@@ -217,6 +221,14 @@ bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release)
 	uint8_t modifier = 0;
 	if (!hid_translate_scancode(code, extended, &usage, &modifier))
 		return true;
+	/* 한국어 USB 키보드의 한/영은 HID Caps Lock이다. macOS RDP의 Right Alt와
+	 * Right GUI를 누를 때만 탭으로 보낸다. modifier로 유지하면 IME가 전환되지 않는다. */
+	if ((extended && code == 0x38) || (extended && code == 0x5c))
+	{
+		if (release)
+			return true;
+		return tap_usage(hid, HID_USAGE_CAPS_LOCK);
+	}
 	if (modifier != 0)
 	{
 		if (release)
@@ -506,6 +518,11 @@ static uint8_t touch_buttons(uint8_t buttons)
 	return (uint8_t)(buttons & HID_TOUCH_BUTTONS_MASK);
 }
 
+static uint8_t relative_buttons(uint8_t buttons)
+{
+	return (uint8_t)(buttons & HID_MOUSE_BUTTONS_MASK);
+}
+
 static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)
 {
 	report[1] = (uint8_t)(x & 0xffU);
@@ -538,12 +555,29 @@ bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_
 		else
 			hid->buttons &= (uint8_t)~0x04U;
 	}
+	if ((flags & PTR_XFLAGS_BUTTON1) != 0)
+	{
+		if ((flags & PTR_FLAGS_DOWN) != 0)
+			hid->buttons |= HID_TOUCH_BUTTON4;
+		else
+			hid->buttons &= (uint8_t)~HID_TOUCH_BUTTON4;
+	}
+	if ((flags & PTR_XFLAGS_BUTTON2) != 0)
+	{
+		if ((flags & PTR_FLAGS_DOWN) != 0)
+			hid->buttons |= HID_TOUCH_BUTTON5;
+		else
+			hid->buttons &= (uint8_t)~HID_TOUCH_BUTTON5;
+	}
 
 	hid->last_x = hid_scale_absolute(x, width);
 	hid->last_y = hid_scale_absolute(y, height);
 	uint8_t report[6] = { touch_buttons(hid->buttons), 0, 0, 0, 0, 0 };
 	write_touch_position(report, hid->last_x, hid->last_y);
-	return write_report(hid->touch_path, report, sizeof(report));
+	const bool touch_sent = write_report(hid->touch_path, report, sizeof(report));
+	/* hidg2는 버튼 3개만 담는다. 4/5번 버튼은 hidg1의 5버튼 상대 마우스로 보낸다. */
+	const uint8_t relative[4] = { relative_buttons(hid->buttons), 0, 0, 0 };
+	return write_report(hid->mouse_path, relative, sizeof(relative)) && touch_sent;
 }
 
 bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
@@ -556,7 +590,7 @@ bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 		y = 127;
 	if (y < -127)
 		y = -127;
-	hid->mouse_buttons = buttons & HID_MOUSE_BUTTONS_MASK;
+	hid->mouse_buttons = relative_buttons(buttons);
 	const uint8_t report[4] = { hid->mouse_buttons, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
 	return write_report(hid->mouse_path, report, sizeof(report));
 }
@@ -583,21 +617,16 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 	if (!vertical && !horizontal)
 		return true;
 	int detents = wheel_detents(flags);
-	/* 절대 마우스 디스크립터는 세로 휠만 있다. 가로 휠은 Shift+세로 휠로 보낸다. */
+	/* 절대 마우스 디스크립터는 세로 휠만 있다. 가로 휠은 상대 마우스 버튼 4/5로 보낸다. */
 	if (horizontal && !vertical)
 	{
-		const uint8_t saved_modifiers = hid->modifiers;
-		hid->modifiers |= HID_MODIFIER_LEFT_SHIFT;
-		if (!send_keyboard(hid))
-		{
-			hid->modifiers = saved_modifiers;
-			return false;
-		}
-		uint8_t report[6] = { touch_buttons(hid->buttons), 0, 0, 0, 0, (uint8_t)(int8_t)detents };
-		write_touch_position(report, hid->last_x, hid->last_y);
-		const bool sent = write_report(hid->touch_path, report, sizeof(report));
-		hid->modifiers = saved_modifiers;
-		return sent && send_keyboard(hid);
+		if (detents == 0)
+			return true;
+		const uint8_t side = detents > 0 ? HID_TOUCH_BUTTON5 : HID_TOUCH_BUTTON4;
+		const uint8_t down[4] = { (uint8_t)(relative_buttons(hid->buttons) | side), 0, 0, 0 };
+		const uint8_t up[4] = { relative_buttons(hid->buttons), 0, 0, 0 };
+		return write_report(hid->mouse_path, down, sizeof(down)) &&
+		       write_report(hid->mouse_path, up, sizeof(up));
 	}
 	uint8_t report[6] = { touch_buttons(hid->buttons), 0, 0, 0, 0, (uint8_t)(int8_t)detents };
 	write_touch_position(report, hid->last_x, hid->last_y);

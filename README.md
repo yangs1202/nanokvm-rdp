@@ -98,8 +98,8 @@ Useful gateway options:
 ```
 
 The gateway advertises Korean keyboard layout `0x00000412` and forwards physical scan codes.
-Right Alt and the Korean Hangul key are sent as HID Caps Lock so the target IME can switch languages.
-Horizontal wheel events are translated to Shift plus vertical wheel because the stock absolute mouse descriptor has only a vertical wheel.
+Right Alt and Right GUI are tapped as HID Caps Lock so a Korean IME can switch languages.
+The absolute mouse carries the left, right, and middle buttons plus the vertical wheel. Side buttons and horizontal wheel events use the relative mouse's fourth and fifth buttons.
 
 Start the agent by supplying the gateway hostname or IPv4 address:
 
