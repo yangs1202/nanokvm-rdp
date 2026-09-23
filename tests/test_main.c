@@ -99,13 +99,25 @@ static void test_hid_mapping(void)
 	hid_map_scancode(0x38, false, true, &mapped_code, &mapped_extended);
 	assert(mapped_code == 0x5b && mapped_extended);
 	hid_map_scancode(0x38, true, true, &mapped_code, &mapped_extended);
-	assert(mapped_code == 0x5c && mapped_extended);
+	assert(mapped_code == 0x3a && !mapped_extended);
 	hid_map_scancode(0x5b, true, true, &mapped_code, &mapped_extended);
 	assert(mapped_code == 0x38 && !mapped_extended);
 	hid_map_scancode(0x5c, true, true, &mapped_code, &mapped_extended);
-	assert(mapped_code == 0x38 && mapped_extended);
+	assert(mapped_code == 0x3a && !mapped_extended);
 	hid_map_scancode(0x38, false, false, &mapped_code, &mapped_extended);
 	assert(mapped_code == 0x38 && !mapped_extended);
+	hid_map_scancode(0x38, true, false, &mapped_code, &mapped_extended);
+	assert(mapped_code == 0x3a && !mapped_extended);
+	hid_map_scancode(0x5c, true, false, &mapped_code, &mapped_extended);
+	assert(mapped_code == 0x3a && !mapped_extended);
+	assert(hid_translate_scancode(0x3a, false, &usage, &modifier));
+	assert(usage == 0x39 && modifier == 0);
+	assert(hid_translate_scancode(0x38, true, &usage, &modifier));
+	assert(usage == 0x39 && modifier == 0);
+	assert(hid_translate_scancode(0x54, false, &usage, &modifier));
+	assert(usage == 0x67 && modifier == 0);
+	assert(hid_translate_scancode(0x37, true, &usage, &modifier));
+	assert(usage == 0x46 && modifier == 0);
 	assert(hid_scale_absolute(0, 1920) == 1);
 	assert(hid_scale_absolute(1919, 1920) == 0x7fff);
 	assert(hid_clamp_absolute(1200, 1920) == 1200);
@@ -159,7 +171,7 @@ static void test_hid_extended_buttons(void)
 	assert(read_fd >= 0);
 	uint8_t report[6] = { 0 };
 	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
-	assert(report[0] == 0x08 && report[5] == 0);
+	assert(report[0] == 0x00 && report[5] == 0);
 	assert(close(read_fd) == 0);
 
 	assert(hid_wheel(&hid, 0x0278U));
@@ -167,7 +179,7 @@ static void test_hid_extended_buttons(void)
 	assert(read_fd >= 0);
 	uint8_t wheel_report[6] = { 0 };
 	assert(read(read_fd, wheel_report, sizeof(wheel_report)) == (ssize_t)sizeof(wheel_report));
-	assert(wheel_report[0] == 0x08 && wheel_report[5] == 1);
+	assert(wheel_report[0] == 0x00 && wheel_report[5] == 1);
 	assert(close(read_fd) == 0);
 
 	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0));
@@ -175,7 +187,7 @@ static void test_hid_extended_buttons(void)
 	assert(read_fd >= 0);
 	memset(report, 0, sizeof(report));
 	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
-	assert(report[0] == 0x08 && report[5] == 0);
+	assert(report[0] == 0x00 && report[5] == 0);
 	assert(close(read_fd) == 0);
 
 	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0x0001U));
@@ -191,9 +203,43 @@ static void test_hid_extended_buttons(void)
 	assert(read_fd >= 0);
 	memset(report, 0, sizeof(report));
 	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
-	assert(report[0] == 0x10 && report[5] == 0);
+	assert(report[0] == 0x00 && report[5] == 0);
 	assert(close(read_fd) == 0);
 	assert(unlink(mouse_path) == 0);
+	assert(unlink(touch_path) == 0);
+}
+
+static void test_hid_horizontal_wheel(void)
+{
+	char keyboard_path[] = "/tmp/nanokvm-rdp-keyboard-hwheel-XXXXXX";
+	char touch_path[] = "/tmp/nanokvm-rdp-touch-hwheel-XXXXXX";
+	const int keyboard_fd = mkstemp(keyboard_path);
+	const int touch_fd = mkstemp(touch_path);
+	assert(keyboard_fd >= 0 && touch_fd >= 0);
+	assert(close(keyboard_fd) == 0);
+	assert(close(touch_fd) == 0);
+	assert(unlink(keyboard_path) == 0);
+	assert(mkfifo(keyboard_path, 0600) == 0);
+	const int keyboard_read = open(keyboard_path, O_RDONLY | O_NONBLOCK);
+	assert(keyboard_read >= 0);
+
+	HidState hid;
+	hid_init(&hid, keyboard_path, "/dev/null", touch_path);
+	assert(hid_wheel(&hid, 0x0478U));
+
+	uint8_t shift_down[8] = { 0 };
+	uint8_t shift_up[8] = { 0 };
+	assert(read(keyboard_read, shift_down, sizeof(shift_down)) == (ssize_t)sizeof(shift_down));
+	assert(read(keyboard_read, shift_up, sizeof(shift_up)) == (ssize_t)sizeof(shift_up));
+	assert(shift_down[0] == 0x02 && shift_up[0] == 0);
+	const int touch_read = open(touch_path, O_RDONLY);
+	assert(touch_read >= 0);
+	uint8_t report[6] = { 0 };
+	assert(read(touch_read, report, sizeof(report)) == (ssize_t)sizeof(report));
+	assert(report[0] == 0 && report[5] == 1);
+	assert(close(keyboard_read) == 0);
+	assert(close(touch_read) == 0);
+	assert(unlink(keyboard_path) == 0);
 	assert(unlink(touch_path) == 0);
 }
 
@@ -391,6 +437,7 @@ int main(void)
 	test_hid_mapping();
 	test_hid_middle_button();
 	test_hid_extended_buttons();
+	test_hid_horizontal_wheel();
 	test_hid_text_utf8();
 	test_hid_keyboard_write_recovery();
 	test_protocol_primitives();

@@ -84,8 +84,6 @@ typedef struct
 	uint16_t bitrate;
 	uint16_t control_port;
 	uint16_t video_port;
-	bool swap_alt_command;
-	bool right_alt_as_command_space;
 	bool direct_gfx;
 } ServerConfig;
 
@@ -1425,20 +1423,7 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 	const bool raw_extended = (flags & KBD_FLAGS_EXTENDED) != 0;
 	uint8_t mapped_code = code;
 	bool mapped_extended = raw_extended;
-	const bool command_space = client->server->config.right_alt_as_command_space &&
-	                           raw_extended && (code == 0x38 || code == 0x5c);
-	if (command_space)
-	{
-		if ((flags & KBD_FLAGS_RELEASE) != 0)
-			return TRUE;
-		const uint8_t sequence[][3] = {
-			{ 0x5b, true, 0 }, { 0x39, false, 0 }, { 0x39, false, 1 }, { 0x5b, true, 1 }
-		};
-		return server_send_key_sequence(client->server, sequence,
-		                               sizeof(sequence) / sizeof(sequence[0]));
-	}
-	hid_map_scancode(code, mapped_extended, client->server->config.swap_alt_command,
-	                 &mapped_code, &mapped_extended);
+	hid_map_scancode(code, mapped_extended, false, &mapped_code, &mapped_extended);
 	if (code == 0x38 || (raw_extended && (code == 0x5b || code == 0x5c)) || code == 0x3a)
 	{
 		char message[160];
@@ -1582,7 +1567,7 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 		log_message("INFO", "RDP absolute pointer → NanoKVM agent HID 전달 확인");
 		client->pointer_input_logged = true;
 	}
-	if (wheel_ok && (flags & PTR_FLAGS_WHEEL) != 0 &&
+	if (wheel_ok && (flags & 0x0600U) != 0 &&
 	    !client->wheel_input_logged)
 	{
 		log_message("INFO", "RDP wheel → NanoKVM agent HID 전달 확인");
@@ -1628,10 +1613,10 @@ static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT1
 	                                              payload, sizeof(payload));
 	uint8_t wheel_payload[2] = { 0 };
 	protocol_write_u16(wheel_payload, flags);
-	const bool wheel_ok = (flags & PTR_FLAGS_WHEEL) == 0 ||
+	const bool wheel_ok = (flags & 0x0600U) == 0 ||
 	                      server_send_control(client->server, NANOKVM_CONTROL_WHEEL,
 	                                           wheel_payload, sizeof(wheel_payload));
-	if (wheel_ok && (flags & PTR_FLAGS_WHEEL) != 0 &&
+	if (wheel_ok && (flags & 0x0600U) != 0 &&
 	    !client->wheel_input_logged)
 	{
 		log_message("INFO", "RDP relative wheel → NanoKVM agent HID 전달 확인");
@@ -1925,7 +1910,11 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 	    !freerdp_settings_set_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled,
 	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_HasExtendedMouseEvent, TRUE) ||
-	    !freerdp_settings_set_bool(settings, FreeRDP_HasHorizontalWheel, FALSE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_HasHorizontalWheel, TRUE) ||
+	    !freerdp_settings_set_uint32(settings, FreeRDP_KeyboardLayout, 0x00000412U) ||
+	    !freerdp_settings_set_uint32(settings, FreeRDP_KeyboardType, 4) ||
+	    !freerdp_settings_set_uint32(settings, FreeRDP_KeyboardSubType, 0) ||
+	    !freerdp_settings_set_uint32(settings, FreeRDP_KeyboardFunctionKey, 12) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_HasRelativeMouseEvent, TRUE) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, server->config.width) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, server->config.height) ||
@@ -2031,8 +2020,7 @@ static void print_usage(const char* executable)
 {
 	(void)fprintf(stderr,
 	              "Usage: %s [-listen host:port] [-cert file] [-key file] [-width n] [-height n] "
-	              "[-bitrate n] [-control-port n] [-video-port n] [-swap-alt-command] "
-	              "[-right-alt-as-command-space] [-direct-gfx]\n",
+	              "[-bitrate n] [-control-port n] [-video-port n] [-direct-gfx]\n",
 	              executable);
 }
 
@@ -2091,10 +2079,6 @@ int main(int argc, char* argv[])
 			server.config.control_port = (uint16_t)strtoul(argv[++index], NULL, 10);
 		else if (strcmp(argv[index], "-video-port") == 0 && index + 1 < argc)
 			server.config.video_port = (uint16_t)strtoul(argv[++index], NULL, 10);
-		else if (strcmp(argv[index], "-swap-alt-command") == 0)
-			server.config.swap_alt_command = true;
-		else if (strcmp(argv[index], "-right-alt-as-command-space") == 0)
-			server.config.right_alt_as_command_space = true;
 		else if (strcmp(argv[index], "-direct-gfx") == 0)
 			server.config.direct_gfx = true;
 		else

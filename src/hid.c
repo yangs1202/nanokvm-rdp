@@ -11,6 +11,7 @@
 #define KBD_FLAGS_RELEASE 0x8000
 #define PTR_FLAGS_WHEEL 0x0200
 #define PTR_FLAGS_WHEEL_NEGATIVE 0x0100
+#define PTR_FLAGS_HWHEEL 0x0400
 #define PTR_FLAGS_DOWN 0x8000
 #define PTR_FLAGS_BUTTON1 0x1000
 #define PTR_FLAGS_BUTTON2 0x2000
@@ -19,9 +20,8 @@
 #define PTR_XFLAGS_BUTTON2 0x0002
 #define WHEEL_ROTATION_MASK 0x01FF
 #define HID_MOUSE_BUTTONS_MASK 0x07
-#define HID_TOUCH_BUTTONS_MASK 0x1F
-#define HID_TOUCH_XBUTTON1 0x08
-#define HID_TOUCH_XBUTTON2 0x10
+#define HID_TOUCH_BUTTONS_MASK 0x07
+#define HID_MODIFIER_LEFT_SHIFT 0x02
 
 static bool write_report(const char* path, const uint8_t* report, size_t length)
 {
@@ -83,6 +83,14 @@ void hid_map_scancode(uint8_t code, bool extended, bool swap_alt_command,
 {
 	*mapped_code = code;
 	*mapped_extended = extended;
+	/* 한국어 USB 키보드의 한/영은 HID Caps Lock(0x39)이다.
+	 * macOS RDP는 이 키를 Right Alt(E0 38)로 보낸다. */
+	if (extended && (code == 0x38 || code == 0x5c))
+	{
+		*mapped_code = 0x3a;
+		*mapped_extended = false;
+		return;
+	}
 	if (!swap_alt_command)
 		return;
 	if (code == 0x38)
@@ -151,6 +159,10 @@ bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t
 		[0x49] = 0x61, [0x4a] = 0x56, [0x4b] = 0x5c, [0x4c] = 0x5d,
 		[0x4d] = 0x5e, [0x4e] = 0x57, [0x4f] = 0x59, [0x50] = 0x5a,
 		[0x51] = 0x5b, [0x52] = 0x62, [0x53] = 0x63, [0x56] = 0x64,
+		[0x54] = 0x67, [0x59] = 0x4c, [0x5c] = 0x49, [0x5d] = 0x4d,
+		[0x5e] = 0x4b, [0x5f] = 0x4e, [0x60] = 0x4a, [0x61] = 0x4f,
+		[0x62] = 0x50, [0x63] = 0x51, [0x64] = 0x52, [0x65] = 0x4c,
+		[0x66] = 0x65,
 		[0x57] = 0x44, [0x58] = 0x45,
 	};
 
@@ -163,7 +175,8 @@ bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t
 			case 0x1c: *usage = 0x58; return true;
 			case 0x1d: *modifier = 0x10; return true;
 			case 0x35: *usage = 0x54; return true;
-			case 0x38: *modifier = 0x40; return true;
+			case 0x37: *usage = 0x46; return true;
+			case 0x38: *usage = 0x39; return true;
 			case 0x47: *usage = 0x4a; return true;
 			case 0x48: *usage = 0x52; return true;
 			case 0x49: *usage = 0x4b; return true;
@@ -175,8 +188,11 @@ bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t
 			case 0x52: *usage = 0x49; return true;
 			case 0x53: *usage = 0x4c; return true;
 			case 0x5b: *modifier = 0x08; return true;
-			case 0x5c: *modifier = 0x80; return true;
+			case 0x5c: *usage = 0x39; return true;
 			case 0x5d: *usage = 0x65; return true;
+			case 0x5e: *usage = 0x66; return true;
+			case 0x5f: *usage = 0x82; return true;
+			case 0x63: *usage = 0x81; return true;
 			default: return false;
 		}
 	}
@@ -487,7 +503,15 @@ bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
 
 static uint8_t touch_buttons(uint8_t buttons)
 {
-	return buttons & HID_TOUCH_BUTTONS_MASK;
+	return (uint8_t)(buttons & HID_TOUCH_BUTTONS_MASK);
+}
+
+static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)
+{
+	report[1] = (uint8_t)(x & 0xffU);
+	report[2] = (uint8_t)(x >> 8U);
+	report[3] = (uint8_t)(y & 0xffU);
+	report[4] = (uint8_t)(y >> 8U);
 }
 
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
@@ -514,26 +538,11 @@ bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_
 		else
 			hid->buttons &= (uint8_t)~0x04U;
 	}
-	if ((flags & PTR_XFLAGS_BUTTON1) != 0)
-	{
-		if ((flags & PTR_FLAGS_DOWN) != 0)
-			hid->buttons |= HID_TOUCH_XBUTTON1;
-		else
-			hid->buttons &= (uint8_t)~HID_TOUCH_XBUTTON1;
-	}
-	if ((flags & PTR_XFLAGS_BUTTON2) != 0)
-	{
-		if ((flags & PTR_FLAGS_DOWN) != 0)
-			hid->buttons |= HID_TOUCH_XBUTTON2;
-		else
-			hid->buttons &= (uint8_t)~HID_TOUCH_XBUTTON2;
-	}
 
 	hid->last_x = hid_scale_absolute(x, width);
 	hid->last_y = hid_scale_absolute(y, height);
-	uint8_t report[6] = { touch_buttons(hid->buttons), (uint8_t)(hid->last_x & 0xffU),
-		(uint8_t)(hid->last_x >> 8U), (uint8_t)(hid->last_y & 0xffU),
-		(uint8_t)(hid->last_y >> 8U), 0 };
+	uint8_t report[6] = { touch_buttons(hid->buttons), 0, 0, 0, 0, 0 };
+	write_touch_position(report, hid->last_x, hid->last_y);
 	return write_report(hid->touch_path, report, sizeof(report));
 }
 
@@ -552,10 +561,8 @@ bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 	return write_report(hid->mouse_path, report, sizeof(report));
 }
 
-bool hid_wheel(HidState* hid, uint16_t flags)
+static int wheel_detents(uint16_t flags)
 {
-	if ((flags & PTR_FLAGS_WHEEL) == 0)
-		return true;
 	int delta = (int)(flags & WHEEL_ROTATION_MASK);
 	if ((flags & PTR_FLAGS_WHEEL_NEGATIVE) != 0)
 		delta = -delta;
@@ -566,13 +573,34 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 		detents = 1;
 	if (detents < -1)
 		detents = -1;
-	/* HID wheel은 한 이벤트당 ±1 노치만 전달. 트랙패드의 큰 delta는 클램프하고,
-	 * 트랙패드의 연속 이벤트로 자연스럽게 여러 노치를 스크롤한다.
-	 * wheel report는 버튼/이동과 동일한 hidg2(절대 마우스, 6바이트)로 보내
-	 * hidg1/hidg2 두 마우스 디바이스의 버튼 상태 충돌을 피한다. */
-	uint8_t report[6] = { touch_buttons(hid->buttons), (uint8_t)(hid->last_x & 0xffU),
-		(uint8_t)(hid->last_x >> 8U), (uint8_t)(hid->last_y & 0xffU),
-		(uint8_t)(hid->last_y >> 8U), (uint8_t)(int8_t)detents };
+	return detents;
+}
+
+bool hid_wheel(HidState* hid, uint16_t flags)
+{
+	const bool vertical = (flags & PTR_FLAGS_WHEEL) != 0;
+	const bool horizontal = (flags & PTR_FLAGS_HWHEEL) != 0;
+	if (!vertical && !horizontal)
+		return true;
+	int detents = wheel_detents(flags);
+	/* 절대 마우스 디스크립터는 세로 휠만 있다. 가로 휠은 Shift+세로 휠로 보낸다. */
+	if (horizontal && !vertical)
+	{
+		const uint8_t saved_modifiers = hid->modifiers;
+		hid->modifiers |= HID_MODIFIER_LEFT_SHIFT;
+		if (!send_keyboard(hid))
+		{
+			hid->modifiers = saved_modifiers;
+			return false;
+		}
+		uint8_t report[6] = { touch_buttons(hid->buttons), 0, 0, 0, 0, (uint8_t)(int8_t)detents };
+		write_touch_position(report, hid->last_x, hid->last_y);
+		const bool sent = write_report(hid->touch_path, report, sizeof(report));
+		hid->modifiers = saved_modifiers;
+		return sent && send_keyboard(hid);
+	}
+	uint8_t report[6] = { touch_buttons(hid->buttons), 0, 0, 0, 0, (uint8_t)(int8_t)detents };
+	write_touch_position(report, hid->last_x, hid->last_y);
 	return write_report(hid->touch_path, report, sizeof(report));
 }
 

@@ -93,14 +93,13 @@ Useful gateway options:
 ```text
 -listen host:port  -cert file  -key file
 -width n           -height n  -bitrate n
--control-port n    -video-port n  -swap-alt-command  -right-alt-as-command-space
+-control-port n    -video-port n
 -direct-gfx
 ```
 
-`-swap-alt-command` exchanges `Alt` and `Command/GUI` scancodes, preserving left/right keys.
-The option is disabled by default; when enabled, `AltGr` also exchanges with right `Command/GUI`.
-`-right-alt-as-command-space` maps right `Alt/Option` to a synthetic `Command + Space` chord and
-takes precedence over the right-side `Alt/Command` exchange.
+The gateway advertises Korean keyboard layout `0x00000412` and forwards physical scan codes.
+Right Alt and the Korean Hangul key are sent as HID Caps Lock so the target IME can switch languages.
+Horizontal wheel events are translated to Shift plus vertical wheel because the stock absolute mouse descriptor has only a vertical wheel.
 
 Start the agent by supplying the gateway hostname or IPv4 address:
 
