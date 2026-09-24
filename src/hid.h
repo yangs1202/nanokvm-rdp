@@ -14,6 +14,9 @@ typedef struct
 	uint8_t buttons;
 	uint8_t mouse_buttons;
 	bool keyboard_desynced;
+	int8_t wheel;
+	int8_t pan;
+	uint8_t absolute_report_length;
 	char keyboard_path[128];
 	char mouse_path[128];
 	char touch_path[128];

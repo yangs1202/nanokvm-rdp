@@ -69,6 +69,10 @@
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define STATS_LOG_INTERVAL_MS 5000U
 #define KEY_ACK_TIMEOUT_MS 1000U
+#define PTR_FLAGS_WHEEL 0x0200U
+#define PTR_FLAGS_WHEEL_NEGATIVE 0x0100U
+#define PTR_FLAGS_HWHEEL 0x0400U
+#define WHEEL_ROTATION_MASK 0x01FFU
 
 typedef struct
 {
@@ -1519,6 +1523,20 @@ static BOOL on_extended_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT16 y_delta)
 {
 	Client* client = (Client*)input->context;
+	bool vertical_wheel = (flags & PTR_FLAGS_WHEEL) != 0;
+	bool horizontal_wheel = (flags & PTR_FLAGS_HWHEEL) != 0;
+	/* Windows App의 가로 스크롤은 상대 마우스의 가로 델타와 세로 휠 비트를 같이 보낸다.
+	 * 휠 비트만 보면 페이지가 세로로만 움직이므로 가로 델타를 AC Pan으로 바꾼다. */
+	if (!horizontal_wheel && vertical_wheel && x_delta != 0 && y_delta == 0)
+	{
+		flags = (uint16_t)((flags & (uint16_t)~(PTR_FLAGS_WHEEL | WHEEL_ROTATION_MASK)) |
+		                   PTR_FLAGS_HWHEEL | (uint16_t)(flags & WHEEL_ROTATION_MASK));
+		if (x_delta < 0)
+			flags |= PTR_FLAGS_WHEEL_NEGATIVE;
+		else
+			flags = (uint16_t)(flags & (uint16_t)~PTR_FLAGS_WHEEL_NEGATIVE);
+		horizontal_wheel = true;
+	}
 	if ((flags & PTR_FLAGS_BUTTON1) != 0)
 	{
 		if ((flags & PTR_FLAGS_DOWN) != 0)

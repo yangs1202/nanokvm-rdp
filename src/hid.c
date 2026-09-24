@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,6 +24,8 @@
 #define HID_TOUCH_BUTTONS_MASK 0x07
 #define HID_MODIFIER_RIGHT_ALT 0x40
 #define HID_USAGE_CAPS_LOCK 0x39
+#define HID_MODIFIER_LEFT_GUI 0x08
+#define HID_USAGE_SPACE 0x2c
 
 static bool write_report(const char* path, const uint8_t* report, size_t length)
 {
@@ -40,6 +43,42 @@ static bool write_report(const char* path, const uint8_t* report, size_t length)
 	return written == (ssize_t)length;
 }
 
+static uint8_t absolute_report_length(const char* path)
+{
+	const char* configured = getenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH");
+	if (configured && configured[0] != '\0')
+	{
+		const long value = strtol(configured, NULL, 10);
+		if (value == 6 || value == 7)
+			return (uint8_t)value;
+	}
+	if (!path || strcmp(path, "/dev/hidg2") != 0)
+		return 6;
+	const int fd = open("/sys/kernel/config/usb_gadget/g0/functions/hid.GS2/report_desc",
+	                     O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 6;
+	uint8_t descriptor[96] = { 0 };
+	const ssize_t length = read(fd, descriptor, sizeof(descriptor));
+	(void)close(fd);
+	if (length < 8)
+		return 6;
+	for (ssize_t index = 0; index + 2 < length; index++)
+	{
+		if (descriptor[index] == 0x0a && descriptor[index + 1] == 0x38 &&
+		    descriptor[index + 2] == 0x02)
+			return 7;
+	}
+	return 6;
+}
+
+static void sleep_milliseconds(long milliseconds)
+{
+	const struct timespec duration = { .tv_sec = milliseconds / 1000L,
+	                                  .tv_nsec = (milliseconds % 1000L) * 1000000L };
+	(void)nanosleep(&duration, NULL);
+}
+
 void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char* touch)
 {
 	memset(hid, 0, sizeof(*hid));
@@ -51,6 +90,7 @@ void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char
 	               touch ? touch : "/dev/hidg2");
 	hid->last_x = 0x3fff;
 	hid->last_y = 0x3fff;
+	hid->absolute_report_length = absolute_report_length(hid->touch_path);
 }
 
 static void reset_keyboard_state(HidState* hid, bool desynced)
@@ -139,13 +179,23 @@ static bool send_keyboard(HidState* hid)
 	return false;
 }
 
-static bool tap_usage(HidState* hid, uint8_t usage)
+static bool tap_modifier_usage(HidState* hid, uint8_t modifier, uint8_t usage)
 {
+	const uint8_t saved = hid->modifiers;
+	hid->modifiers = (uint8_t)(saved | modifier);
 	hid->usages[usage] = true;
 	if (!send_keyboard(hid))
 		return false;
+	sleep_milliseconds(30);
 	hid->usages[usage] = false;
-	return send_keyboard(hid);
+	if (!send_keyboard(hid))
+		return false;
+	sleep_milliseconds(20);
+	hid->modifiers = saved;
+	if (!send_keyboard(hid))
+		return false;
+	sleep_milliseconds(20);
+	return true;
 }
 
 bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t* modifier)
@@ -229,13 +279,13 @@ bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release)
 	uint8_t modifier = 0;
 	if (!hid_translate_scancode(code, extended, &usage, &modifier))
 		return true;
-	/* 한국어 USB 키보드의 한/영은 HID Caps Lock이다. macOS RDP의 Right Alt와
-	 * Right GUI를 누를 때만 탭으로 보낸다. modifier로 유지하면 IME가 전환되지 않는다. */
-	if ((extended && code == 0x38) || (extended && code == 0x5c))
+	/* 대상 macOS의 한/영은 Command+Space다. Right Alt, Right GUI, Caps Lock은
+	 * 그 조합으로 치환한다. modifier만 유지하면 IME가 바뀌지 않는다. */
+	if ((extended && (code == 0x38 || code == 0x5c)) || (!extended && code == 0x3a))
 	{
 		if (release)
 			return true;
-		return tap_usage(hid, HID_USAGE_CAPS_LOCK);
+		return tap_modifier_usage(hid, HID_MODIFIER_LEFT_GUI, HID_USAGE_SPACE);
 	}
 	if (modifier != 0)
 	{
@@ -449,25 +499,18 @@ static bool text_supported(const uint8_t* text, size_t length)
 	return true;
 }
 
-static void sleep_milliseconds(long milliseconds)
-{
-	const struct timespec duration = { .tv_sec = milliseconds / 1000L,
-	                                  .tv_nsec = (milliseconds % 1000L) * 1000000L };
-	(void)nanosleep(&duration, NULL);
-}
-
 static bool tap_text_key(HidState* hid, HidTextKey key)
 {
 	hid->modifiers = key.modifier;
 	hid->usages[key.usage] = true;
 	if (!send_keyboard(hid))
 		return false;
-	sleep_milliseconds(8);
+	sleep_milliseconds(20);
 	hid->modifiers = 0;
 	hid->usages[key.usage] = false;
 	if (!send_keyboard(hid))
 		return false;
-	sleep_milliseconds(2);
+	sleep_milliseconds(20);
 	return true;
 }
 
@@ -534,6 +577,26 @@ static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)
 	report[4] = (uint8_t)(y >> 8U);
 }
 
+static bool send_absolute(HidState* hid)
+{
+	uint8_t report[7] = { touch_buttons(hid->buttons), 0, 0, 0, 0, (uint8_t)hid->wheel,
+	                      (uint8_t)hid->pan };
+	const size_t length = hid->absolute_report_length == 7 ? 7 : 6;
+	write_touch_position(report, hid->last_x, hid->last_y);
+	if (hid->wheel == 0 && hid->pan == 0)
+		return write_report(hid->touch_path, report, length);
+	uint8_t release[7] = { 0 };
+	memcpy(release, report, length);
+	release[5] = 0;
+	release[6] = 0;
+	hid->wheel = 0;
+	hid->pan = 0;
+	uint8_t combined[14] = { 0 };
+	memcpy(combined, report, length);
+	memcpy(combined + length, release, length);
+	return write_report(hid->touch_path, combined, length * 2);
+}
+
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
 	              uint16_t flags)
 {
@@ -561,9 +624,7 @@ bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_
 
 	hid->last_x = hid_scale_absolute(x, width);
 	hid->last_y = hid_scale_absolute(y, height);
-	uint8_t report[6] = { touch_buttons(hid->buttons), 0, 0, 0, 0, 0 };
-	write_touch_position(report, hid->last_x, hid->last_y);
-	return write_report(hid->touch_path, report, sizeof(report));
+	return send_absolute(hid);
 }
 
 bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
@@ -603,17 +664,17 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 	if (!vertical && !horizontal)
 		return true;
 	int detents = wheel_detents(flags);
-	/* 이 장치의 hidg1은 버튼 3개와 휠 바이트를 가진다. 가로 휠은 그 휠 바이트로 보낸다. */
+	/* 7바이트 보고의 마지막 바이트는 AC Pan이다. 6바이트 가젯은 그 usage가 없어
+	 * 가로 휠을 세로 Wheel로 보내지 않는다. macOS 가로 부호는 RDP와 반대다. */
 	if (horizontal && !vertical)
 	{
-		if (detents == 0)
+		if (hid->absolute_report_length != 7)
 			return true;
-		const uint8_t report[4] = { hid->mouse_buttons, 0, 0, (uint8_t)(int8_t)detents };
-		return write_report(hid->mouse_path, report, sizeof(report));
+		hid->pan = (int8_t)detents;
 	}
-	uint8_t report[6] = { touch_buttons(hid->buttons), 0, 0, 0, 0, (uint8_t)(int8_t)detents };
-	write_touch_position(report, hid->last_x, hid->last_y);
-	return write_report(hid->touch_path, report, sizeof(report));
+	else
+		hid->wheel = (int8_t)detents;
+	return send_absolute(hid);
 }
 
 void hid_release_all(HidState* hid)
@@ -626,6 +687,8 @@ void hid_release_all(HidState* hid)
 	const uint8_t touch[6] = { 0, (uint8_t)(hid->last_x & 0xffU),
 		(uint8_t)(hid->last_x >> 8U), (uint8_t)(hid->last_y & 0xffU),
 		(uint8_t)(hid->last_y >> 8U), 0 };
+	hid->wheel = 0;
+	hid->pan = 0;
 	if (!write_report(hid->keyboard_path, keyboard, sizeof(keyboard)))
 		hid->keyboard_desynced = true;
 	(void)write_report(hid->mouse_path, mouse, sizeof(mouse));
