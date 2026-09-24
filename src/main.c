@@ -1565,8 +1565,9 @@ static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT1
 		else
 			client->relative_buttons &= (uint8_t)~0x04U;
 	}
-	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) != 0 ||
-	    client->relative_buttons != 0)
+	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3 |
+	              PTR_FLAGS_MOVE)) != 0 ||
+	    x_delta != 0 || y_delta != 0 || client->relative_buttons != 0)
 	{
 		char message[192];
 		(void)snprintf(message, sizeof(message),
