@@ -490,34 +490,6 @@ static bool client_cap_supports_avc420(const RDPGFX_CAPSET* cap)
 	       (cap->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) == 0;
 }
 
-static bool tile_changed(const uint8_t* previous, const uint8_t* current, uint16_t width,
-                         uint16_t left, uint16_t top, uint16_t columns, uint16_t rows)
-{
-	if (!previous)
-		return true;
-	const size_t stride = (size_t)width * 4U;
-	uint32_t changed = 0;
-	for (uint16_t row = 0; row < rows; row++)
-	{
-		const uint8_t* old_row = previous + ((size_t)(top + row) * stride) + (size_t)left * 4U;
-		const uint8_t* new_row = current + ((size_t)(top + row) * stride) + (size_t)left * 4U;
-		for (uint16_t column = 0; column < columns; column++)
-		{
-			const int blue = (int)new_row[column * 4U] - (int)old_row[column * 4U];
-			const int green = (int)new_row[column * 4U + 1U] - (int)old_row[column * 4U + 1U];
-			const int red = (int)new_row[column * 4U + 2U] - (int)old_row[column * 4U + 2U];
-			if (blue < 0) blue = -blue;
-			if (green < 0) green = -green;
-			if (red < 0) red = -red;
-			if (blue + green + red > (int)CLASSIC_PIXEL_DIFF_THRESHOLD)
-				changed++;
-			if (changed >= CLASSIC_CHANGED_PIXEL_THRESHOLD)
-				return true;
-		}
-	}
-	return false;
-}
-
 static bool client_advertises_avc444(const RDPGFX_CAPS_ADVERTISE_PDU* advertise)
 {
 	for (UINT32 index = 0; index < advertise->capsSetCount; index++)
@@ -1050,9 +1022,9 @@ static bool send_progressive_frame(Client* client, const uint8_t* bgra, size_t l
 		{
 			const uint16_t left = (uint16_t)(tile_x * 64U);
 			const uint16_t top = (uint16_t)(tile_y * 64U);
-			const uint16_t columns = (uint16_t)((left + 64U > width) ? width - left : 64U);
-			const uint16_t rows = (uint16_t)((top + 64U > height) ? height - top : 64U);
-			if (previous && !tile_changed(previous, bgra, width, left, top, columns, rows))
+			const uint16_t columns = (uint16_t)(left + 64U > width ? width - left : 64U);
+			const uint16_t rows = (uint16_t)(top + 64U > height ? height - top : 64U);
+			if (previous && !classic_tile_changed(previous, bgra, width, left, top, columns, rows))
 				continue;
 			RECTANGLE_16 rect = { .left = left, .top = top,
 				.right = (UINT16)(left + columns), .bottom = (UINT16)(top + rows) };
