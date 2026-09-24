@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -24,35 +25,94 @@
 #define HID_MOUSE_BUTTONS_MASK 0x07
 #define HID_TOUCH_BUTTONS_MASK 0x07
 #define HID_MODIFIER_RIGHT_ALT 0x40
-#define HID_USAGE_CAPS_LOCK 0x39
-#define HID_MODIFIER_LEFT_GUI 0x08
-#define HID_USAGE_SPACE 0x2c
 
-static bool write_report(const char* path, const uint8_t* report, size_t length)
+static bool is_hid_gadget(const char* path)
+{
+	return path && strncmp(path, "/dev/hidg", 9) == 0;
+}
+
+static int* hid_fd_slot(HidState* hid, const char* path)
+{
+	if (!hid || !path)
+		return NULL;
+	if (strcmp(path, hid->keyboard_path) == 0)
+		return &hid->keyboard_fd;
+	if (strcmp(path, hid->mouse_path) == 0)
+		return &hid->mouse_fd;
+	if (strcmp(path, hid->touch_path) == 0)
+		return &hid->touch_fd;
+	return NULL;
+}
+
+static int open_hid_fd(const char* path)
 {
 	const int fd = open(path, O_WRONLY | O_CLOEXEC | O_NONBLOCK);
 	if (fd < 0)
-		return false;
-	/* 장치에서 /dev/hidg1, /dev/hidg2가 일반 파일로 덮이면 버튼 해제가
-	 * 가젯이 아니라 파일에 쌓인다. 그 경로만 캐릭터 디바이스가 아니면 거절한다. */
-	if (path && strncmp(path, "/dev/hidg", 9) == 0)
+		return -1;
+	struct stat status;
+	if (fstat(fd, &status) != 0 || (is_hid_gadget(path) && !S_ISCHR(status.st_mode)))
 	{
-		struct stat status;
-		if (fstat(fd, &status) != 0 || !S_ISCHR(status.st_mode))
-		{
-			(void)close(fd);
-			return false;
-		}
+		(void)close(fd);
+		errno = ENODEV;
+		return -1;
 	}
+	return fd;
+}
+
+static int hid_fd(HidState* hid, const char* path)
+{
+	int* slot = hid_fd_slot(hid, path);
+	if (slot && *slot >= 0)
+	{
+		struct pollfd ready = { .fd = *slot, .events = POLLOUT };
+		if (poll(&ready, 1, 0) >= 0)
+			return *slot;
+		(void)close(*slot);
+		*slot = -1;
+	}
+	const int fd = open_hid_fd(path);
+	if (slot && fd >= 0)
+		*slot = fd;
+	return fd;
+}
+
+static bool write_open_report(int fd, const uint8_t* report, size_t length, bool* retryable)
+{
+	if (retryable)
+		*retryable = false;
+	if (fd < 0)
+		return false;
 	ssize_t written = -1;
 	do
 	{
 		written = write(fd, report, length);
 	} while (written < 0 && errno == EINTR);
 	const int saved_errno = errno;
-	(void)close(fd);
 	errno = saved_errno;
-	return written == (ssize_t)length;
+	if (written == (ssize_t)length)
+		return true;
+	if (retryable)
+		*retryable = saved_errno == EAGAIN || saved_errno == EWOULDBLOCK;
+	return false;
+}
+
+static bool write_hid_report(HidState* hid, const char* path, const uint8_t* report, size_t length)
+{
+	int* slot = hid_fd_slot(hid, path);
+	int fd = slot ? hid_fd(hid, path) : open_hid_fd(path);
+	bool retryable = false;
+	bool wrote = write_open_report(fd, report, length, &retryable);
+	/* EAGAIN은 가젯 큐가 찬 것이다. 디스크립터를 닫고 다시 열면 큐가 비워지고
+	 * 눌린 키 상태가 유실된다. */
+	if (!wrote && slot && fd >= 0 && !retryable)
+	{
+		(void)close(fd);
+		*slot = -1;
+		errno = EIO;
+	}
+	if (!slot && fd >= 0)
+		(void)close(fd);
+	return wrote;
 }
 
 static uint8_t absolute_report_length(const char* path)
@@ -94,6 +154,9 @@ static void sleep_milliseconds(long milliseconds)
 void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char* touch)
 {
 	memset(hid, 0, sizeof(*hid));
+	hid->keyboard_fd = -1;
+	hid->mouse_fd = -1;
+	hid->touch_fd = -1;
 	(void)snprintf(hid->keyboard_path, sizeof(hid->keyboard_path), "%s",
 	               keyboard ? keyboard : "/dev/hidg0");
 	(void)snprintf(hid->mouse_path, sizeof(hid->mouse_path), "%s",
@@ -103,6 +166,9 @@ void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char
 	hid->last_x = 0x3fff;
 	hid->last_y = 0x3fff;
 	hid->absolute_report_length = absolute_report_length(hid->touch_path);
+	hid->keyboard_fd = open_hid_fd(hid->keyboard_path);
+	hid->mouse_fd = open_hid_fd(hid->mouse_path);
+	hid->touch_fd = open_hid_fd(hid->touch_path);
 }
 
 static void reset_keyboard_state(HidState* hid, bool desynced)
@@ -175,39 +241,33 @@ static bool send_keyboard(HidState* hid)
 		if (hid->usages[usage])
 			report[index++] = (uint8_t)usage;
 	}
-	if (hid->keyboard_desynced)
+	if (write_hid_report(hid, hid->keyboard_path, report, sizeof(report)))
 	{
-		const uint8_t release[8] = { 0 };
-		if (!write_report(hid->keyboard_path, release, sizeof(release)))
-		{
-			reset_keyboard_state(hid, true);
-			return false;
-		}
 		hid->keyboard_desynced = false;
-	}
-	if (write_report(hid->keyboard_path, report, sizeof(report)))
 		return true;
-	reset_keyboard_state(hid, true);
+	}
+	/* EAGAIN은 호스트가 이전 보고를 아직 가져가지 않은 것이다. 키 상태를 지우면
+	 * 물리 키보드가 멈추므로 상태만 유지하고 다음 보고에서 다시 쓴다. */
+	if (errno == EAGAIN || errno == EWOULDBLOCK)
+	{
+		hid->keyboard_desynced = true;
+		return true;
+	}
+	hid->keyboard_desynced = true;
 	return false;
 }
 
-static bool tap_modifier_usage(HidState* hid, uint8_t modifier, uint8_t usage)
+bool hid_keyboard_pending(const HidState* hid)
 {
-	const uint8_t saved = hid->modifiers;
-	hid->modifiers = (uint8_t)(saved | modifier);
-	hid->usages[usage] = true;
-	if (!send_keyboard(hid))
-		return false;
-	sleep_milliseconds(30);
-	hid->usages[usage] = false;
-	if (!send_keyboard(hid))
-		return false;
-	sleep_milliseconds(20);
-	hid->modifiers = saved;
-	if (!send_keyboard(hid))
-		return false;
-	sleep_milliseconds(20);
-	return true;
+	return hid && hid->keyboard_desynced;
+}
+
+void hid_keyboard_flush(HidState* hid)
+{
+	if (!hid)
+		return;
+	if (hid->keyboard_desynced)
+		(void)send_keyboard(hid);
 }
 
 bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t* modifier)
@@ -291,14 +351,6 @@ bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release)
 	uint8_t modifier = 0;
 	if (!hid_translate_scancode(code, extended, &usage, &modifier))
 		return true;
-	/* 대상 macOS의 한/영은 Command+Space다. Right Alt, Right GUI, Caps Lock은
-	 * 그 조합으로 치환한다. modifier만 유지하면 IME가 바뀌지 않는다. */
-	if ((extended && (code == 0x38 || code == 0x5c)) || (!extended && code == 0x3a))
-	{
-		if (release)
-			return true;
-		return tap_modifier_usage(hid, HID_MODIFIER_LEFT_GUI, HID_USAGE_SPACE);
-	}
 	if (modifier != 0)
 	{
 		if (release)
@@ -308,6 +360,10 @@ bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release)
 	}
 	else
 		hid->usages[usage] = !release;
+	/* 가젯 큐가 찼으면 중간 보고를 더 넣지 않는다. 최신 상태는 유지하고
+	 * 다음 flush가 한 보고만 다시 쓴다. */
+	if (hid->keyboard_desynced)
+		return true;
 	return send_keyboard(hid);
 }
 
@@ -591,24 +647,21 @@ static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)
 
 static bool send_absolute(HidState* hid)
 {
-	uint8_t report[7] = { touch_buttons(hid->buttons), 0, 0, 0, 0, (uint8_t)hid->wheel,
-	                      (uint8_t)hid->pan };
+	uint8_t report[7] = { touch_buttons(hid->buttons), 0, 0, 0, 0, 0, 0 };
 	const size_t length = hid->absolute_report_length == 7 ? 7 : 6;
 	write_touch_position(report, hid->last_x, hid->last_y);
+	if (length == 7)
+		report[6] = (uint8_t)hid->pan;
+	report[5] = (uint8_t)hid->wheel;
+	if (!write_hid_report(hid, hid->touch_path, report, length))
+		return false;
 	if (hid->wheel == 0 && hid->pan == 0)
-		return write_report(hid->touch_path, report, length);
-	uint8_t release[7] = { 0 };
-	memcpy(release, report, length);
-	release[5] = 0;
-	release[6] = 0;
+		return true;
 	hid->wheel = 0;
 	hid->pan = 0;
-	/* 휠 해제는 버튼 바이트를 유지한다. 버튼이 눌린 채 휠과 해제를 한 write에
-	 * 섞으면 호스트가 리포트를 쪼개 버튼을 놓칠 수 있다. */
-	uint8_t combined[14] = { 0 };
-	memcpy(combined, report, length);
-	memcpy(combined + length, release, length);
-	return write_report(hid->touch_path, combined, length * 2);
+	report[5] = 0;
+	report[6] = 0;
+	return write_hid_report(hid, hid->touch_path, report, length);
 }
 
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
@@ -647,12 +700,12 @@ bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_
 	if (hid->buttons == previous)
 		return absolute_ok;
 	const uint8_t relative[4] = { hid->mouse_buttons, 0, 0, 0 };
-	const bool relative_ok = write_report(hid->mouse_path, relative, sizeof(relative));
+	const bool relative_ok = write_hid_report(hid, hid->mouse_path, relative, sizeof(relative));
 	if (!relative_ok || hid->buttons != 0)
 		return absolute_ok && relative_ok;
 	/* macOS는 절대 마우스 버튼이 풀려도 상대 마우스 버튼이 한 번이라도 남으면
 	 * 오른쪽 클릭을 고정한다. 해제는 상대 보고를 한 번 더 보낸다. */
-	return absolute_ok && write_report(hid->mouse_path, relative, sizeof(relative));
+	return absolute_ok && write_hid_report(hid, hid->mouse_path, relative, sizeof(relative));
 }
 
 bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
@@ -670,10 +723,11 @@ bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 	hid->mouse_buttons = next;
 	hid->buttons = next;
 	const uint8_t report[4] = { hid->mouse_buttons, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
-	const bool relative_ok = write_report(hid->mouse_path, report, sizeof(report));
+	const bool relative_ok = write_hid_report(hid, hid->mouse_path, report, sizeof(report));
 	if (!buttons_changed)
-		return relative_ok;
-	return send_absolute(hid) && relative_ok;
+		return relative_ok || errno == EAGAIN || errno == EWOULDBLOCK;
+	const bool absolute_ok = send_absolute(hid);
+	return absolute_ok || relative_ok;
 }
 
 static int wheel_detents(uint16_t flags)
@@ -724,8 +778,8 @@ void hid_release_all(HidState* hid)
 		(uint8_t)(hid->last_y >> 8U), 0 };
 	hid->wheel = 0;
 	hid->pan = 0;
-	if (!write_report(hid->keyboard_path, keyboard, sizeof(keyboard)))
+	if (!write_hid_report(hid, hid->keyboard_path, keyboard, sizeof(keyboard)))
 		hid->keyboard_desynced = true;
-	(void)write_report(hid->mouse_path, mouse, sizeof(mouse));
-	(void)write_report(hid->touch_path, touch, touch_length);
+	(void)write_hid_report(hid, hid->mouse_path, mouse, sizeof(mouse));
+	(void)write_hid_report(hid, hid->touch_path, touch, touch_length);
 }

@@ -17,6 +17,9 @@ typedef struct
 	int8_t wheel;
 	int8_t pan;
 	uint8_t absolute_report_length;
+	int keyboard_fd;
+	int mouse_fd;
+	int touch_fd;
 	char keyboard_path[128];
 	char mouse_path[128];
 	char touch_path[128];
@@ -24,6 +27,8 @@ typedef struct
 
 void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char* touch);
 bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release);
+bool hid_keyboard_pending(const HidState* hid);
+void hid_keyboard_flush(HidState* hid);
 bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length);
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
 	              uint16_t flags);

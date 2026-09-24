@@ -4,9 +4,11 @@
 #include "rtp_h264.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -139,28 +141,65 @@ static void test_hid_mapping(void)
 
 	HidState hid;
 	hid_init(&hid, keyboard_path, "/dev/null", "/dev/null");
-	assert(hid_scancode(&hid, 0x38, true, false));
-	assert(hid_scancode(&hid, 0x38, true, true));
-	assert(hid_scancode(&hid, 0x3a, false, false));
-	assert(hid_scancode(&hid, 0x3a, false, true));
-	uint8_t down[8] = { 0 };
-	uint8_t up[8] = { 0 };
-	assert(read(keyboard_read, down, sizeof(down)) == (ssize_t)sizeof(down));
-	assert(read(keyboard_read, up, sizeof(up)) == (ssize_t)sizeof(up));
-	assert(down[0] == 0x08 && down[2] == 0x2c);
-	assert(up[0] == 0x08 && up[2] == 0);
-	memset(up, 0, sizeof(up));
-	assert(read(keyboard_read, up, sizeof(up)) == (ssize_t)sizeof(up));
-	assert(up[0] == 0 && up[2] == 0);
-	assert(read(keyboard_read, down, sizeof(down)) == (ssize_t)sizeof(down));
-	assert(read(keyboard_read, up, sizeof(up)) == (ssize_t)sizeof(up));
-	assert(down[0] == 0x08 && down[2] == 0x2c);
-	assert(up[0] == 0x08 && up[2] == 0);
-	memset(up, 0, sizeof(up));
-	assert(read(keyboard_read, up, sizeof(up)) == (ssize_t)sizeof(up));
-	assert(up[0] == 0 && up[2] == 0);
+	uint8_t reports[6][8] = { { 0 } };
+	const struct
+	{
+		uint8_t code;
+		bool extended;
+		uint8_t modifier;
+		uint8_t usage;
+	} presses[] = {
+		{ 0x38, true, 0x40, 0 },
+		{ 0x3a, false, 0, 0x39 },
+		{ 0x5c, true, 0x80, 0 },
+	};
+	for (size_t press = 0; press < 3; press++)
+	{
+		assert(hid_scancode(&hid, presses[press].code, presses[press].extended, false));
+		assert(hid_scancode(&hid, presses[press].code, presses[press].extended, true));
+		for (size_t report_index = 0; report_index < 2; report_index++)
+		{
+			uint8_t* report = reports[press * 2U + report_index];
+			size_t offset = 0;
+			while (offset < 8)
+			{
+				const ssize_t result = read(keyboard_read, report + offset, 8U - offset);
+				assert(result > 0);
+				offset += (size_t)result;
+			}
+		}
+		assert(!hid_keyboard_pending(&hid));
+		assert(hid.modifiers == 0);
+		assert(reports[press * 2U][0] == presses[press].modifier);
+		assert(reports[press * 2U][2] == presses[press].usage);
+		assert(reports[press * 2U + 1U][0] == 0);
+		assert(reports[press * 2U + 1U][2] == 0);
+	}
 	assert(close(keyboard_read) == 0);
 	assert(unlink(keyboard_path) == 0);
+}
+
+static void test_hid_control_space_passthrough(void)
+{
+	HidState hid;
+	hid_init(&hid, "/dev/null", "/dev/null", "/dev/null");
+	assert(hid_scancode(&hid, 0x1d, false, false));
+	assert(hid.modifiers == 0x01);
+	assert(hid_scancode(&hid, 0x39, false, false));
+	assert(hid.modifiers == 0x01);
+	assert(hid.usages[0x2c]);
+	assert(!hid_keyboard_pending(&hid));
+	assert(hid_scancode(&hid, 0x39, false, true));
+	assert(!hid.usages[0x2c]);
+	assert(hid.modifiers == 0x01);
+	assert(hid_scancode(&hid, 0x1d, false, true));
+	assert(hid.modifiers == 0);
+	assert(hid_scancode(&hid, 0x20, false, false));
+	assert(hid.usages[0x07]);
+	assert(hid_scancode(&hid, 0x20, false, true));
+	assert(!hid.usages[0x07]);
+	assert(hid.modifiers == 0);
+	assert(!hid_keyboard_pending(&hid));
 }
 
 static void test_hid_middle_button(void)
@@ -187,7 +226,9 @@ static void test_hid_middle_button(void)
 	read_fd = open(touch_path, O_RDONLY);
 	assert(read_fd >= 0);
 	memset(report, 0, sizeof(report));
-	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
+	uint8_t reports[3][6] = { { 0 } };
+	assert(read(read_fd, reports, sizeof(reports)) == (ssize_t)sizeof(reports));
+	memcpy(report, reports[2], sizeof(report));
 	assert(report[0] == 0x04);
 	assert(close(read_fd) == 0);
 	assert(unlink(touch_path) == 0);
@@ -216,12 +257,10 @@ static void test_hid_extended_buttons(void)
 	assert(hid_wheel(&hid, 0x0278U));
 	read_fd = open(touch_path, O_RDONLY);
 	assert(read_fd >= 0);
-	uint8_t wheel_report[6] = { 0 };
+	uint8_t wheel_report[18] = { 0 };
 	assert(read(read_fd, wheel_report, sizeof(wheel_report)) == (ssize_t)sizeof(wheel_report));
-	assert(wheel_report[0] == 0x00 && wheel_report[5] == 1);
-	memset(wheel_report, 0, sizeof(wheel_report));
-	assert(read(read_fd, wheel_report, sizeof(wheel_report)) == (ssize_t)sizeof(wheel_report));
-	assert(wheel_report[5] == 0);
+	assert(wheel_report[6] == 0x00 && wheel_report[11] == 1);
+	assert(wheel_report[17] == 0);
 	assert(close(read_fd) == 0);
 
 	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0));
@@ -278,11 +317,11 @@ static void test_hid_horizontal_wheel(void)
 	assert(hid_wheel(&hid, 0x0578U));
 	read_fd = open(touch_path, O_RDONLY);
 	assert(read_fd >= 0);
-	memset(report, 0, sizeof(report));
-	got = read(read_fd, report, sizeof(report));
-	assert(got == 14);
-	assert(report[0] == 0 && report[5] == 0 && report[6] == 0xff);
-	assert(report[12] == 0 && report[13] == 0);
+	uint8_t second[28] = { 0 };
+	got = read(read_fd, second, sizeof(second));
+	assert(got == (ssize_t)sizeof(second));
+	assert(second[14] == 0 && second[19] == 0 && second[20] == 0xff);
+	assert(second[26] == 0 && second[27] == 0);
 	assert(close(read_fd) == 0);
 	assert(unlink(touch_path) == 0);
 	assert(unsetenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH") == 0);
@@ -324,7 +363,7 @@ static void test_hid_release_all_absolute_length(void)
 	assert(report[3] == 0x78 && report[4] == 0x56);
 	assert(report[5] == 0 && report[6] == 0);
 	uint8_t extra = 0xff;
-	assert(read(touch_read, &extra, 1) == 0);
+	assert(read(touch_read, &extra, 1) == -1);
 	assert(hid.buttons == 0 && hid.mouse_buttons == 0);
 	uint8_t keyboard[8] = { 0xff };
 	assert(read(keyboard_read, keyboard, sizeof(keyboard)) == (ssize_t)sizeof(keyboard));
@@ -518,37 +557,52 @@ static void test_hid_keyboard_write_recovery(void)
 	assert(unlink(keyboard_path) == 0);
 	assert(mkfifo(keyboard_path, 0600) == 0);
 
-	HidState hid;
-	hid_init(&hid, keyboard_path, "/dev/null", "/dev/null");
-	assert(!hid_scancode(&hid, 0x1e, false, false));
-
 	const int read_fd = open(keyboard_path, O_RDONLY | O_NONBLOCK);
 	assert(read_fd >= 0);
-	assert(hid_scancode(&hid, 0x30, false, false));
 
-	uint8_t release_report[8] = { 0 };
+	HidState hid;
+	hid_init(&hid, keyboard_path, "/dev/null", "/dev/null");
+	assert(hid.keyboard_fd >= 0);
+	assert(close(hid.keyboard_fd) == 0);
+	assert(close(read_fd) == 0);
+	hid.keyboard_fd = -1;
+	assert(!hid_scancode(&hid, 0x1e, false, false));
+	assert(hid.keyboard_fd < 0);
+	assert(hid.usages[0x04] == true);
+
+	const int recovered_read = open(keyboard_path, O_RDONLY | O_NONBLOCK);
+	assert(recovered_read >= 0);
+	assert(hid_scancode(&hid, 0x30, false, false));
+	assert(hid.keyboard_desynced == true);
+	hid_keyboard_flush(&hid);
+	assert(hid.keyboard_desynced == false);
+	assert(hid.usages[0x04] == true);
+	assert(hid.usages[0x05] == true);
 	uint8_t key_report[8] = { 0 };
 	size_t offset = 0;
-	while (offset < sizeof(release_report))
-	{
-		const ssize_t result = read(read_fd, release_report + offset,
-		                            sizeof(release_report) - offset);
-		assert(result > 0);
-		offset += (size_t)result;
-	}
-	offset = 0;
 	while (offset < sizeof(key_report))
 	{
-		const ssize_t result = read(read_fd, key_report + offset, sizeof(key_report) - offset);
+		const ssize_t result = read(recovered_read, key_report + offset, sizeof(key_report) - offset);
 		assert(result > 0);
 		offset += (size_t)result;
 	}
+	/* 리더가 생기기 전 실패는 키를 지우지 않는다. 다음 성공 보고는 그때의 상태다. */
+	assert(key_report[0] == 0 && key_report[2] == 0x04 && key_report[3] == 0x05);
+	assert(hid.keyboard_desynced == false);
+	assert(hid.usages[0x04] == true);
+	assert(hid.usages[0x05] == true);
 
-	assert(release_report[0] == 0 && release_report[2] == 0);
-	assert(key_report[0] == 0 && key_report[2] == 0x05);
-	assert(key_report[3] == 0);
-
-	assert(close(read_fd) == 0);
+	assert(close(hid.keyboard_fd) == 0);
+	hid.keyboard_fd = open("/dev/full", O_WRONLY | O_CLOEXEC | O_NONBLOCK);
+	if (hid.keyboard_fd >= 0)
+	{
+		assert(hid_scancode(&hid, 0x1e, false, true));
+		assert(hid.keyboard_desynced == true);
+		assert(hid.usages[0x04] == false);
+		assert(hid.usages[0x05] == true);
+		assert(close(hid.keyboard_fd) == 0);
+	}
+	assert(close(recovered_read) == 0);
 	assert(unlink(keyboard_path) == 0);
 }
 
@@ -651,6 +705,7 @@ int main(void)
 {
 	test_h264_annexb();
 	test_hid_mapping();
+	test_hid_control_space_passthrough();
 	test_hid_middle_button();
 	test_hid_extended_buttons();
 	test_hid_horizontal_wheel();

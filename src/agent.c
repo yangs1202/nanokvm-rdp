@@ -539,6 +539,8 @@ int main(int argc, char* argv[])
 					break;
 			}
 		}
+		if (agent.control_fd >= 0 && hid_keyboard_pending(&agent.hid))
+			hid_keyboard_flush(&agent.hid);
 		const uint64_t now = monotonic_milliseconds();
 		if (now - agent.last_pong_at > HEARTBEAT_TIMEOUT_MS ||
 		    (now - agent.last_ping_at >= HEARTBEAT_INTERVAL_MS &&
