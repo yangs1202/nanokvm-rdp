@@ -95,10 +95,12 @@ Useful gateway options:
 -width n           -height n  -bitrate n
 -control-port n    -video-port n
 -direct-gfx
+-swap-alt-command
 ```
 
 The gateway advertises Korean keyboard layout `0x00000412` and forwards physical scan codes.
 Right Alt, Right GUI, and Caps Lock are tapped as Command+Space so the target macOS input source can switch languages.
+Pass `-swap-alt-command` to exchange Alt and Command before that mapping: Left/Right Alt become Left/Right Command, and Left/Right Command become Left/Right Alt.
 The absolute mouse carries the left, right, and middle buttons plus the vertical wheel. Horizontal wheel events use the absolute report AC Pan byte.
 
 Start the agent by supplying the gateway hostname or IPv4 address:

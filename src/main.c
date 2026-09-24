@@ -89,6 +89,7 @@ typedef struct
 	uint16_t control_port;
 	uint16_t video_port;
 	bool direct_gfx;
+	bool swap_alt_command;
 } ServerConfig;
 
 typedef struct Server Server;
@@ -1363,7 +1364,8 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 	const bool raw_extended = (flags & KBD_FLAGS_EXTENDED) != 0;
 	uint8_t mapped_code = code;
 	bool mapped_extended = raw_extended;
-	hid_map_scancode(code, mapped_extended, false, &mapped_code, &mapped_extended);
+	hid_map_scancode(code, mapped_extended, client->server->config.swap_alt_command,
+	                 &mapped_code, &mapped_extended);
 	if (code == 0x38 || (raw_extended && (code == 0x5b || code == 0x5c)) || code == 0x3a)
 	{
 		char message[160];
@@ -1973,7 +1975,8 @@ static void print_usage(const char* executable)
 {
 	(void)fprintf(stderr,
 	              "Usage: %s [-listen host:port] [-cert file] [-key file] [-width n] [-height n] "
-	              "[-bitrate n] [-control-port n] [-video-port n] [-direct-gfx]\n",
+	              "[-bitrate n] [-control-port n] [-video-port n] [-direct-gfx] "
+	              "[-swap-alt-command]\n",
 	              executable);
 }
 
@@ -2034,6 +2037,8 @@ int main(int argc, char* argv[])
 			server.config.video_port = (uint16_t)strtoul(argv[++index], NULL, 10);
 		else if (strcmp(argv[index], "-direct-gfx") == 0)
 			server.config.direct_gfx = true;
+		else if (strcmp(argv[index], "-swap-alt-command") == 0)
+			server.config.swap_alt_command = true;
 		else
 		{
 			print_usage(argv[0]);
