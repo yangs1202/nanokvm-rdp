@@ -346,6 +346,13 @@ static void test_hid_right_button_release(void)
 	assert(close(mouse_fd) == 0);
 	assert(close(touch_fd) == 0);
 	assert(setenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH", "7", 1) == 0);
+	assert(unlink(mouse_path) == 0);
+	assert(unlink(touch_path) == 0);
+	assert(mkfifo(mouse_path, 0600) == 0);
+	assert(mkfifo(touch_path, 0600) == 0);
+	const int mouse_read = open(mouse_path, O_RDONLY | O_NONBLOCK);
+	const int touch_read = open(touch_path, O_RDONLY | O_NONBLOCK);
+	assert(mouse_read >= 0 && touch_read >= 0);
 
 	HidState hid;
 	hid_init(&hid, "/dev/null", mouse_path, touch_path);
@@ -353,21 +360,103 @@ static void test_hid_right_button_release(void)
 
 	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xa000U));
 	assert(hid.buttons == 0x02 && hid.mouse_buttons == 0x02);
+	uint8_t touch[7] = { 0 };
+	uint8_t mouse[4] = { 0 };
+	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
+	assert(touch[0] == 0x02);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0x02);
 	assert(hid_relative(&hid, 0, 0, 0));
 	assert(hid.buttons == 0 && hid.mouse_buttons == 0);
+	memset(touch, 0xff, sizeof(touch));
+	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
+	assert(touch[0] == 0);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0);
 
 	assert(hid_relative(&hid, 3, -2, 0x02));
 	assert(hid.buttons == 0x02 && hid.mouse_buttons == 0x02);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0x02);
+	memset(touch, 0xff, sizeof(touch));
+	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
+	assert(touch[0] == 0x02);
 	assert(hid_absolute(&hid, 120, 220, 1920, 1080, 0x2000U));
 	assert(hid.buttons == 0 && hid.mouse_buttons == 0);
+	memset(touch, 0xff, sizeof(touch));
+	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
+	assert(touch[0] == 0);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0);
 
 	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xa000U));
+	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
+	assert(touch[0] == 0x02);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0x02);
 	hid_release_all(&hid);
 	assert(hid.buttons == 0 && hid.mouse_buttons == 0 && hid.wheel == 0 && hid.pan == 0);
+	memset(touch, 0xff, sizeof(touch));
+	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
+	assert(touch[0] == 0 && touch[6] == 0);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0);
+	assert(close(mouse_read) == 0);
+	assert(close(touch_read) == 0);
 
 	assert(unlink(mouse_path) == 0);
 	assert(unlink(touch_path) == 0);
 	assert(unsetenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH") == 0);
+}
+
+static void test_hid_right_button_release_six_byte(void)
+{
+	char mouse_path[] = "/tmp/nanokvm-rdp-mouse-right6-XXXXXX";
+	char touch_path[] = "/tmp/nanokvm-rdp-touch-right6-XXXXXX";
+	const int mouse_fd = mkstemp(mouse_path);
+	const int touch_fd = mkstemp(touch_path);
+	assert(mouse_fd >= 0 && touch_fd >= 0);
+	assert(close(mouse_fd) == 0);
+	assert(close(touch_fd) == 0);
+	assert(unlink(mouse_path) == 0);
+	assert(unlink(touch_path) == 0);
+	assert(mkfifo(mouse_path, 0600) == 0);
+	assert(mkfifo(touch_path, 0600) == 0);
+	const int mouse_read = open(mouse_path, O_RDONLY | O_NONBLOCK);
+	const int touch_read = open(touch_path, O_RDONLY | O_NONBLOCK);
+	assert(mouse_read >= 0 && touch_read >= 0);
+
+	HidState hid;
+	hid_init(&hid, "/dev/null", mouse_path, touch_path);
+	assert(hid.absolute_report_length == 6);
+
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xa000U));
+	uint8_t touch[6] = { 0 };
+	uint8_t mouse[4] = { 0 };
+	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
+	assert(touch[0] == 0x02 && touch[5] == 0);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0x02 && mouse[1] == 0 && mouse[2] == 0);
+
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0x2000U));
+	assert(hid.buttons == 0 && hid.mouse_buttons == 0);
+	memset(touch, 0xff, sizeof(touch));
+	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
+	assert(touch[0] == 0 && touch[5] == 0);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0 && mouse[1] == 0 && mouse[2] == 0 && mouse[3] == 0);
+
+	uint8_t extra = 0xff;
+	assert(read(touch_read, &extra, 1) <= 0);
+	assert(read(mouse_read, &extra, 1) <= 0);
+	assert(close(mouse_read) == 0);
+	assert(close(touch_read) == 0);
+	assert(unlink(mouse_path) == 0);
+	assert(unlink(touch_path) == 0);
 }
 
 static void test_hid_text_utf8(void)
@@ -567,6 +656,7 @@ int main(void)
 	test_hid_horizontal_wheel();
 	test_hid_release_all_absolute_length();
 	test_hid_right_button_release();
+	test_hid_right_button_release_six_byte();
 	test_hid_text_utf8();
 	test_hid_keyboard_write_recovery();
 	test_protocol_primitives();

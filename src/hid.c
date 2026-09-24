@@ -603,6 +603,8 @@ static bool send_absolute(HidState* hid)
 	release[6] = 0;
 	hid->wheel = 0;
 	hid->pan = 0;
+	/* 휠 해제는 버튼 바이트를 유지한다. 버튼이 눌린 채 휠과 해제를 한 write에
+	 * 섞으면 호스트가 리포트를 쪼개 버튼을 놓칠 수 있다. */
 	uint8_t combined[14] = { 0 };
 	memcpy(combined, report, length);
 	memcpy(combined + length, release, length);
@@ -646,7 +648,11 @@ bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_
 		return absolute_ok;
 	const uint8_t relative[4] = { hid->mouse_buttons, 0, 0, 0 };
 	const bool relative_ok = write_report(hid->mouse_path, relative, sizeof(relative));
-	return absolute_ok && relative_ok;
+	if (!relative_ok || hid->buttons != 0)
+		return absolute_ok && relative_ok;
+	/* macOS는 절대 마우스 버튼이 풀려도 상대 마우스 버튼이 한 번이라도 남으면
+	 * 오른쪽 클릭을 고정한다. 해제는 상대 보고를 한 번 더 보낸다. */
+	return absolute_ok && write_report(hid->mouse_path, relative, sizeof(relative));
 }
 
 bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
