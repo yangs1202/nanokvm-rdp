@@ -811,11 +811,16 @@ bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 		y = -127;
 	const uint8_t next = buttons & HID_MOUSE_BUTTONS_MASK;
 	const bool buttons_changed = hid->mouse_buttons != next || hid->buttons != next;
-	hid->mouse_buttons = next;
-	hid->buttons = next;
-	if (buttons_changed)
-		note_button_change(hid);
-	const uint8_t report[4] = { hid->mouse_buttons, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
+	/* 상대 이동은 버튼 마스크가 0으로 들어온다. 절대 포인터에 남은 버튼을
+	 * 그 값으로 덮으면 오른쪽 클릭 해제가 이동 보고에 묻힌다. */
+	if (next != 0 || hid->mouse_buttons != 0)
+	{
+		hid->mouse_buttons = next;
+		hid->buttons = next;
+		if (buttons_changed)
+			note_button_change(hid);
+	}
+	const uint8_t report[4] = { next, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
 	const bool relative_ok = write_hid_report(hid, hid->mouse_path, report, sizeof(report));
 	if (!buttons_changed)
 		return relative_ok || errno == EAGAIN || errno == EWOULDBLOCK;
