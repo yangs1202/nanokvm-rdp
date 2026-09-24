@@ -488,6 +488,21 @@ static bool client_cap_supports_avc420(const RDPGFX_CAPSET* cap)
 	       (cap->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) == 0;
 }
 
+static bool client_advertises_avc444(const RDPGFX_CAPS_ADVERTISE_PDU* advertise)
+{
+	for (UINT32 index = 0; index < advertise->capsSetCount; index++)
+	{
+		const RDPGFX_CAPSET* current = &advertise->capsSets[index];
+		if (current->version < RDPGFX_CAPVERSION_10)
+			continue;
+		if ((current->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) != 0)
+			continue;
+		if ((current->flags & RDPGFX_CAPS_FLAG_AVC_THINCLIENT) != 0)
+			return true;
+	}
+	return false;
+}
+
 static bool client_select_gfx_cap(const RDPGFX_CAPS_ADVERTISE_PDU* advertise,
 	                              RDPGFX_CAPSET* selected, bool* use_avc420)
 {
@@ -497,6 +512,10 @@ static bool client_select_gfx_cap(const RDPGFX_CAPS_ADVERTISE_PDU* advertise,
 		RDPGFX_CAPVERSION_102, RDPGFX_CAPVERSION_101, RDPGFX_CAPVERSION_10,
 		RDPGFX_CAPVERSION_81, RDPGFX_CAPVERSION_8
 	};
+	/* Windows App on iOS advertises AVC420, then closes the graphics channel on
+	 * the first hardware H.264 frame. AVC444 clients, including desktop Windows
+	 * App, keep the passthrough path. */
+	const bool allow_avc420 = client_advertises_avc444(advertise);
 
 	for (size_t pass = 0; pass < 2; pass++)
 	{
@@ -507,7 +526,7 @@ static bool client_select_gfx_cap(const RDPGFX_CAPS_ADVERTISE_PDU* advertise,
 				const RDPGFX_CAPSET* current = &advertise->capsSets[index];
 				if (current->version != preferred_versions[version])
 					continue;
-				const bool avc420 = client_cap_supports_avc420(current);
+				const bool avc420 = allow_avc420 && client_cap_supports_avc420(current);
 				if (pass == 0 && !avc420)
 					continue;
 				*selected = *current;
