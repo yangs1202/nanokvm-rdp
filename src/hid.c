@@ -26,6 +26,13 @@
 #define HID_TOUCH_BUTTONS_MASK 0x07
 #define HID_MODIFIER_RIGHT_ALT 0x40
 
+/* hidg2는 버튼 1,2,3,4,5 순서다. 상대 마우스의 오른쪽 버튼 비트 0x02를
+ * 그대로 쓰면 절대 포인터의 Button 2가 된다. */
+static uint8_t absolute_buttons(uint8_t buttons)
+{
+	return (uint8_t)((buttons & 0x01U) | ((buttons & 0x02U) << 1U) | ((buttons & 0x04U) >> 1U));
+}
+
 static bool is_hid_gadget(const char* path)
 {
 	return path && strncmp(path, "/dev/hidg", 9) == 0;
@@ -715,7 +722,7 @@ bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
 
 static uint8_t touch_buttons(uint8_t buttons)
 {
-	return (uint8_t)(buttons & HID_TOUCH_BUTTONS_MASK);
+	return absolute_buttons(buttons);
 }
 
 static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)

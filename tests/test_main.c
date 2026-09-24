@@ -217,7 +217,7 @@ static void test_hid_middle_button(void)
 	assert(read_fd >= 0);
 	uint8_t report[6] = { 0 };
 	assert(read(read_fd, report, sizeof(report)) == (ssize_t)sizeof(report));
-	assert(report[0] == 0x02);
+	assert(report[0] == 0x04);
 	assert(close(read_fd) == 0);
 
 	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0x2000U));
@@ -229,7 +229,7 @@ static void test_hid_middle_button(void)
 	uint8_t reports[3][6] = { { 0 } };
 	assert(read(read_fd, reports, sizeof(reports)) == (ssize_t)sizeof(reports));
 	memcpy(report, reports[2], sizeof(report));
-	assert(report[0] == 0x04);
+	assert(report[0] == 0x02);
 	assert(close(read_fd) == 0);
 	assert(unlink(touch_path) == 0);
 }
@@ -402,7 +402,7 @@ static void test_hid_right_button_release(void)
 	uint8_t touch[7] = { 0 };
 	uint8_t mouse[4] = { 0 };
 	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
-	assert(touch[0] == 0x02);
+	assert(touch[0] == 0x04);
 	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
 	assert(mouse[0] == 0x02);
 	assert(hid_relative(&hid, 0, 0, 0));
@@ -419,7 +419,7 @@ static void test_hid_right_button_release(void)
 	assert(mouse[0] == 0x02);
 	memset(touch, 0xff, sizeof(touch));
 	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
-	assert(touch[0] == 0x02);
+	assert(touch[0] == 0x04);
 	assert(hid_absolute(&hid, 120, 220, 1920, 1080, 0x2000U));
 	assert(hid.buttons == 0 && hid.mouse_buttons == 0);
 	memset(touch, 0xff, sizeof(touch));
@@ -432,7 +432,7 @@ static void test_hid_right_button_release(void)
 
 	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xa000U));
 	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
-	assert(touch[0] == 0x02);
+	assert(touch[0] == 0x04);
 	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
 	assert(mouse[0] == 0x02);
 	hid_release_all(&hid);
@@ -520,7 +520,7 @@ static void test_hid_right_button_release_six_byte(void)
 	uint8_t touch[6] = { 0 };
 	uint8_t mouse[4] = { 0 };
 	assert(read(touch_read, touch, sizeof(touch)) == (ssize_t)sizeof(touch));
-	assert(touch[0] == 0x02 && touch[5] == 0);
+	assert(touch[0] == 0x04 && touch[5] == 0);
 	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
 	assert(mouse[0] == 0x02 && mouse[1] == 0 && mouse[2] == 0);
 
