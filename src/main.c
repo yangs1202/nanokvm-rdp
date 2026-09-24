@@ -1022,8 +1022,8 @@ static bool send_progressive_frame(Client* client, const uint8_t* bgra, size_t l
 		{
 			const uint16_t left = (uint16_t)(tile_x * 64U);
 			const uint16_t top = (uint16_t)(tile_y * 64U);
-			const uint16_t columns = (uint16_t)(left + 64U > width ? width - left : 64U);
-			const uint16_t rows = (uint16_t)(top + 64U > height ? height - top : 64U);
+			const uint16_t columns = (uint16_t)(left + 64U > width ? (uint16_t)(width - left) : 64U);
+			const uint16_t rows = (uint16_t)(top + 64U > height ? (uint16_t)(height - top) : 64U);
 			if (previous && !classic_tile_changed(previous, bgra, width, left, top, columns, rows))
 				continue;
 			RECTANGLE_16 rect = { .left = left, .top = top,
