@@ -41,6 +41,8 @@ static int* hid_fd_slot(HidState* hid, const char* path)
 		return &hid->mouse_fd;
 	if (strcmp(path, hid->touch_path) == 0)
 		return &hid->touch_fd;
+	if (hid->paste_path[0] != '\0' && strcmp(path, hid->paste_path) == 0)
+		return &hid->paste_fd;
 	return NULL;
 }
 
@@ -157,18 +159,30 @@ void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char
 	hid->keyboard_fd = -1;
 	hid->mouse_fd = -1;
 	hid->touch_fd = -1;
+	hid->paste_fd = -1;
 	(void)snprintf(hid->keyboard_path, sizeof(hid->keyboard_path), "%s",
 	               keyboard ? keyboard : "/dev/hidg0");
 	(void)snprintf(hid->mouse_path, sizeof(hid->mouse_path), "%s",
 	               mouse ? mouse : "/dev/hidg1");
 	(void)snprintf(hid->touch_path, sizeof(hid->touch_path), "%s",
 	               touch ? touch : "/dev/hidg2");
+	(void)snprintf(hid->paste_path, sizeof(hid->paste_path), "%s.paste", hid->keyboard_path);
 	hid->last_x = 0x3fff;
 	hid->last_y = 0x3fff;
 	hid->absolute_report_length = absolute_report_length(hid->touch_path);
 	hid->keyboard_fd = open_hid_fd(hid->keyboard_path);
 	hid->mouse_fd = open_hid_fd(hid->mouse_path);
 	hid->touch_fd = open_hid_fd(hid->touch_path);
+	hid->paste_fd = open_hid_fd(hid->paste_path);
+}
+
+static void note_button_change(HidState* hid)
+{
+	struct timespec now = { 0 };
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		hid->buttons_changed_at = 0;
+	else
+		hid->buttons_changed_at = (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 }
 
 static void reset_keyboard_state(HidState* hid, bool desynced)
@@ -549,24 +563,6 @@ static bool utf8_decode(const uint8_t* text, size_t length, size_t* offset, uint
 	return false;
 }
 
-static bool text_supported(const uint8_t* text, size_t length)
-{
-	for (size_t offset = 0; offset < length;)
-	{
-		uint32_t codepoint = 0;
-		HidTextKey key = { 0 };
-		const char* lead = NULL;
-		const char* vowel = NULL;
-		const char* trail = NULL;
-		if (!utf8_decode(text, length, &offset, &codepoint) ||
-		    !((codepoint != 0 && codepoint <= 0x7fU && ascii_to_hid((uint8_t)codepoint, &key)) ||
-		      codepoint_to_hangul_sequences(codepoint, &lead, &vowel, &trail) ||
-		      hangul_jamo_sequence(codepoint) != NULL))
-			return false;
-	}
-	return true;
-}
-
 static bool tap_text_key(HidState* hid, HidTextKey key)
 {
 	hid->modifiers = key.modifier;
@@ -610,9 +606,85 @@ static bool type_codepoint(HidState* hid, uint32_t codepoint)
 	return sequence && type_ascii_sequence(hid, sequence);
 }
 
+static bool utf8_encode(uint32_t codepoint, uint8_t out[4], size_t* length)
+{
+	if (codepoint > 0x10ffffU || (codepoint >= 0xd800U && codepoint <= 0xdfffU))
+		return false;
+	if (codepoint <= 0x7fU)
+	{
+		out[0] = (uint8_t)codepoint;
+		*length = 1;
+	}
+	else if (codepoint <= 0x7ffU)
+	{
+		out[0] = (uint8_t)(0xc0U | (codepoint >> 6U));
+		out[1] = (uint8_t)(0x80U | (codepoint & 0x3fU));
+		*length = 2;
+	}
+	else if (codepoint <= 0xffffU)
+	{
+		out[0] = (uint8_t)(0xe0U | (codepoint >> 12U));
+		out[1] = (uint8_t)(0x80U | ((codepoint >> 6U) & 0x3fU));
+		out[2] = (uint8_t)(0x80U | (codepoint & 0x3fU));
+		*length = 3;
+	}
+	else
+	{
+		out[0] = (uint8_t)(0xf0U | (codepoint >> 18U));
+		out[1] = (uint8_t)(0x80U | ((codepoint >> 12U) & 0x3fU));
+		out[2] = (uint8_t)(0x80U | ((codepoint >> 6U) & 0x3fU));
+		out[3] = (uint8_t)(0x80U | (codepoint & 0x3fU));
+		*length = 4;
+	}
+	return true;
+}
+
+/* 두벌식으로 칠 수 없는 문자는 대상 macOS 클립보드에 넣고 Command+V로 붙인다.
+ * 페이로드는 osascript가 UTF-8로 읽는 quoted form이다. */
+static bool paste_codepoint(HidState* hid, uint32_t codepoint)
+{
+	uint8_t encoded[4] = { 0 };
+	size_t encoded_length = 0;
+	if (hid->paste_fd < 0 || !utf8_encode(codepoint, encoded, &encoded_length))
+		return false;
+	uint8_t payload[32] = { 0 };
+	size_t length = 0;
+	payload[length++] = '\'';
+	for (size_t index = 0; index < encoded_length; index++)
+	{
+		const uint8_t byte = encoded[index];
+		if (byte == '\'' || byte == '\\')
+		{
+			if (length + 2U >= sizeof(payload))
+				return false;
+			payload[length++] = '\\';
+		}
+		else if (length + 1U >= sizeof(payload))
+			return false;
+		payload[length++] = byte;
+	}
+	if (length + 2U > sizeof(payload))
+		return false;
+	payload[length++] = '\'';
+	payload[length++] = '\n';
+	if (!write_hid_report(hid, hid->paste_path, payload, length))
+		return false;
+
+	const uint8_t saved = hid->modifiers;
+	memset(hid->usages, 0, sizeof(hid->usages));
+	hid->modifiers = 0x08;
+	hid->usages[0x19] = true;
+	if (!send_keyboard(hid))
+		return false;
+	sleep_milliseconds(30);
+	hid->usages[0x19] = false;
+	hid->modifiers = saved;
+	return send_keyboard(hid);
+}
+
 bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
 {
-	if (!hid || !text || length == 0 || !text_supported(text, length))
+	if (!hid || !text || length == 0)
 		return false;
 
 	reset_keyboard_state(hid, false);
@@ -622,7 +694,16 @@ bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
 	for (size_t offset = 0; offset < length;)
 	{
 		uint32_t codepoint = 0;
-		if (!utf8_decode(text, length, &offset, &codepoint) || !type_codepoint(hid, codepoint))
+		if (!utf8_decode(text, length, &offset, &codepoint))
+		{
+			reset_keyboard_state(hid, false);
+			(void)send_keyboard(hid);
+			return false;
+		}
+		if (type_codepoint(hid, codepoint))
+			continue;
+		if (paste_codepoint(hid, codepoint))
+			continue;
 		{
 			reset_keyboard_state(hid, false);
 			(void)send_keyboard(hid);
@@ -692,7 +773,10 @@ bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_
 	/* Windows App은 버튼 down을 절대 포인터로, release를 상대 포인터로 보낸다.
 	 * 절대 버튼이 바뀌면 상대 버튼도 같은 값으로 맞춰 한쪽만 눌린 채 남지 않게 한다. */
 	if (hid->buttons != previous)
+	{
 		hid->mouse_buttons = hid->buttons;
+		note_button_change(hid);
+	}
 
 	hid->last_x = hid_scale_absolute(x, width);
 	hid->last_y = hid_scale_absolute(y, height);
@@ -722,6 +806,8 @@ bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 	const bool buttons_changed = hid->mouse_buttons != next || hid->buttons != next;
 	hid->mouse_buttons = next;
 	hid->buttons = next;
+	if (buttons_changed)
+		note_button_change(hid);
 	const uint8_t report[4] = { hid->mouse_buttons, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
 	const bool relative_ok = write_hid_report(hid, hid->mouse_path, report, sizeof(report));
 	if (!buttons_changed)
@@ -765,11 +851,34 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 	return send_absolute(hid);
 }
 
+void hid_release_stuck_buttons(HidState* hid, uint64_t now_ms)
+{
+	if (!hid || (hid->buttons == 0 && hid->mouse_buttons == 0))
+		return;
+	if (hid->buttons_changed_at == 0 || now_ms < hid->buttons_changed_at ||
+	    now_ms - hid->buttons_changed_at < HID_BUTTON_STUCK_TIMEOUT_MS)
+		return;
+	hid->buttons = 0;
+	hid->mouse_buttons = 0;
+	hid->wheel = 0;
+	hid->pan = 0;
+	note_button_change(hid);
+	const uint8_t mouse[4] = { 0 };
+	const size_t touch_length = hid->absolute_report_length == 7 ? 7 : 6;
+	const uint8_t touch[7] = { 0, (uint8_t)(hid->last_x & 0xffU),
+		(uint8_t)(hid->last_x >> 8U), (uint8_t)(hid->last_y & 0xffU),
+		(uint8_t)(hid->last_y >> 8U), 0 };
+	(void)write_hid_report(hid, hid->mouse_path, mouse, sizeof(mouse));
+	(void)write_hid_report(hid, hid->mouse_path, mouse, sizeof(mouse));
+	(void)write_hid_report(hid, hid->touch_path, touch, touch_length);
+}
+
 void hid_release_all(HidState* hid)
 {
 	reset_keyboard_state(hid, false);
 	hid->buttons = 0;
 	hid->mouse_buttons = 0;
+	note_button_change(hid);
 	const uint8_t keyboard[8] = { 0 };
 	const uint8_t mouse[4] = { 0 };
 	const size_t touch_length = hid->absolute_report_length == 7 ? 7 : 6;

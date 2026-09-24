@@ -450,6 +450,51 @@ static void test_hid_right_button_release(void)
 	assert(unsetenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH") == 0);
 }
 
+static void test_hid_stuck_right_button_times_out(void)
+{
+	char mouse_path[] = "/tmp/nanokvm-rdp-mouse-stuck-XXXXXX";
+	char touch_path[] = "/tmp/nanokvm-rdp-touch-stuck-XXXXXX";
+	const int mouse_fd = mkstemp(mouse_path);
+	const int touch_fd = mkstemp(touch_path);
+	assert(mouse_fd >= 0 && touch_fd >= 0);
+	assert(close(mouse_fd) == 0);
+	assert(close(touch_fd) == 0);
+	assert(unlink(mouse_path) == 0);
+	assert(unlink(touch_path) == 0);
+	assert(mkfifo(mouse_path, 0600) == 0);
+	assert(mkfifo(touch_path, 0600) == 0);
+	const int mouse_read = open(mouse_path, O_RDONLY | O_NONBLOCK);
+	const int touch_read = open(touch_path, O_RDONLY | O_NONBLOCK);
+	assert(mouse_read >= 0 && touch_read >= 0);
+
+	HidState hid;
+	hid_init(&hid, "/dev/null", mouse_path, touch_path);
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xa000U));
+	assert(hid.buttons == 0x02);
+	uint8_t ignored[16];
+	while (read(mouse_read, ignored, sizeof(ignored)) > 0)
+		;
+	while (read(touch_read, ignored, sizeof(ignored)) > 0)
+		;
+	hid_release_stuck_buttons(&hid, hid.buttons_changed_at + HID_BUTTON_STUCK_TIMEOUT_MS - 1U);
+	assert(hid.buttons == 0x02);
+	assert(read(mouse_read, ignored, sizeof(ignored)) < 0);
+	hid_release_stuck_buttons(&hid, hid.buttons_changed_at + HID_BUTTON_STUCK_TIMEOUT_MS);
+	assert(hid.buttons == 0 && hid.mouse_buttons == 0);
+	uint8_t mouse[4] = { 0xff };
+	uint8_t touch[7] = { 0xff };
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0);
+	assert(read(mouse_read, mouse, sizeof(mouse)) == (ssize_t)sizeof(mouse));
+	assert(mouse[0] == 0);
+	assert(read(touch_read, touch, sizeof(touch)) == 6);
+	assert(touch[0] == 0);
+	assert(close(mouse_read) == 0);
+	assert(close(touch_read) == 0);
+	assert(unlink(mouse_path) == 0);
+	assert(unlink(touch_path) == 0);
+}
+
 static void test_hid_right_button_release_six_byte(void)
 {
 	char mouse_path[] = "/tmp/nanokvm-rdp-mouse-right6-XXXXXX";
@@ -541,7 +586,6 @@ static void test_hid_text_utf8(void)
 	assert(reports[21][0] == 0 && reports[21][2] == 0x09);
 	assert(reports[22][0] == 0 && reports[22][2] == 0);
 
-	assert(!hid_type_utf8(&hid, (const uint8_t*)"🙂", strlen("🙂")));
 	const uint8_t truncated[] = { 0xed, 0xa0, 0x80 };
 	assert(!hid_type_utf8(&hid, truncated, sizeof(truncated)));
 	assert(close(read_fd) == 0);
@@ -701,6 +745,67 @@ static void test_rtp_h264_stap_a(void)
 	rtp_h264_reassembler_free(&reassembler);
 }
 
+
+static void test_hid_emoji_paste(void)
+{
+	char keyboard_path[] = "/tmp/nanokvm-rdp-keyboard-paste-XXXXXX";
+	const int temp_fd = mkstemp(keyboard_path);
+	assert(temp_fd >= 0);
+	assert(close(temp_fd) == 0);
+	assert(unlink(keyboard_path) == 0);
+	assert(mkfifo(keyboard_path, 0600) == 0);
+	char paste_path[160] = { 0 };
+	assert(snprintf(paste_path, sizeof(paste_path), "%s.paste", keyboard_path) > 0);
+	assert(mkfifo(paste_path, 0600) == 0);
+	const int keyboard_read = open(keyboard_path, O_RDONLY | O_NONBLOCK);
+	const int paste_read = open(paste_path, O_RDONLY | O_NONBLOCK);
+	assert(keyboard_read >= 0);
+	assert(paste_read >= 0);
+
+	HidState hid;
+	hid_init(&hid, keyboard_path, "/dev/null", "/dev/null");
+	assert(hid.paste_fd >= 0);
+	const uint8_t emoji[] = "🙂";
+	assert(hid_type_utf8(&hid, emoji, sizeof(emoji) - 1U));
+
+	char pasted[16] = { 0 };
+	size_t pasted_length = 0;
+	while (pasted_length + 1U < sizeof(pasted))
+	{
+		const ssize_t result = read(paste_read, pasted + pasted_length,
+		                            sizeof(pasted) - 1U - pasted_length);
+		if (result < 0 && errno == EAGAIN)
+			break;
+		assert(result > 0);
+		pasted_length += (size_t)result;
+		if (pasted[pasted_length - 1U] == '\n')
+			break;
+	}
+	assert(strcmp(pasted, "'🙂'\n") == 0);
+	uint8_t down[8] = { 0 };
+	uint8_t up[8] = { 0 };
+	size_t offset = 0;
+	while (offset < 8)
+	{
+		const ssize_t result = read(keyboard_read, down + offset, 8U - offset);
+		assert(result > 0);
+		offset += (size_t)result;
+	}
+	offset = 0;
+	while (offset < 8)
+	{
+		const ssize_t result = read(keyboard_read, up + offset, 8U - offset);
+		assert(result > 0);
+		offset += (size_t)result;
+	}
+	assert(down[0] == 0 && down[2] == 0);
+	assert(up[0] == 0x08 && up[2] == 0x19);
+	assert(close(keyboard_read) == 0);
+	assert(close(paste_read) == 0);
+	assert(unlink(keyboard_path) == 0);
+	assert(unlink(paste_path) == 0);
+}
+
 int main(void)
 {
 	test_h264_annexb();
@@ -712,7 +817,9 @@ int main(void)
 	test_hid_release_all_absolute_length();
 	test_hid_right_button_release();
 	test_hid_right_button_release_six_byte();
+	test_hid_stuck_right_button_times_out();
 	test_hid_text_utf8();
+	test_hid_emoji_paste();
 	test_hid_keyboard_write_recovery();
 	test_protocol_primitives();
 	test_control_wire_message();
