@@ -21,6 +21,8 @@ typedef struct
 	uint8_t* frame;
 	size_t frame_size;
 	size_t frame_used;
+	uint8_t* pending_frame;
+	bool pending_frame_ready;
 	FfmpegFrameHandler frame_handler;
 	void* frame_context;
 } FfmpegDecoder;

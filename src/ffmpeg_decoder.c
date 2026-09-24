@@ -47,17 +47,32 @@ static bool decoder_drain(FfmpegDecoder* decoder, int timeout_ms)
 				if (decoder->frame_used == decoder->frame_size)
 				{
 					decoder->frame_used = 0;
-					if (!decoder->frame_handler(decoder->frame_context, decoder->frame,
-					                             decoder->frame_size))
-						return false;
+					/* 디코더 출력은 전송보다 빨리 쌓인다. 최신 프레임만 남기고
+					 * 이전 프레임은 버려야 화면이 실제보다 빨리 재생되지 않는다. */
+					if (!decoder->pending_frame)
+					{
+						decoder->pending_frame = malloc(decoder->frame_size);
+						if (!decoder->pending_frame)
+							return false;
+					}
+					memcpy(decoder->pending_frame, decoder->frame, decoder->frame_size);
+					decoder->pending_frame_ready = true;
 				}
 			}
 			continue;
 		}
 		if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-			return true;
+			break;
 		return false;
 	}
+	if (decoder->pending_frame_ready)
+	{
+		decoder->pending_frame_ready = false;
+		if (!decoder->frame_handler(decoder->frame_context, decoder->pending_frame,
+		                             decoder->frame_size))
+			return false;
+	}
+	return true;
 }
 
 static void* decoder_output_loop(void* context)
@@ -193,5 +208,6 @@ void ffmpeg_decoder_stop(FfmpegDecoder* decoder)
 		decoder->pid = -1;
 	}
 	free(decoder->frame);
+	free(decoder->pending_frame);
 	*decoder = (FfmpegDecoder){ .pid = -1, .input = -1, .output = -1 };
 }
