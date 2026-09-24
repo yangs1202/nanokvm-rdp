@@ -288,6 +288,88 @@ static void test_hid_horizontal_wheel(void)
 	assert(unsetenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH") == 0);
 }
 
+static void test_hid_release_all_absolute_length(void)
+{
+	char touch_template[] = "/tmp/nanokvm-rdp-touch-release-XXXXXX";
+	const int touch_temp = mkstemp(touch_template);
+	assert(touch_temp >= 0);
+	assert(close(touch_temp) == 0);
+	assert(unlink(touch_template) == 0);
+	assert(mkfifo(touch_template, 0600) == 0);
+	const int touch_read = open(touch_template, O_RDONLY | O_NONBLOCK);
+	assert(touch_read >= 0);
+	assert(setenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH", "7", 1) == 0);
+
+	char keyboard_template[] = "/tmp/nanokvm-rdp-keyboard-release-XXXXXX";
+	const int keyboard_temp = mkstemp(keyboard_template);
+	assert(keyboard_temp >= 0);
+	assert(close(keyboard_temp) == 0);
+	assert(unlink(keyboard_template) == 0);
+	assert(mkfifo(keyboard_template, 0600) == 0);
+	const int keyboard_read = open(keyboard_template, O_RDONLY | O_NONBLOCK);
+	assert(keyboard_read >= 0);
+
+	HidState hid;
+	hid_init(&hid, keyboard_template, "/dev/null", touch_template);
+	hid.last_x = 0x1234;
+	hid.last_y = 0x5678;
+	hid.buttons = 0x02;
+	hid.mouse_buttons = 0x02;
+	hid_release_all(&hid);
+
+	uint8_t report[7] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	assert(read(touch_read, report, sizeof(report)) == (ssize_t)sizeof(report));
+	assert(report[0] == 0);
+	assert(report[1] == 0x34 && report[2] == 0x12);
+	assert(report[3] == 0x78 && report[4] == 0x56);
+	assert(report[5] == 0 && report[6] == 0);
+	uint8_t extra = 0xff;
+	assert(read(touch_read, &extra, 1) == 0);
+	assert(hid.buttons == 0 && hid.mouse_buttons == 0);
+	uint8_t keyboard[8] = { 0xff };
+	assert(read(keyboard_read, keyboard, sizeof(keyboard)) == (ssize_t)sizeof(keyboard));
+	assert(keyboard[0] == 0 && keyboard[2] == 0);
+	assert(close(keyboard_read) == 0);
+	assert(unlink(keyboard_template) == 0);
+	assert(close(touch_read) == 0);
+	assert(unlink(touch_template) == 0);
+	assert(unsetenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH") == 0);
+}
+
+static void test_hid_right_button_release(void)
+{
+	char mouse_path[] = "/tmp/nanokvm-rdp-mouse-right-XXXXXX";
+	char touch_path[] = "/tmp/nanokvm-rdp-touch-right-XXXXXX";
+	const int mouse_fd = mkstemp(mouse_path);
+	const int touch_fd = mkstemp(touch_path);
+	assert(mouse_fd >= 0 && touch_fd >= 0);
+	assert(close(mouse_fd) == 0);
+	assert(close(touch_fd) == 0);
+	assert(setenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH", "7", 1) == 0);
+
+	HidState hid;
+	hid_init(&hid, "/dev/null", mouse_path, touch_path);
+	assert(hid.absolute_report_length == 7);
+
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xa000U));
+	assert(hid.buttons == 0x02 && hid.mouse_buttons == 0x02);
+	assert(hid_relative(&hid, 0, 0, 0));
+	assert(hid.buttons == 0 && hid.mouse_buttons == 0);
+
+	assert(hid_relative(&hid, 3, -2, 0x02));
+	assert(hid.buttons == 0x02 && hid.mouse_buttons == 0x02);
+	assert(hid_absolute(&hid, 120, 220, 1920, 1080, 0x2000U));
+	assert(hid.buttons == 0 && hid.mouse_buttons == 0);
+
+	assert(hid_absolute(&hid, 100, 200, 1920, 1080, 0xa000U));
+	hid_release_all(&hid);
+	assert(hid.buttons == 0 && hid.mouse_buttons == 0 && hid.wheel == 0 && hid.pan == 0);
+
+	assert(unlink(mouse_path) == 0);
+	assert(unlink(touch_path) == 0);
+	assert(unsetenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH") == 0);
+}
+
 static void test_hid_text_utf8(void)
 {
 	char keyboard_path[] = "/tmp/nanokvm-rdp-keyboard-XXXXXX";
@@ -483,6 +565,8 @@ int main(void)
 	test_hid_middle_button();
 	test_hid_extended_buttons();
 	test_hid_horizontal_wheel();
+	test_hid_release_all_absolute_length();
+	test_hid_right_button_release();
 	test_hid_text_utf8();
 	test_hid_keyboard_write_recovery();
 	test_protocol_primitives();

@@ -600,6 +600,7 @@ static bool send_absolute(HidState* hid)
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
 	              uint16_t flags)
 {
+	const uint8_t previous = hid->buttons;
 	if ((flags & PTR_FLAGS_BUTTON1) != 0)
 	{
 		if ((flags & PTR_FLAGS_DOWN) != 0)
@@ -621,10 +622,19 @@ bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_
 		else
 			hid->buttons &= (uint8_t)~0x04U;
 	}
+	/* Windows App은 버튼 down을 절대 포인터로, release를 상대 포인터로 보낸다.
+	 * 절대 버튼이 바뀌면 상대 버튼도 같은 값으로 맞춰 한쪽만 눌린 채 남지 않게 한다. */
+	if (hid->buttons != previous)
+		hid->mouse_buttons = hid->buttons;
 
 	hid->last_x = hid_scale_absolute(x, width);
 	hid->last_y = hid_scale_absolute(y, height);
-	return send_absolute(hid);
+	const bool absolute_ok = send_absolute(hid);
+	if (hid->buttons == previous)
+		return absolute_ok;
+	const uint8_t relative[4] = { hid->mouse_buttons, 0, 0, 0 };
+	const bool relative_ok = write_report(hid->mouse_path, relative, sizeof(relative));
+	return absolute_ok && relative_ok;
 }
 
 bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
@@ -637,9 +647,15 @@ bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 		y = 127;
 	if (y < -127)
 		y = -127;
-	hid->mouse_buttons = buttons & HID_MOUSE_BUTTONS_MASK;
+	const uint8_t next = buttons & HID_MOUSE_BUTTONS_MASK;
+	const bool buttons_changed = hid->mouse_buttons != next || hid->buttons != next;
+	hid->mouse_buttons = next;
+	hid->buttons = next;
 	const uint8_t report[4] = { hid->mouse_buttons, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
-	return write_report(hid->mouse_path, report, sizeof(report));
+	const bool relative_ok = write_report(hid->mouse_path, report, sizeof(report));
+	if (!buttons_changed)
+		return relative_ok;
+	return send_absolute(hid) && relative_ok;
 }
 
 static int wheel_detents(uint16_t flags)
@@ -684,7 +700,8 @@ void hid_release_all(HidState* hid)
 	hid->mouse_buttons = 0;
 	const uint8_t keyboard[8] = { 0 };
 	const uint8_t mouse[4] = { 0 };
-	const uint8_t touch[6] = { 0, (uint8_t)(hid->last_x & 0xffU),
+	const size_t touch_length = hid->absolute_report_length == 7 ? 7 : 6;
+	const uint8_t touch[7] = { 0, (uint8_t)(hid->last_x & 0xffU),
 		(uint8_t)(hid->last_x >> 8U), (uint8_t)(hid->last_y & 0xffU),
 		(uint8_t)(hid->last_y >> 8U), 0 };
 	hid->wheel = 0;
@@ -692,5 +709,5 @@ void hid_release_all(HidState* hid)
 	if (!write_report(hid->keyboard_path, keyboard, sizeof(keyboard)))
 		hid->keyboard_desynced = true;
 	(void)write_report(hid->mouse_path, mouse, sizeof(mouse));
-	(void)write_report(hid->touch_path, touch, sizeof(touch));
+	(void)write_report(hid->touch_path, touch, touch_length);
 }
