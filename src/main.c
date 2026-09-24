@@ -58,6 +58,8 @@
 #define BITMAP_QUEUE_CAPACITY 16U
 #define BITMAP_FRAME_INTERVAL_MS 10U
 #define BITMAP_MAX_QUEUE_AGE_MS 100U
+#define PROGRESSIVE_MAX_QUEUE_AGE_MS 30U
+#define PROGRESSIVE_MIN_SEND_INTERVAL_MS 40U
 #define CLASSIC_TILE_WIDTH 64U
 #define CLASSIC_TILE_HEIGHT 64U
 #define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
@@ -486,6 +488,34 @@ static bool client_cap_supports_avc420(const RDPGFX_CAPSET* cap)
 		return (cap->flags & RDPGFX_CAPS_FLAG_AVC420_ENABLED) != 0;
 	return cap->version >= RDPGFX_CAPVERSION_10 &&
 	       (cap->flags & RDPGFX_CAPS_FLAG_AVC_DISABLED) == 0;
+}
+
+static bool tile_changed(const uint8_t* previous, const uint8_t* current, uint16_t width,
+                         uint16_t left, uint16_t top, uint16_t columns, uint16_t rows)
+{
+	if (!previous)
+		return true;
+	const size_t stride = (size_t)width * 4U;
+	uint32_t changed = 0;
+	for (uint16_t row = 0; row < rows; row++)
+	{
+		const uint8_t* old_row = previous + ((size_t)(top + row) * stride) + (size_t)left * 4U;
+		const uint8_t* new_row = current + ((size_t)(top + row) * stride) + (size_t)left * 4U;
+		for (uint16_t column = 0; column < columns; column++)
+		{
+			const int blue = (int)new_row[column * 4U] - (int)old_row[column * 4U];
+			const int green = (int)new_row[column * 4U + 1U] - (int)old_row[column * 4U + 1U];
+			const int red = (int)new_row[column * 4U + 2U] - (int)old_row[column * 4U + 2U];
+			if (blue < 0) blue = -blue;
+			if (green < 0) green = -green;
+			if (red < 0) red = -red;
+			if (blue + green + red > (int)CLASSIC_PIXEL_DIFF_THRESHOLD)
+				changed++;
+			if (changed >= CLASSIC_CHANGED_PIXEL_THRESHOLD)
+				return true;
+		}
+	}
+	return false;
 }
 
 static bool client_advertises_avc444(const RDPGFX_CAPS_ADVERTISE_PDU* advertise)
@@ -994,7 +1024,6 @@ static bool send_progressive_frame(Client* client, const uint8_t* bgra, size_t l
 	const uint16_t height = client->render_height;
 	const size_t expected_length = (size_t)width * height * 4U;
 	REGION16 region = WINPR_C_ARRAY_INIT;
-	RECTANGLE_16 rect = { .left = 0, .top = 0, .right = width, .bottom = height };
 	RDPGFX_SURFACE_COMMAND command = WINPR_C_ARRAY_INIT;
 	RDPGFX_START_FRAME_PDU start = WINPR_C_ARRAY_INIT;
 	RDPGFX_END_FRAME_PDU end = WINPR_C_ARRAY_INIT;
@@ -1003,10 +1032,42 @@ static bool send_progressive_frame(Client* client, const uint8_t* bgra, size_t l
 	    length != expected_length || client_should_stop(client))
 		return false;
 	region16_init(&region);
-	if (!region16_union_rect(&region, &region, &rect))
+	const uint16_t tile_columns = (uint16_t)((width + 63U) / 64U);
+	const uint16_t tile_rows = (uint16_t)((height + 63U) / 64U);
+	if (!client->previous_bitmap)
+	{
+		client->previous_bitmap = malloc(expected_length);
+		client->previous_bitmap_length = client->previous_bitmap ? expected_length : 0;
+	}
+	const uint8_t* previous = client->previous_bitmap_valid &&
+	                          client->previous_bitmap_length == expected_length
+	                              ? client->previous_bitmap
+	                              : NULL;
+	size_t changed_tiles = 0;
+	for (uint16_t tile_y = 0; tile_y < tile_rows; tile_y++)
+	{
+		for (uint16_t tile_x = 0; tile_x < tile_columns; tile_x++)
+		{
+			const uint16_t left = (uint16_t)(tile_x * 64U);
+			const uint16_t top = (uint16_t)(tile_y * 64U);
+			const uint16_t columns = (uint16_t)((left + 64U > width) ? width - left : 64U);
+			const uint16_t rows = (uint16_t)((top + 64U > height) ? height - top : 64U);
+			if (previous && !tile_changed(previous, bgra, width, left, top, columns, rows))
+				continue;
+			RECTANGLE_16 rect = { .left = left, .top = top,
+				.right = (UINT16)(left + columns), .bottom = (UINT16)(top + rows) };
+			if (!region16_union_rect(&region, &region, &rect))
+			{
+				region16_uninit(&region);
+				return false;
+			}
+			changed_tiles++;
+		}
+	}
+	if (changed_tiles == 0)
 	{
 		region16_uninit(&region);
-		return false;
+		return true;
 	}
 	const int encoded = progressive_compress(
 	    client->progressive, bgra, WINPR_ASSERTING_INT_CAST(uint32_t, length),
@@ -1038,6 +1099,11 @@ static bool send_progressive_frame(Client* client, const uint8_t* bgra, size_t l
 	{
 		log_message("ERROR", "RDPGFX Progressive frame 전송 실패");
 		return false;
+	}
+	if (client->previous_bitmap && client->previous_bitmap_length == expected_length)
+	{
+		memcpy(client->previous_bitmap, bgra, expected_length);
+		client->previous_bitmap_valid = true;
 	}
 	return true;
 }
@@ -1185,6 +1251,11 @@ static bool client_flush_pending_bitmap(Client* client)
 	size_t bitmap_length = 0;
 	bool sent = true;
 	const uint64_t now = monotonic_milliseconds();
+	const uint64_t max_queue_age = client->gfx_uses_progressive ? PROGRESSIVE_MAX_QUEUE_AGE_MS
+	                                                           : BITMAP_MAX_QUEUE_AGE_MS;
+	const uint64_t min_send_interval = client->gfx_uses_progressive
+	                                       ? PROGRESSIVE_MIN_SEND_INTERVAL_MS
+	                                       : BITMAP_FRAME_INTERVAL_MS;
 	if (client->bitmap_ready_event)
 		(void)ResetEvent(client->bitmap_ready_event);
 	if (client->peer && client->peer->IsWriteBlocked && client->peer->DrainOutputBuffer &&
@@ -1199,7 +1270,7 @@ static bool client_flush_pending_bitmap(Client* client)
 	while (client->bitmap_queue_count > 0)
 	{
 		const uint8_t stale_slot = client->bitmap_queue_head;
-		if (now - client->bitmap_queue_queued_at[stale_slot] <= BITMAP_MAX_QUEUE_AGE_MS)
+		if (now - client->bitmap_queue_queued_at[stale_slot] <= max_queue_age)
 			break;
 		stale[stale_count++] = client->bitmap_queue[stale_slot];
 		client->bitmap_queue[stale_slot] = NULL;
@@ -1220,7 +1291,7 @@ static bool client_flush_pending_bitmap(Client* client)
 		return true;
 	}
 	if (client->bitmap_last_send_started_at != 0 &&
-	    now - client->bitmap_last_send_started_at < BITMAP_FRAME_INTERVAL_MS)
+	    now - client->bitmap_last_send_started_at < min_send_interval)
 	{
 		LeaveCriticalSection(&client->lock);
 		for (size_t index = 0; index < stale_count; index++)
