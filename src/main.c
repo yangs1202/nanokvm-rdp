@@ -1487,6 +1487,14 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	Client* client = (Client*)input->context;
 	const uint16_t width = client->server->config.width;
 	const uint16_t height = client->server->config.height;
+	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) != 0)
+	{
+		char message[160];
+		(void)snprintf(message, sizeof(message),
+		               "RDP absolute button flags=0x%04X x=%u y=%u down=%u",
+		               flags, x, y, (unsigned)((flags & PTR_FLAGS_DOWN) != 0));
+		log_message("INFO", message);
+	}
 	uint8_t payload[12] = { 0 };
 	protocol_write_u16(payload, hid_clamp_absolute(x, width));
 	protocol_write_u16(payload + 2, hid_clamp_absolute(y, height));
@@ -1556,6 +1564,16 @@ static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT1
 			client->relative_buttons |= 0x04;
 		else
 			client->relative_buttons &= (uint8_t)~0x04U;
+	}
+	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) != 0 ||
+	    client->relative_buttons != 0)
+	{
+		char message[192];
+		(void)snprintf(message, sizeof(message),
+		               "RDP relative button flags=0x%04X dx=%d dy=%d mask=0x%02X down=%u",
+		               flags, x_delta, y_delta, client->relative_buttons,
+		               (unsigned)((flags & PTR_FLAGS_DOWN) != 0));
+		log_message("INFO", message);
 	}
 	uint8_t payload[5] = { 0 };
 	protocol_write_u16(payload, (uint16_t)x_delta);
