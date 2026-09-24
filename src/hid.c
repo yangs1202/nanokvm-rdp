@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -32,6 +33,17 @@ static bool write_report(const char* path, const uint8_t* report, size_t length)
 	const int fd = open(path, O_WRONLY | O_CLOEXEC | O_NONBLOCK);
 	if (fd < 0)
 		return false;
+	/* 장치에서 /dev/hidg1, /dev/hidg2가 일반 파일로 덮이면 버튼 해제가
+	 * 가젯이 아니라 파일에 쌓인다. 그 경로만 캐릭터 디바이스가 아니면 거절한다. */
+	if (path && strncmp(path, "/dev/hidg", 9) == 0)
+	{
+		struct stat status;
+		if (fstat(fd, &status) != 0 || !S_ISCHR(status.st_mode))
+		{
+			(void)close(fd);
+			return false;
+		}
+	}
 	ssize_t written = -1;
 	do
 	{

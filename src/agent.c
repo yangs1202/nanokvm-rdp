@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -37,6 +38,18 @@
  * 무한 반복한다. 이 횟수를 넘기면 프로세스를 종료해 init 스크립트가 깨끗한
  * 커널 ISP/VI 상태에서 재시작하도록 한다. */
 #define CAPTURE_REINIT_LIMIT 3U
+#define HIDG_MAJOR 238U
+
+#ifndef makedev
+#define makedev(major_number, minor_number) \
+	((dev_t)((((unsigned)(major_number) & 0xfffU) << 8) | ((unsigned)(minor_number) & 0xffU)))
+#endif
+#ifndef major
+#define major(device) ((unsigned)(((unsigned)(device) >> 8) & 0xfffU))
+#endif
+#ifndef minor
+#define minor(device) ((unsigned)((unsigned)(device) & 0xffU))
+#endif
 
 enum KvmFrameKind { KVM_FRAME_SPS = 1, KVM_FRAME_PPS = 2, KVM_FRAME_IDR = 3, KVM_FRAME_P = 4 };
 
@@ -317,6 +330,28 @@ static void usage(const char* executable)
 	(void)fprintf(stderr, "Usage: %s -gateway host-or-ipv4 [-control-port n] [-video-port n] [-width n] [-height n] [-bitrate n]\n", executable);
 }
 
+static void ensure_hid_node(const char* path, int node_minor)
+{
+	struct stat status;
+	if (stat(path, &status) == 0 && S_ISCHR(status.st_mode) &&
+	    (int)major(status.st_rdev) == (int)HIDG_MAJOR && (int)minor(status.st_rdev) == node_minor)
+		return;
+	if (stat(path, &status) == 0 && unlink(path) != 0)
+	{
+		(void)fprintf(stderr, "%s: %s 노드를 교체하지 못했습니다\n", TAG, path);
+		return;
+	}
+	if (mknod(path, S_IFCHR | 0600, makedev(HIDG_MAJOR, (unsigned)node_minor)) != 0)
+		(void)fprintf(stderr, "%s: %s 캐릭터 노드 생성 실패\n", TAG, path);
+}
+
+static void ensure_hid_nodes(void)
+{
+	ensure_hid_node("/dev/hidg0", 0);
+	ensure_hid_node("/dev/hidg1", 1);
+	ensure_hid_node("/dev/hidg2", 2);
+}
+
 static void capture_deinit(bool* capture_initialized)
 {
 	if (!*capture_initialized)
@@ -456,6 +491,7 @@ int main(int argc, char* argv[])
 	if (agent.video_fd < 0)
 		return 1;
 	rtp_h264_packetizer_init(&agent.packetizer, RTP_H264_DEFAULT_MTU, (uint32_t)getpid());
+	ensure_hid_nodes();
 	hid_init(&agent.hid, NULL, NULL, NULL);
 	atomic_init(&agent.streaming, false);
 	atomic_init(&agent.wait_for_idr, true);
