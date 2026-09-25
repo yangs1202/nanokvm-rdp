@@ -310,6 +310,14 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 				ack[4] = succeeded ? 1 : 0;
 				(void)protocol_send(agent->control_fd, NANOKVM_CONTROL_KEY_ACK, ack, sizeof(ack));
 			}
+			if ((message->length == NANOKVM_KEY_PAYLOAD_SIZE ||
+			     message->length == NANOKVM_KEY_ACK_REQUEST_PAYLOAD_SIZE) && message->payload[0] == 0x1d)
+			{
+				(void)fprintf(stderr,
+				              "%s: INPUT Control at_ms=%llu extended=%u release=%u modifiers=0x%02x pending=%u ok=%u\n",
+				              TAG, (unsigned long long)started, message->payload[1], message->payload[2],
+				              agent->hid.modifiers, agent->hid.keyboard_queue.count, (unsigned)succeeded);
+			}
 			break;
 		case NANOKVM_CONTROL_TEXT_UTF8:
 			if (message->length > 0 && !hid_type_utf8(&agent->hid, message->payload, message->length))
@@ -591,7 +599,7 @@ int main(int argc, char* argv[])
 		if (now - agent.last_input_log_at >= 5000U)
 		{
 			(void)fprintf(stderr,
-			              "%s: INPUT events=%llu sent=%llu retry=%llu errors=%llu overflow=%llu pending=%u/%u feedback=%llu feedback_errors=%llu leds=0x%02x max_queue_ms=%llu max_handle_ms=%llu\n",
+			              "%s: INPUT events=%llu sent=%llu retry=%llu errors=%llu overflow=%llu pending=%u/%u feedback=%llu feedback_errors=%llu leds=0x%02x max_queue_ms=%llu max_handle_ms=%llu at_ms=%llu modifiers=0x%02x buttons=0x%02x\n",
 			              TAG, (unsigned long long)agent.input_events,
 			              (unsigned long long)agent.hid.reports_sent,
 			              (unsigned long long)agent.hid.write_retries,
@@ -601,7 +609,8 @@ int main(int argc, char* argv[])
 			              (unsigned long long)agent.hid.feedback_reports,
 			              (unsigned long long)agent.hid.feedback_errors, agent.hid.keyboard_leds,
 			              (unsigned long long)agent.hid.max_queue_age_ms,
-			              (unsigned long long)agent.max_input_handler_ms);
+			              (unsigned long long)agent.max_input_handler_ms,
+			              (unsigned long long)now, agent.hid.modifiers, agent.hid.buttons);
 			agent.hid.max_queue_age_ms = 0;
 			agent.max_input_handler_ms = 0;
 			agent.last_input_log_at = now;
