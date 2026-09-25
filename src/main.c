@@ -186,6 +186,8 @@ struct Client
 	bool pointer_input_logged;
 	bool wheel_input_logged;
 	uint8_t pointer_buttons;
+	uint8_t keyboard_modifiers;
+	bool control_space_down;
 	uint64_t last_rtp_received_at;
 	uint64_t last_decode_latency_ms;
 	uint64_t last_rdp_send_ms;
@@ -1427,14 +1429,32 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 	bool mapped_extended = raw_extended;
 	hid_map_scancode(code, mapped_extended, client->server->config.swap_alt_command,
 	                 &mapped_code, &mapped_extended);
-	if (code == 0x38 || (raw_extended && (code == 0x5b || code == 0x5c)) || code == 0x3a)
+	const bool release = (flags & KBD_FLAGS_RELEASE) != 0;
+	uint8_t usage = 0;
+	uint8_t modifier = 0;
+	(void)hid_translate_scancode(mapped_code, mapped_extended, &usage, &modifier);
+	if (release)
+		client->keyboard_modifiers &= (uint8_t)~modifier;
+	else
+		client->keyboard_modifiers |= modifier;
+	if (modifier != 0 || code == 0x3a)
 	{
-		char message[160];
+		char message[192];
 		(void)snprintf(message, sizeof(message),
-		               "RDP modifier diagnostic raw=0x%02X extended=%u release=%u mapped=0x%02X extended=%u",
-		               code, (unsigned)raw_extended, (unsigned)((flags & KBD_FLAGS_RELEASE) != 0),
-		               mapped_code, (unsigned)mapped_extended);
+		               "RDP modifier diagnostic raw=0x%02X extended=%u release=%u mapped=0x%02X extended=%u modifiers=0x%02X",
+		               code, (unsigned)raw_extended, (unsigned)release,
+		               mapped_code, (unsigned)mapped_extended, client->keyboard_modifiers);
 		log_message("INFO", message);
+	}
+	if (code == 0x39 && !raw_extended &&
+	    ((client->keyboard_modifiers & 0x11U) || client->control_space_down))
+	{
+		char message[128];
+		(void)snprintf(message, sizeof(message),
+		               "RDP Control+Space diagnostic release=%u modifiers=0x%02X",
+		               (unsigned)release, client->keyboard_modifiers);
+		log_message("INFO", message);
+		client->control_space_down = !release;
 	}
 	const uint8_t payload[3] = { mapped_code, mapped_extended,
 		(flags & KBD_FLAGS_RELEASE) != 0 };
@@ -1528,6 +1548,8 @@ static bool client_set_render_size(Client* client)
 static BOOL client_release_all_inputs(Client* client, const char* reason)
 {
 	client->pointer_buttons = 0;
+	client->keyboard_modifiers = 0;
+	client->control_space_down = false;
 	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_RELEASE_ALL, NULL, 0);
 	if (sent && reason)
 	{
@@ -1557,8 +1579,9 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	{
 		char message[160];
 		(void)snprintf(message, sizeof(message),
-		               "RDP absolute button flags=0x%04X x=%u y=%u down=%u",
-		               flags, x, y, (unsigned)((flags & PTR_FLAGS_DOWN) != 0));
+		               "RDP absolute button flags=0x%04X x=%u y=%u down=%u mask=0x%02X modifiers=0x%02X",
+		               flags, x, y, (unsigned)((flags & PTR_FLAGS_DOWN) != 0),
+		               client->pointer_buttons, client->keyboard_modifiers);
 		log_message("INFO", message);
 	}
 	uint8_t payload[12] = { 0 };
@@ -1616,9 +1639,9 @@ static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT1
 	{
 		char message[192];
 		(void)snprintf(message, sizeof(message),
-		               "RDP relative button flags=0x%04X dx=%d dy=%d mask=0x%02X down=%u",
+		               "RDP relative button flags=0x%04X dx=%d dy=%d mask=0x%02X down=%u modifiers=0x%02X",
 		               flags, x_delta, y_delta, client->pointer_buttons,
-		               (unsigned)((flags & PTR_FLAGS_DOWN) != 0));
+		               (unsigned)((flags & PTR_FLAGS_DOWN) != 0), client->keyboard_modifiers);
 		log_message("INFO", message);
 	}
 	uint8_t payload[5] = { 0 };
