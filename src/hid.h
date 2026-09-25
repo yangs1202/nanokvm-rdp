@@ -42,6 +42,10 @@ typedef struct
 	uint64_t write_errors;
 	uint64_t queue_overflows;
 	uint64_t max_queue_age_ms;
+	uint64_t feedback_reports;
+	uint64_t feedback_errors;
+	uint64_t feedback_retry_at;
+	uint8_t keyboard_leds;
 	uint16_t last_x;
 	uint16_t last_y;
 	uint8_t buttons;
@@ -51,6 +55,7 @@ typedef struct
 	int8_t pan;
 	uint8_t absolute_report_length;
 	int keyboard_fd;
+	int keyboard_feedback_fd;
 	int mouse_fd;
 	int touch_fd;
 	int paste_fd;

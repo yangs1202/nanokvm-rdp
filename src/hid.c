@@ -61,6 +61,22 @@ static int open_hid_fd(const char* path)
 	return fd;
 }
 
+static int open_keyboard_feedback(const char* path)
+{
+	if (!is_hid_gadget(path))
+		return -1;
+	const int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+	if (fd < 0)
+		return -1;
+	struct stat status;
+	if (fstat(fd, &status) != 0 || !S_ISCHR(status.st_mode))
+	{
+		(void)close(fd);
+		return -1;
+	}
+	return fd;
+}
+
 static int hid_fd(HidState* hid, const char* path)
 {
 	int* slot = hid_fd_slot(hid, path);
@@ -272,6 +288,7 @@ void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char
 {
 	memset(hid, 0, sizeof(*hid));
 	hid->keyboard_fd = -1;
+	hid->keyboard_feedback_fd = -1;
 	hid->mouse_fd = -1;
 	hid->touch_fd = -1;
 	hid->paste_fd = -1;
@@ -286,6 +303,7 @@ void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char
 	hid->last_y = 0x3fff;
 	hid->absolute_report_length = absolute_report_length(hid->touch_path);
 	hid->keyboard_fd = open_hid_fd(hid->keyboard_path);
+	hid->keyboard_feedback_fd = open_keyboard_feedback(hid->keyboard_path);
 	hid->mouse_fd = open_hid_fd(hid->mouse_path);
 	hid->touch_fd = open_hid_fd(hid->touch_path);
 	hid->paste_fd = open_hid_fd(hid->paste_path);
@@ -398,8 +416,44 @@ bool hid_pending(const HidState* hid)
 	return hid && (hid->keyboard_queue.count || hid->pointer_queue.count);
 }
 
+static void drain_keyboard_feedback(HidState* hid)
+{
+	const uint64_t now = hid_now();
+	if (hid->keyboard_feedback_fd < 0 && now >= hid->feedback_retry_at)
+	{
+		hid->keyboard_feedback_fd = open_keyboard_feedback(hid->keyboard_path);
+		hid->feedback_retry_at = now + 1000U;
+	}
+	if (hid->keyboard_feedback_fd < 0)
+		return;
+	/* HID OUT requests are rearmed only after userspace reads them. Leaving
+	 * LED reports unread can stall host keyboard synchronization although
+	 * every gadget-to-host key write succeeds. Bound each batch for fairness. */
+	for (unsigned batch = 0; batch < 32; batch++)
+	{
+		uint8_t report[64];
+		const ssize_t length = read(hid->keyboard_feedback_fd, report, sizeof(report));
+		if (length > 0)
+		{
+			hid->feedback_reports++;
+			hid->keyboard_leds = report[0] & 0x1fU;
+			continue;
+		}
+		if (length < 0 && errno == EINTR)
+			continue;
+		if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			return;
+		hid->feedback_errors++;
+		(void)close(hid->keyboard_feedback_fd);
+		hid->keyboard_feedback_fd = -1;
+		hid->feedback_retry_at = now + 1000U;
+		return;
+	}
+}
+
 bool hid_flush(HidState* hid)
 {
+	drain_keyboard_feedback(hid);
 	const bool keyboard = flush_reports(hid, &hid->keyboard_queue);
 	const bool pointer = flush_reports(hid, &hid->pointer_queue);
 	hid->keyboard_desynced = hid->keyboard_queue.count > 0;
@@ -421,6 +475,8 @@ size_t hid_pollfds(const HidState* hid, struct pollfd* fds)
 		const int fd = endpoint_fd(hid, endpoint);
 		if (fd >= 0) fds[count++] = (struct pollfd){ .fd = fd, .events = POLLOUT };
 	}
+	if (hid->keyboard_feedback_fd >= 0)
+		fds[count++] = (struct pollfd){ .fd = hid->keyboard_feedback_fd, .events = POLLIN };
 	return count;
 }
 

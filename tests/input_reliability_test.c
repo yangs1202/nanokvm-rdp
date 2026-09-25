@@ -341,11 +341,57 @@ static void test_fragmented_network_with_pending_release(void)
 	assert(protocol_receive_available(sockets[1], &reader, &message) == -1);
 	close(sockets[1]); cleanup(&f);
 }
+static void test_control_space_with_host_feedback(void)
+{
+	Fixture f; setup(&f);
+	int feedback[2]; assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, feedback) == 0);
+	assert(fcntl(feedback[0], F_SETFL, O_NONBLOCK) == 0);
+	assert(fcntl(feedback[1], F_SETFL, O_NONBLOCK) == 0);
+	f.hid.keyboard_feedback_fd = feedback[0];
+	/* This is the host-to-keyboard direction (LED output reports), not keys. */
+	for (unsigned round = 0; round < 50; round++)
+	{
+		const uint8_t led = (round & 1) ? 2 : 0;
+		assert(write(feedback[1], &led, 1) == 1);
+		assert(hid_scancode(&f.hid, 0x1d, false, false));
+		assert(hid_scancode(&f.hid, 0x39, false, false));
+		assert(hid_scancode(&f.hid, 0x39, false, true));
+		assert(hid_scancode(&f.hid, 0x1d, false, true));
+		assert(!hid_pending(&f.hid));
+		struct pollfd fds[3]; size_t count = hid_pollfds(&f.hid, fds);
+		assert(count == 1 && fds[0].fd == feedback[0] && fds[0].events == POLLIN);
+		assert(poll(fds, count, 0) == 1);
+		assert(hid_flush(&f.hid));
+		assert(f.hid.feedback_reports == round + 1 && f.hid.keyboard_leds == led);
+		assert(poll(fds, count, 0) == 0);
+		uint8_t keys[4][8]; read_exact(f.receiver[0], keys, sizeof(keys));
+		assert(keys[0][0] == 1 && keys[0][2] == 0);
+		assert(keys[1][0] == 1 && keys[1][2] == 0x2c);
+		assert(keys[2][0] == 1 && keys[2][2] == 0);
+		assert(keys[3][0] == 0 && keys[3][2] == 0);
+	}
+	/* Fill the reverse direction: flushing it must let the host send again,
+	 * even while the separate input direction is blocked. */
+	const uint8_t led = 2;
+	unsigned queued = 0;
+	while (write(feedback[1], &led, 1) == 1) queued++;
+	assert(queued > 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS));
+	block_fd(f.hid.keyboard_fd);
+	assert(hid_scancode(&f.hid, 0x1d, false, false));
+	for (unsigned i = 0; i < queued; i++) assert(hid_flush(&f.hid));
+	assert(f.hid.feedback_reports == 50U + queued);
+	assert(write(feedback[1], &led, 1) == 1);
+	drain(f.receiver[0]); hid_release_all(&f.hid); assert(hid_flush(&f.hid));
+	assert(f.hid.feedback_reports == 51U + queued && f.hid.feedback_errors == 0);
+	uint8_t release[8]; read_exact(f.receiver[0], release, 8); assert(release[0] == 0 && release[2] == 0);
+	close(feedback[0]); close(feedback[1]); cleanup(&f);
+}
 int main(void)
 {
 	test_button_mapping_and_mixed_motion(); test_final_release_and_coalescing();
 	test_keyboard_order_and_wrap(); test_cancel_retries_all_endpoints();
 	test_overflow_and_stall(); test_endpoint_reopen(); test_text_does_not_block_click_release();
 	test_paste_order(); test_wheel(); test_fragmented_network_with_pending_release();
-	puts("Input reliability: all 10 scenarios passed"); return 0;
+	test_control_space_with_host_feedback();
+	puts("Input reliability: all 11 scenarios passed"); return 0;
 }
