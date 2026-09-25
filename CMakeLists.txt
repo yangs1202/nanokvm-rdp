@@ -26,6 +26,12 @@ if(NANOKVM_RDP_BUILD_TESTS)
   target_compile_options(nanokvm-rdp-unit PRIVATE -Wall -Wextra -Werror)
   add_test(NAME nanokvm-rdp-unit COMMAND nanokvm-rdp-unit)
 
+  add_executable(nanokvm-input-reliability-test tests/input_reliability_test.c src/hid.c src/protocol.c)
+  target_include_directories(nanokvm-input-reliability-test PRIVATE src)
+  target_compile_options(nanokvm-input-reliability-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  add_test(NAME nanokvm-input-reliability-test COMMAND nanokvm-input-reliability-test)
+  set_tests_properties(nanokvm-input-reliability-test PROPERTIES TIMEOUT 10)
+
   add_executable(nanokvm-rtp-loopback-test
     tests/rtp_loopback_test.c
     src/rtp_h264.c

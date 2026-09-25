@@ -185,7 +185,7 @@ struct Client
 	bool keyboard_input_logged;
 	bool pointer_input_logged;
 	bool wheel_input_logged;
-	uint8_t relative_buttons;
+	uint8_t pointer_buttons;
 	uint64_t last_rtp_received_at;
 	uint64_t last_decode_latency_ms;
 	uint64_t last_rdp_send_ms;
@@ -255,6 +255,8 @@ static DWORD WINAPI control_thread(LPVOID argument)
 			continue;
 		int enabled = 1;
 		(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+		const struct timeval send_timeout = { .tv_usec = 100000 };
+		(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
 		NanokvmControlMessage hello = { 0 };
 		if (!protocol_receive(fd, &hello) || hello.type != NANOKVM_CONTROL_HELLO ||
 		    (hello.length != NANOKVM_HELLO_BASE_PAYLOAD_SIZE &&
@@ -1525,7 +1527,7 @@ static bool client_set_render_size(Client* client)
 
 static BOOL client_release_all_inputs(Client* client, const char* reason)
 {
-	client->relative_buttons = 0;
+	client->pointer_buttons = 0;
 	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_RELEASE_ALL, NULL, 0);
 	if (sent && reason)
 	{
@@ -1549,6 +1551,8 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	Client* client = (Client*)input->context;
 	const uint16_t width = client->server->config.width;
 	const uint16_t height = client->server->config.height;
+	if (!(flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)))
+		client->pointer_buttons = hid_pointer_buttons(client->pointer_buttons, flags);
 	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) != 0)
 	{
 		char message[160];
@@ -1606,43 +1610,23 @@ static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT1
 			flags = (uint16_t)(flags & (uint16_t)~PTR_FLAGS_WHEEL_NEGATIVE);
 		horizontal_wheel = true;
 	}
-	if ((flags & PTR_FLAGS_BUTTON1) != 0)
-	{
-		if ((flags & PTR_FLAGS_DOWN) != 0)
-			client->relative_buttons |= 0x01;
-		else
-			client->relative_buttons &= (uint8_t)~0x01U;
-	}
-	if ((flags & PTR_FLAGS_BUTTON2) != 0)
-	{
-		if ((flags & PTR_FLAGS_DOWN) != 0)
-			client->relative_buttons |= 0x02;
-		else
-			client->relative_buttons &= (uint8_t)~0x02U;
-	}
-	if ((flags & PTR_FLAGS_BUTTON3) != 0)
-	{
-		if ((flags & PTR_FLAGS_DOWN) != 0)
-			client->relative_buttons |= 0x04;
-		else
-			client->relative_buttons &= (uint8_t)~0x04U;
-	}
-	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3 |
-	              PTR_FLAGS_MOVE)) != 0 ||
-	    x_delta != 0 || y_delta != 0 || client->relative_buttons != 0)
+	if (!(flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)))
+		client->pointer_buttons = hid_pointer_buttons(client->pointer_buttons, flags);
+	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) != 0)
 	{
 		char message[192];
 		(void)snprintf(message, sizeof(message),
 		               "RDP relative button flags=0x%04X dx=%d dy=%d mask=0x%02X down=%u",
-		               flags, x_delta, y_delta, client->relative_buttons,
+		               flags, x_delta, y_delta, client->pointer_buttons,
 		               (unsigned)((flags & PTR_FLAGS_DOWN) != 0));
 		log_message("INFO", message);
 	}
 	uint8_t payload[5] = { 0 };
 	protocol_write_u16(payload, (uint16_t)x_delta);
 	protocol_write_u16(payload + 2, (uint16_t)y_delta);
-	payload[4] = client->relative_buttons;
-	const bool position_ok = server_send_control(client->server, NANOKVM_CONTROL_POINTER_REL,
+	payload[4] = client->pointer_buttons;
+	const bool position_ok = (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) != 0 ||
+	                         server_send_control(client->server, NANOKVM_CONTROL_POINTER_REL,
 	                                              payload, sizeof(payload));
 	uint8_t wheel_payload[2] = { 0 };
 	protocol_write_u16(wheel_payload, flags);
@@ -1976,8 +1960,6 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 	log_message("INFO", "TLS RDP client 연결 수락");
 	while (!client_should_stop(client))
 	{
-		if (client->bitmap_fallback_active && !client_flush_pending_bitmap(client))
-			break;
 		HANDLE handles[MAX_EVENT_HANDLES] = WINPR_C_ARRAY_INIT;
 		DWORD count = peer->GetEventHandles(peer, handles, ARRAYSIZE(handles));
 		if (count == 0 || count >= ARRAYSIZE(handles))
@@ -1993,27 +1975,26 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 			const bool bitmap_pending = client->bitmap_queue_count > 0;
 			const uint64_t last_send_started_at = client->bitmap_last_send_started_at;
 			LeaveCriticalSection(&client->lock);
+			const uint64_t interval = client->gfx_uses_progressive
+			                              ? PROGRESSIVE_MIN_SEND_INTERVAL_MS : BITMAP_FRAME_INTERVAL_MS;
 			if (bitmap_pending)
 			{
 				const uint64_t now = monotonic_milliseconds();
 				if (last_send_started_at == 0 ||
-				    now - last_send_started_at >= BITMAP_FRAME_INTERVAL_MS)
+				    now - last_send_started_at >= interval)
 					timeout = 0;
 				else
 					timeout = WINPR_ASSERTING_INT_CAST(
-					    DWORD, BITMAP_FRAME_INTERVAL_MS - (now - last_send_started_at));
+					    DWORD, interval - (now - last_send_started_at));
 			}
 		}
+		/* A blocked transport must wait for socket readiness, never spin on a due frame. */
+		if (timeout == 0 && peer->IsWriteBlocked && peer->IsWriteBlocked(peer))
+			timeout = 20;
 		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, timeout);
-		if (status == WAIT_TIMEOUT)
-		{
-			if (client->direct_gfx_active &&
-			    (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client)))
-				break;
-			continue;
-		}
 		if (status == WAIT_FAILED)
 			break;
+		/* Read key/button releases before spending time encoding the next frame. */
 		if (!peer->CheckFileDescriptor(peer))
 			break;
 		if (client->bitmap_fallback_active && !client_flush_pending_bitmap(client))

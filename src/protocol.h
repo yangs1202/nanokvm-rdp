@@ -41,6 +41,14 @@ typedef struct
 	uint16_t length;
 } NanokvmControlMessage;
 
+typedef struct
+{
+	uint8_t data[4 + NANOKVM_CONTROL_MAX_PAYLOAD];
+	size_t used;
+} NanokvmControlReader;
+
+/* 1: complete message, 0: partial/no data, -1: closed/invalid/error. */
+int protocol_receive_available(int fd, NanokvmControlReader* reader, NanokvmControlMessage* message);
 bool protocol_send(int fd, uint8_t type, const void* payload, uint16_t length);
 bool protocol_receive(int fd, NanokvmControlMessage* message);
 void protocol_write_u16(uint8_t* data, uint16_t value);

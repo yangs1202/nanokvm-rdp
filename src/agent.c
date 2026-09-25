@@ -6,6 +6,8 @@
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
@@ -76,6 +78,10 @@ typedef struct
 	struct sockaddr_in video_address;
 	KvmApi kvm;
 	HidState hid;
+	NanokvmControlReader control_reader;
+	uint64_t input_events;
+	uint64_t max_input_handler_ms;
+	uint64_t last_input_log_at;
 	RtpH264Packetizer packetizer;
 	atomic_bool streaming;
 	atomic_bool wait_for_idr;
@@ -151,12 +157,28 @@ static bool connect_control(Agent* agent)
 	int enabled = 1;
 	(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
 	struct sockaddr_in address = { .sin_family = AF_INET, .sin_port = htons(agent->control_port) };
-	if (!resolve_gateway(agent->gateway, &address.sin_addr) ||
-	    connect(fd, (const struct sockaddr*)&address, sizeof(address)) != 0)
+	if (!resolve_gateway(agent->gateway, &address.sin_addr) || fcntl(fd, F_SETFL, O_NONBLOCK) < 0)
 	{
 		(void)close(fd);
 		return false;
 	}
+	int connected = connect(fd, (const struct sockaddr*)&address, sizeof(address));
+	if (connected < 0 && errno == EINPROGRESS)
+	{
+		struct pollfd ready = { .fd = fd, .events = POLLOUT };
+		int error = 0;
+		socklen_t size = sizeof(error);
+		connected = poll(&ready, 1, 250) > 0 &&
+		            getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == 0 && error == 0 ? 0 : -1;
+	}
+	if (connected < 0 || fcntl(fd, F_SETFL, 0) < 0)
+	{
+		(void)close(fd);
+		return false;
+	}
+	const struct timeval send_timeout = { .tv_usec = 100000 };
+	(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+	agent->control_reader = (NanokvmControlReader){ 0 };
 	agent->video_address.sin_addr = address.sin_addr;
 	uint8_t hello[NANOKVM_HELLO_CAPABILITIES_PAYLOAD_SIZE] = { 0 };
 	protocol_write_u16(hello, agent->width);
@@ -256,6 +278,8 @@ static bool send_h264(Agent* agent, const uint8_t* data, size_t length)
 
 static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 {
+	const uint64_t started = monotonic_milliseconds();
+	bool succeeded = true;
 	switch (message->type)
 	{
 		case NANOKVM_CONTROL_START_STREAM:
@@ -275,11 +299,11 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 			break;
 		case NANOKVM_CONTROL_KEY:
 			if (message->length == NANOKVM_KEY_PAYLOAD_SIZE)
-				(void)hid_scancode(&agent->hid, message->payload[0], message->payload[1] != 0,
+				succeeded = hid_scancode(&agent->hid, message->payload[0], message->payload[1] != 0,
 				                   message->payload[2] != 0);
 			else if (message->length == NANOKVM_KEY_ACK_REQUEST_PAYLOAD_SIZE)
 			{
-				const bool succeeded = hid_scancode(&agent->hid, message->payload[0],
+				succeeded = hid_scancode(&agent->hid, message->payload[0],
 				                                   message->payload[1] != 0, message->payload[2] != 0);
 				uint8_t ack[NANOKVM_KEY_ACK_PAYLOAD_SIZE] = { 0 };
 				memcpy(ack, message->payload + 3, sizeof(uint32_t));
@@ -297,7 +321,7 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 			break;
 		case NANOKVM_CONTROL_POINTER_ABS:
 			if (message->length == 12)
-				(void)hid_absolute(&agent->hid, protocol_read_u16(message->payload),
+				succeeded = hid_absolute(&agent->hid, protocol_read_u16(message->payload),
 				                   protocol_read_u16(message->payload + 2),
 				                   protocol_read_u16(message->payload + 4),
 				                   protocol_read_u16(message->payload + 6),
@@ -305,12 +329,12 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 			break;
 		case NANOKVM_CONTROL_POINTER_REL:
 			if (message->length == 5)
-				(void)hid_relative(&agent->hid, (int16_t)protocol_read_u16(message->payload),
+				succeeded = hid_relative(&agent->hid, (int16_t)protocol_read_u16(message->payload),
 				                   (int16_t)protocol_read_u16(message->payload + 2), message->payload[4]);
 			break;
 		case NANOKVM_CONTROL_WHEEL:
 			if (message->length == 2)
-				(void)hid_wheel(&agent->hid, protocol_read_u16(message->payload));
+				succeeded = hid_wheel(&agent->hid, protocol_read_u16(message->payload));
 			break;
 		case NANOKVM_CONTROL_RELEASE_ALL:
 			hid_release_all(&agent->hid);
@@ -322,6 +346,20 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 			agent->last_pong_at = monotonic_milliseconds();
 			break;
 		default: break;
+	}
+	if (!succeeded)
+	{
+		(void)fprintf(stderr, "%s: input delivery failed (type=%u); cancelling stale input and releasing HID\n",
+		              TAG, message->type);
+		hid_release_all(&agent->hid);
+	}
+	if ((message->type >= NANOKVM_CONTROL_KEY && message->type <= NANOKVM_CONTROL_RELEASE_ALL) ||
+	    message->type == NANOKVM_CONTROL_TEXT_UTF8)
+	{
+		agent->input_events++;
+		const uint64_t elapsed = monotonic_milliseconds() - started;
+		if (elapsed > agent->max_input_handler_ms)
+			agent->max_input_handler_ms = elapsed;
 	}
 }
 
@@ -493,6 +531,7 @@ int main(int argc, char* argv[])
 	rtp_h264_packetizer_init(&agent.packetizer, RTP_H264_DEFAULT_MTU, (uint32_t)getpid());
 	ensure_hid_nodes();
 	hid_init(&agent.hid, NULL, NULL, NULL);
+	hid_release_all(&agent.hid);
 	atomic_init(&agent.streaming, false);
 	atomic_init(&agent.wait_for_idr, true);
 	atomic_init(&agent.capture_deinit_requested, false);
@@ -505,45 +544,68 @@ int main(int argc, char* argv[])
 	(void)signal(SIGPIPE, SIG_IGN);
 	if (pthread_create(&agent.video_thread, NULL, video_loop, &agent) != 0)
 		return 1;
+	uint64_t reconnect_at = 0;
+	uint64_t last_hid_error_log = 0;
 	while (!stop_requested)
 	{
-		if (agent.control_fd < 0)
+		if (!hid_flush(&agent.hid))
 		{
-			if (!connect_control(&agent))
+			const uint64_t error_at = monotonic_milliseconds();
+			if (error_at - last_hid_error_log >= 5000U)
 			{
-				sleep(1);
-				continue;
+				(void)fprintf(stderr, "%s: HID unavailable; cancelling stale reports and retrying release\n", TAG);
+				last_hid_error_log = error_at;
 			}
-			(void)fprintf(stderr, "%s: gateway control 연결 완료\n", TAG);
+			hid_release_all(&agent.hid);
 		}
-		fd_set readable;
-		FD_ZERO(&readable);
-		FD_SET(agent.control_fd, &readable);
-		struct timeval timeout = { .tv_sec = 0, .tv_usec = 5000 };
-		if (select(agent.control_fd + 1, &readable, NULL, NULL, &timeout) > 0)
+		uint64_t now = monotonic_milliseconds();
+		if (agent.control_fd < 0 && now >= reconnect_at)
 		{
-			for (;;)
+			if (connect_control(&agent))
+				(void)fprintf(stderr, "%s: gateway control 연결 완료\n", TAG);
+			reconnect_at = monotonic_milliseconds() + 1000U;
+		}
+		struct pollfd fds[4] = { { .fd = agent.control_fd, .events = POLLIN } };
+		const size_t count = 1U + hid_pollfds(&agent.hid, fds + 1);
+		const int ready = poll(fds, count, hid_poll_timeout(&agent.hid, 20));
+		if (ready > 0 && agent.control_fd >= 0 &&
+		    (fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL)))
+		{
+			/* Bound each network batch so mouse/keyboard output and heartbeat
+			 * continue even during an uninterrupted stream of pointer motion. */
+			for (unsigned batch = 0; batch < 32; batch++)
 			{
 				NanokvmControlMessage message = { 0 };
-				if (!protocol_receive(agent.control_fd, &message))
+				const int result = protocol_receive_available(agent.control_fd, &agent.control_reader, &message);
+				if (result < 0)
 				{
 					disconnect_control(&agent);
 					break;
 				}
-				handle_control(&agent, &message);
-				fd_set pending;
-				FD_ZERO(&pending);
-				FD_SET(agent.control_fd, &pending);
-				struct timeval immediate = { 0 };
-				if (select(agent.control_fd + 1, &pending, NULL, NULL, &immediate) <= 0)
+				if (result == 0)
 					break;
+				handle_control(&agent, &message);
 			}
 		}
-		if (agent.control_fd >= 0 && hid_keyboard_pending(&agent.hid))
-			hid_keyboard_flush(&agent.hid);
-		const uint64_t now = monotonic_milliseconds();
-		if (agent.control_fd >= 0)
-			hid_release_stuck_buttons(&agent.hid, now);
+		now = monotonic_milliseconds();
+		if (now - agent.last_input_log_at >= 5000U)
+		{
+			(void)fprintf(stderr,
+			              "%s: INPUT events=%llu sent=%llu retry=%llu errors=%llu overflow=%llu pending=%u/%u/%u max_queue_ms=%llu max_handle_ms=%llu\n",
+			              TAG, (unsigned long long)agent.input_events,
+			              (unsigned long long)agent.hid.reports_sent,
+			              (unsigned long long)agent.hid.write_retries,
+			              (unsigned long long)agent.hid.write_errors,
+			              (unsigned long long)agent.hid.queue_overflows,
+			              agent.hid.keyboard_queue.count, agent.hid.mouse_queue.count, agent.hid.touch_queue.count,
+			              (unsigned long long)agent.hid.max_queue_age_ms,
+			              (unsigned long long)agent.max_input_handler_ms);
+			agent.hid.max_queue_age_ms = 0;
+			agent.max_input_handler_ms = 0;
+			agent.last_input_log_at = now;
+		}
+		if (agent.control_fd < 0)
+			continue;
 		if (now - agent.last_pong_at > HEARTBEAT_TIMEOUT_MS ||
 		    (now - agent.last_ping_at >= HEARTBEAT_INTERVAL_MS &&
 		     !protocol_send(agent.control_fd, NANOKVM_CONTROL_PING, NULL, 0)))
@@ -563,8 +625,16 @@ int main(int argc, char* argv[])
 			agent.last_stats_at = now;
 		}
 	}
-	(void)pthread_join(agent.video_thread, NULL);
 	hid_release_all(&agent.hid);
+	const uint64_t release_deadline = monotonic_milliseconds() + 200U;
+	while (hid_pending(&agent.hid) && monotonic_milliseconds() < release_deadline)
+	{
+		struct pollfd fds[3];
+		const size_t count = hid_pollfds(&agent.hid, fds);
+		(void)poll(fds, count, 5);
+		(void)hid_flush(&agent.hid);
+	}
+	(void)pthread_join(agent.video_thread, NULL);
 	if (agent.control_fd >= 0)
 		(void)close(agent.control_fd);
 	if (agent.video_fd >= 0)

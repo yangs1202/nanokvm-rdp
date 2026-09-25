@@ -23,15 +23,8 @@
 #define PTR_XFLAGS_BUTTON2 0x0002
 #define WHEEL_ROTATION_MASK 0x01FF
 #define HID_MOUSE_BUTTONS_MASK 0x07
-#define HID_TOUCH_BUTTONS_MASK 0x07
+#define HID_TOUCH_BUTTONS_MASK 0x1f
 #define HID_MODIFIER_RIGHT_ALT 0x40
-
-/* hidg2는 버튼 1,2,3,4,5 순서다. 상대 마우스의 오른쪽 버튼 비트 0x02를
- * 그대로 쓰면 절대 포인터의 Button 2가 된다. */
-static uint8_t absolute_buttons(uint8_t buttons)
-{
-	return (uint8_t)((buttons & 0x01U) | ((buttons & 0x02U) << 1U) | ((buttons & 0x04U) >> 1U));
-}
 
 static bool is_hid_gadget(const char* path)
 {
@@ -74,7 +67,7 @@ static int hid_fd(HidState* hid, const char* path)
 	if (slot && *slot >= 0)
 	{
 		struct pollfd ready = { .fd = *slot, .events = POLLOUT };
-		if (poll(&ready, 1, 0) >= 0)
+		if (poll(&ready, 1, 0) >= 0 && !(ready.revents & (POLLERR | POLLHUP | POLLNVAL)))
 			return *slot;
 		(void)close(*slot);
 		*slot = -1;
@@ -111,8 +104,8 @@ static bool write_hid_report(HidState* hid, const char* path, const uint8_t* rep
 	int fd = slot ? hid_fd(hid, path) : open_hid_fd(path);
 	bool retryable = false;
 	bool wrote = write_open_report(fd, report, length, &retryable);
-	/* EAGAIN은 가젯 큐가 찬 것이다. 디스크립터를 닫고 다시 열면 큐가 비워지고
-	 * 눌린 키 상태가 유실된다. */
+	/* EAGAIN means the previous USB transfer is still pending. Retry the
+	 * same report when writable; reopening the fd does not drain that transfer. */
 	if (!wrote && slot && fd >= 0 && !retryable)
 	{
 		(void)close(fd);
@@ -153,11 +146,97 @@ static uint8_t absolute_report_length(const char* path)
 	return 6;
 }
 
-static void sleep_milliseconds(long milliseconds)
+static uint64_t hid_now(void)
 {
-	const struct timespec duration = { .tv_sec = milliseconds / 1000L,
-	                                  .tv_nsec = (milliseconds % 1000L) * 1000000L };
-	(void)nanosleep(&duration, NULL);
+	struct timespec now = { 0 };
+	(void)clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+/* A successful write submits one USB report; EAGAIN must retain that report.
+ * Keep transitions in order. Only adjacent absolute motion with unchanged
+ * buttons may replace older motion. Never merge clicks or relative deltas. */
+static bool write_paste_codepoint(HidState* hid, uint32_t codepoint);
+
+static bool flush_reports(HidState* hid, HidReportQueue* queue, const char* path, size_t length)
+{
+	while (queue->count > 0)
+	{
+		const uint64_t now = hid_now();
+		if (now < queue->ready_at)
+			return true;
+		if (queue->blocked_at && now - queue->blocked_at >= HID_REPORT_STALL_TIMEOUT_MS)
+		{
+			hid->write_errors++;
+			return false;
+		}
+		HidReport* report = &queue->reports[queue->head];
+		if (report->paste_codepoint)
+		{
+			if (!write_paste_codepoint(hid, report->paste_codepoint))
+			{
+				hid->write_errors++;
+				return false;
+			}
+			report->paste_codepoint = 0;
+			queue->ready_at = now + 30U;
+			return true;
+		}
+		if (!write_hid_report(hid, path, report->data, length))
+		{
+			if (!queue->blocked_at)
+				queue->blocked_at = now;
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+			{
+				hid->write_retries++;
+				return true;
+			}
+			hid->write_errors++;
+			queue->ready_at = now + 100U;
+			return false;
+		}
+		queue->blocked_at = 0;
+		const uint64_t age = now - report->queued_at;
+		if (age > hid->max_queue_age_ms)
+			hid->max_queue_age_ms = age;
+		hid->reports_sent++;
+		queue->ready_at = now + report->delay_ms;
+		queue->head = (queue->head + 1U) % HID_REPORT_QUEUE_CAPACITY;
+		queue->count--;
+	}
+	return true;
+}
+
+static bool queue_report(HidState* hid, HidReportQueue* queue, const char* path,
+                         const uint8_t* data, size_t length, bool motion, uint16_t delay_ms)
+{
+	if (motion && queue->count > 0)
+	{
+		const unsigned last = (queue->head + queue->count - 1U) % HID_REPORT_QUEUE_CAPACITY;
+		HidReport* previous = &queue->reports[last];
+		if (previous->motion && previous->data[0] == data[0])
+		{
+			memcpy(previous->data, data, length);
+			return flush_reports(hid, queue, path, length);
+		}
+	}
+	if (queue->count == HID_REPORT_QUEUE_CAPACITY)
+	{
+		(void)flush_reports(hid, queue, path, length);
+		if (queue->count == HID_REPORT_QUEUE_CAPACITY)
+		{
+			hid->queue_overflows++;
+			return false;
+		}
+	}
+	const unsigned slot = (queue->head + queue->count) % HID_REPORT_QUEUE_CAPACITY;
+	queue->reports[slot] = (HidReport){ .delay_ms = delay_ms, .motion = motion,
+	                                  .queued_at = hid_now(),
+	                                  .paste_codepoint = queue == &hid->keyboard_queue
+	                                      ? hid->keyboard_paste_codepoint : 0 };
+	memcpy(queue->reports[slot].data, data, length);
+	queue->count++;
+	return flush_reports(hid, queue, path, length);
 }
 
 void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char* touch)
@@ -181,15 +260,6 @@ void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char
 	hid->mouse_fd = open_hid_fd(hid->mouse_path);
 	hid->touch_fd = open_hid_fd(hid->touch_path);
 	hid->paste_fd = open_hid_fd(hid->paste_path);
-}
-
-static void note_button_change(HidState* hid)
-{
-	struct timespec now = { 0 };
-	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-		hid->buttons_changed_at = 0;
-	else
-		hid->buttons_changed_at = (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 }
 
 static void reset_keyboard_state(HidState* hid, bool desynced)
@@ -220,12 +290,25 @@ uint16_t hid_clamp_absolute(uint16_t value, uint16_t dimension)
 
 uint16_t hid_pointer_flags_from_extended(uint16_t flags)
 {
-	/* RDP extended mouse의 X1은 가운데 버튼이다. X2는 이 가젯이 받지 않는다. */
-	uint16_t mapped = (uint16_t)(flags & (PTR_FLAGS_DOWN | PTR_FLAGS_WHEEL |
-	                                      PTR_FLAGS_WHEEL_NEGATIVE | PTR_FLAGS_HWHEEL));
-	if ((flags & PTR_XFLAGS_BUTTON1) != 0)
-		mapped |= PTR_FLAGS_BUTTON3;
-	return mapped;
+	/* Reserve the low two bits of absolute control flags for USB buttons 4/5. */
+	return flags & (PTR_FLAGS_DOWN | PTR_XFLAGS_BUTTON1 | PTR_XFLAGS_BUTTON2);
+}
+
+uint8_t hid_pointer_buttons(uint8_t buttons, uint16_t flags)
+{
+	const uint16_t bits[] = { PTR_FLAGS_BUTTON1, PTR_FLAGS_BUTTON2, PTR_FLAGS_BUTTON3,
+	                          PTR_XFLAGS_BUTTON1, PTR_XFLAGS_BUTTON2 };
+	for (unsigned i = 0; i < 5; i++)
+	{
+		if (flags & bits[i])
+		{
+			if (flags & PTR_FLAGS_DOWN)
+				buttons |= (uint8_t)(1U << i);
+			else
+				buttons &= (uint8_t)~(1U << i);
+		}
+	}
+	return buttons;
 }
 
 void hid_map_scancode(uint8_t code, bool extended, bool swap_alt_command,
@@ -262,33 +345,67 @@ static bool send_keyboard(HidState* hid)
 		if (hid->usages[usage])
 			report[index++] = (uint8_t)usage;
 	}
-	if (write_hid_report(hid, hid->keyboard_path, report, sizeof(report)))
-	{
-		hid->keyboard_desynced = false;
-		return true;
-	}
-	/* EAGAIN은 호스트가 이전 보고를 아직 가져가지 않은 것이다. 키 상태를 지우면
-	 * 물리 키보드가 멈추므로 상태만 유지하고 다음 보고에서 다시 쓴다. */
-	if (errno == EAGAIN || errno == EWOULDBLOCK)
-	{
-		hid->keyboard_desynced = true;
-		return true;
-	}
-	hid->keyboard_desynced = true;
-	return false;
+	const bool ok = queue_report(hid, &hid->keyboard_queue, hid->keyboard_path,
+	                             report, sizeof(report), false, hid->keyboard_delay_ms);
+	hid->keyboard_desynced = hid->keyboard_queue.count > 0;
+	return ok;
 }
 
 bool hid_keyboard_pending(const HidState* hid)
 {
-	return hid && hid->keyboard_desynced;
+	return hid && hid->keyboard_queue.count > 0;
 }
 
 void hid_keyboard_flush(HidState* hid)
 {
 	if (!hid)
 		return;
-	if (hid->keyboard_desynced)
-		(void)send_keyboard(hid);
+	(void)flush_reports(hid, &hid->keyboard_queue, hid->keyboard_path, 8);
+	hid->keyboard_desynced = hid->keyboard_queue.count > 0;
+}
+
+bool hid_pending(const HidState* hid)
+{
+	return hid && (hid->keyboard_queue.count || hid->mouse_queue.count || hid->touch_queue.count);
+}
+
+bool hid_flush(HidState* hid)
+{
+	const bool keyboard = flush_reports(hid, &hid->keyboard_queue, hid->keyboard_path, 8);
+	const bool mouse = flush_reports(hid, &hid->mouse_queue, hid->mouse_path, 4);
+	const bool touch = flush_reports(hid, &hid->touch_queue, hid->touch_path,
+	                                  hid->absolute_report_length);
+	hid->keyboard_desynced = hid->keyboard_queue.count > 0;
+	return keyboard && mouse && touch;
+}
+
+size_t hid_pollfds(const HidState* hid, struct pollfd* fds)
+{
+	const HidReportQueue* queues[] = { &hid->keyboard_queue, &hid->mouse_queue, &hid->touch_queue };
+	const int devices[] = { hid->keyboard_fd, hid->mouse_fd, hid->touch_fd };
+	const uint64_t now = hid_now();
+	size_t count = 0;
+	for (size_t i = 0; i < 3; i++)
+	{
+		if (queues[i]->count && now >= queues[i]->ready_at && devices[i] >= 0)
+			fds[count++] = (struct pollfd){ .fd = devices[i], .events = POLLOUT };
+	}
+	return count;
+}
+
+int hid_poll_timeout(const HidState* hid, int idle_ms)
+{
+	const HidReportQueue* queues[] = { &hid->keyboard_queue, &hid->mouse_queue, &hid->touch_queue };
+	const uint64_t now = hid_now();
+	for (size_t i = 0; i < 3; i++)
+	{
+		if (!queues[i]->count)
+			continue;
+		const uint64_t delay = queues[i]->ready_at > now ? queues[i]->ready_at - now : 5U;
+		if (delay < (uint64_t)idle_ms)
+			idle_ms = (int)delay;
+	}
+	return idle_ms;
 }
 
 bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t* modifier)
@@ -372,6 +489,8 @@ bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release)
 	uint8_t modifier = 0;
 	if (!hid_translate_scancode(code, extended, &usage, &modifier))
 		return true;
+	if ((modifier != 0 ? (hid->modifiers & modifier) != 0 : hid->usages[usage]) == !release)
+		return true;
 	if (modifier != 0)
 	{
 		if (release)
@@ -381,10 +500,8 @@ bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release)
 	}
 	else
 		hid->usages[usage] = !release;
-	/* 가젯 큐가 찼으면 중간 보고를 더 넣지 않는다. 최신 상태는 유지하고
-	 * 다음 flush가 한 보고만 다시 쓴다. */
-	if (hid->keyboard_desynced)
-		return true;
+	/* 가젯이 막혀 있어도 이번 보고를 큐에 남긴다. 최신 상태만 다시 쓰면
+	 * 아직 나가지 않은 글자가 사라진다. */
 	return send_keyboard(hid);
 }
 
@@ -576,12 +693,10 @@ static bool tap_text_key(HidState* hid, HidTextKey key)
 	hid->usages[key.usage] = true;
 	if (!send_keyboard(hid))
 		return false;
-	sleep_milliseconds(20);
 	hid->modifiers = 0;
 	hid->usages[key.usage] = false;
 	if (!send_keyboard(hid))
 		return false;
-	sleep_milliseconds(20);
 	return true;
 }
 
@@ -648,7 +763,7 @@ static bool utf8_encode(uint32_t codepoint, uint8_t out[4], size_t* length)
 
 /* 두벌식으로 칠 수 없는 문자는 대상 macOS 클립보드에 넣고 Command+V로 붙인다.
  * 페이로드는 osascript가 UTF-8로 읽는 quoted form이다. */
-static bool paste_codepoint(HidState* hid, uint32_t codepoint)
+static bool write_paste_codepoint(HidState* hid, uint32_t codepoint)
 {
 	uint8_t encoded[4] = { 0 };
 	size_t encoded_length = 0;
@@ -674,16 +789,22 @@ static bool paste_codepoint(HidState* hid, uint32_t codepoint)
 		return false;
 	payload[length++] = '\'';
 	payload[length++] = '\n';
-	if (!write_hid_report(hid, hid->paste_path, payload, length))
-		return false;
+	return write_hid_report(hid, hid->paste_path, payload, length);
+}
 
+static bool paste_codepoint(HidState* hid, uint32_t codepoint)
+{
+	if (hid->paste_fd < 0)
+		return false;
 	const uint8_t saved = hid->modifiers;
 	memset(hid->usages, 0, sizeof(hid->usages));
 	hid->modifiers = 0x08;
 	hid->usages[0x19] = true;
-	if (!send_keyboard(hid))
+	hid->keyboard_paste_codepoint = codepoint;
+	const bool queued = send_keyboard(hid);
+	hid->keyboard_paste_codepoint = 0;
+	if (!queued)
 		return false;
-	sleep_milliseconds(30);
 	hid->usages[0x19] = false;
 	hid->modifiers = saved;
 	return send_keyboard(hid);
@@ -693,36 +814,28 @@ bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
 {
 	if (!hid || !text || length == 0)
 		return false;
-
+	/* Pacing belongs to the output queue; never sleep in the control receiver. */
+	hid->keyboard_delay_ms = 20;
 	reset_keyboard_state(hid, false);
-	if (!send_keyboard(hid))
-		return false;
-
-	for (size_t offset = 0; offset < length;)
+	bool ok = send_keyboard(hid);
+	for (size_t offset = 0; ok && offset < length;)
 	{
 		uint32_t codepoint = 0;
-		if (!utf8_decode(text, length, &offset, &codepoint))
-		{
-			reset_keyboard_state(hid, false);
-			(void)send_keyboard(hid);
-			return false;
-		}
-		if (type_codepoint(hid, codepoint))
-			continue;
-		if (paste_codepoint(hid, codepoint))
-			continue;
-		{
-			reset_keyboard_state(hid, false);
-			(void)send_keyboard(hid);
-			return false;
-		}
+		ok = utf8_decode(text, length, &offset, &codepoint);
+		if (ok)
+			ok = codepoint <= 0x7fU || (codepoint >= 0xac00 && codepoint <= 0xd7a3) ||
+			     hangul_jamo_sequence(codepoint)
+			         ? type_codepoint(hid, codepoint) : paste_codepoint(hid, codepoint);
 	}
-	return true;
+	hid->keyboard_delay_ms = 0;
+	if (!ok)
+		hid_release_all(hid);
+	return ok;
 }
 
 static uint8_t touch_buttons(uint8_t buttons)
 {
-	return absolute_buttons(buttons);
+	return (uint8_t)(buttons & HID_TOUCH_BUTTONS_MASK);
 }
 
 static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)
@@ -733,113 +846,64 @@ static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)
 	report[4] = (uint8_t)(y >> 8U);
 }
 
-static bool send_absolute(HidState* hid)
+static bool send_absolute(HidState* hid, bool motion)
 {
 	uint8_t report[7] = { touch_buttons(hid->buttons), 0, 0, 0, 0, 0, 0 };
-	const size_t length = hid->absolute_report_length == 7 ? 7 : 6;
+	const size_t length = hid->absolute_report_length;
 	write_touch_position(report, hid->last_x, hid->last_y);
+	report[5] = (uint8_t)hid->wheel;
 	if (length == 7)
 		report[6] = (uint8_t)hid->pan;
-	report[5] = (uint8_t)hid->wheel;
-	if (!write_hid_report(hid, hid->touch_path, report, length))
-		return false;
-	if (hid->wheel == 0 && hid->pan == 0)
-		return true;
+	const bool ok = queue_report(hid, &hid->touch_queue, hid->touch_path, report, length,
+	                             motion && hid->wheel == 0 && hid->pan == 0, 0);
+	/* Wheel and relative axes are deltas, not persistent state. */
 	hid->wheel = 0;
 	hid->pan = 0;
-	report[5] = 0;
-	report[6] = 0;
-	return write_hid_report(hid, hid->touch_path, report, length);
+	return ok;
 }
 
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
-	              uint16_t flags)
+                  uint16_t flags)
 {
-	const uint8_t previous = hid->buttons;
-	if ((flags & PTR_FLAGS_BUTTON1) != 0)
-	{
-		if ((flags & PTR_FLAGS_DOWN) != 0)
-			hid->buttons |= 0x01;
-		else
-			hid->buttons &= (uint8_t)~0x01U;
-	}
-	if ((flags & PTR_FLAGS_BUTTON2) != 0)
-	{
-		if ((flags & PTR_FLAGS_DOWN) != 0)
-			hid->buttons |= 0x02;
-		else
-			hid->buttons &= (uint8_t)~0x02U;
-	}
-	if ((flags & PTR_FLAGS_BUTTON3) != 0)
-	{
-		if ((flags & PTR_FLAGS_DOWN) != 0)
-			hid->buttons |= 0x04;
-		else
-			hid->buttons &= (uint8_t)~0x04U;
-	}
-	/* Windows App은 버튼 down을 절대 포인터로, release를 상대 포인터로 보낸다.
-	 * 절대 버튼이 바뀌면 상대 버튼도 같은 값으로 맞춰 한쪽만 눌린 채 남지 않게 한다. */
-	if (hid->buttons != previous)
-	{
-		hid->mouse_buttons = hid->buttons;
-		note_button_change(hid);
-	}
-
+	hid->buttons = hid_pointer_buttons(hid->buttons, flags);
+	hid->mouse_buttons = hid->buttons;
 	hid->last_x = hid_scale_absolute(x, width);
 	hid->last_y = hid_scale_absolute(y, height);
-	const bool absolute_ok = send_absolute(hid);
-	if (hid->buttons == previous)
-		return absolute_ok;
-	const uint8_t relative[4] = { hid->mouse_buttons, 0, 0, 0 };
-	const bool relative_ok = write_hid_report(hid, hid->mouse_path, relative, sizeof(relative));
-	if (!relative_ok || hid->buttons != 0)
-		return absolute_ok && relative_ok;
-	/* macOS는 절대 마우스 버튼이 풀려도 상대 마우스 버튼이 한 번이라도 남으면
-	 * 오른쪽 클릭을 고정한다. 해제는 상대 보고를 한 번 더 보낸다. */
-	return absolute_ok && write_hid_report(hid, hid->mouse_path, relative, sizeof(relative));
+	/* The absolute endpoint alone owns buttons. Duplicating presses on two
+	 * USB mice creates independently stuck button states on the host. */
+	return send_absolute(hid, (flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3 |
+	                                    PTR_XFLAGS_BUTTON1 | PTR_XFLAGS_BUTTON2)) == 0);
 }
 
 bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 {
-	if (x > 127)
-		x = 127;
-	if (x < -127)
-		x = -127;
-	if (y > 127)
-		y = 127;
-	if (y < -127)
-		y = -127;
-	const uint8_t next = buttons & HID_MOUSE_BUTTONS_MASK;
-	const bool buttons_changed = hid->mouse_buttons != next || hid->buttons != next;
-	/* 상대 이동은 버튼 마스크가 0으로 들어온다. 절대 포인터에 남은 버튼을
-	 * 그 값으로 덮으면 오른쪽 클릭 해제가 이동 보고에 묻힌다. */
-	if (next != 0 || hid->mouse_buttons != 0)
+	const uint8_t next = buttons & HID_TOUCH_BUTTONS_MASK;
+	const bool changed = hid->buttons != next;
+	hid->buttons = next;
+	hid->mouse_buttons = next;
+	bool ok = !changed || send_absolute(hid, false);
+	/* Relative endpoint carries motion only. Split large deltas without loss. */
+	while (x != 0 || y != 0)
 	{
-		hid->mouse_buttons = next;
-		hid->buttons = next;
-		if (buttons_changed)
-			note_button_change(hid);
+		const int8_t dx = x > 127 ? 127 : x < -127 ? -127 : (int8_t)x;
+		const int8_t dy = y > 127 ? 127 : y < -127 ? -127 : (int8_t)y;
+		const uint8_t report[4] = { 0, (uint8_t)dx, (uint8_t)dy, 0 };
+		if (!queue_report(hid, &hid->mouse_queue, hid->mouse_path, report, sizeof(report), false, 0))
+			return false;
+		x -= dx;
+		y -= dy;
 	}
-	const uint8_t report[4] = { next, (uint8_t)(int8_t)x, (uint8_t)(int8_t)y, 0 };
-	const bool relative_ok = write_hid_report(hid, hid->mouse_path, report, sizeof(report));
-	if (!buttons_changed)
-		return relative_ok || errno == EAGAIN || errno == EWOULDBLOCK;
-	const bool absolute_ok = send_absolute(hid);
-	return absolute_ok || relative_ok;
+	return ok;
 }
 
 static int wheel_detents(uint16_t flags)
 {
 	int delta = (int)(flags & WHEEL_ROTATION_MASK);
-	if ((flags & PTR_FLAGS_WHEEL_NEGATIVE) != 0)
-		delta = -delta;
+	if (delta & PTR_FLAGS_WHEEL_NEGATIVE)
+		delta -= 0x200; /* signed 9-bit RDP rotation */
 	int detents = delta / 120;
 	if (detents == 0 && delta != 0)
 		detents = delta > 0 ? 1 : -1;
-	if (detents > 1)
-		detents = 1;
-	if (detents < -1)
-		detents = -1;
 	return detents;
 }
 
@@ -849,9 +913,7 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 	const bool horizontal = (flags & PTR_FLAGS_HWHEEL) != 0;
 	if (!vertical && !horizontal)
 		return true;
-	int detents = wheel_detents(flags);
-	/* 7바이트 보고의 마지막 바이트는 AC Pan이다. 6바이트 가젯은 그 usage가 없어
-	 * 가로 휠을 세로 Wheel로 보내지 않는다. macOS 가로 부호는 RDP와 반대다. */
+	const int detents = wheel_detents(flags);
 	if (horizontal && !vertical)
 	{
 		if (hid->absolute_report_length != 7)
@@ -860,47 +922,24 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 	}
 	else
 		hid->wheel = (int8_t)detents;
-	return send_absolute(hid);
-}
-
-void hid_release_stuck_buttons(HidState* hid, uint64_t now_ms)
-{
-	if (!hid || (hid->buttons == 0 && hid->mouse_buttons == 0))
-		return;
-	if (hid->buttons_changed_at == 0 || now_ms < hid->buttons_changed_at ||
-	    now_ms - hid->buttons_changed_at < HID_BUTTON_STUCK_TIMEOUT_MS)
-		return;
-	hid->buttons = 0;
-	hid->mouse_buttons = 0;
-	hid->wheel = 0;
-	hid->pan = 0;
-	note_button_change(hid);
-	const uint8_t mouse[4] = { 0 };
-	const size_t touch_length = hid->absolute_report_length == 7 ? 7 : 6;
-	const uint8_t touch[7] = { 0, (uint8_t)(hid->last_x & 0xffU),
-		(uint8_t)(hid->last_x >> 8U), (uint8_t)(hid->last_y & 0xffU),
-		(uint8_t)(hid->last_y >> 8U), 0 };
-	(void)write_hid_report(hid, hid->mouse_path, mouse, sizeof(mouse));
-	(void)write_hid_report(hid, hid->mouse_path, mouse, sizeof(mouse));
-	(void)write_hid_report(hid, hid->touch_path, touch, touch_length);
+	return send_absolute(hid, false);
 }
 
 void hid_release_all(HidState* hid)
 {
+	/* Cancel stale actions and retry the neutral reports until USB accepts them. */
+	hid->keyboard_queue = (HidReportQueue){ 0 };
+	hid->mouse_queue = (HidReportQueue){ 0 };
+	hid->touch_queue = (HidReportQueue){ 0 };
+	hid->keyboard_delay_ms = 0;
+	hid->keyboard_paste_codepoint = 0;
 	reset_keyboard_state(hid, false);
 	hid->buttons = 0;
 	hid->mouse_buttons = 0;
-	note_button_change(hid);
-	const uint8_t keyboard[8] = { 0 };
-	const uint8_t mouse[4] = { 0 };
-	const size_t touch_length = hid->absolute_report_length == 7 ? 7 : 6;
-	const uint8_t touch[7] = { 0, (uint8_t)(hid->last_x & 0xffU),
-		(uint8_t)(hid->last_x >> 8U), (uint8_t)(hid->last_y & 0xffU),
-		(uint8_t)(hid->last_y >> 8U), 0 };
 	hid->wheel = 0;
 	hid->pan = 0;
-	if (!write_hid_report(hid, hid->keyboard_path, keyboard, sizeof(keyboard)))
-		hid->keyboard_desynced = true;
-	(void)write_hid_report(hid, hid->mouse_path, mouse, sizeof(mouse));
-	(void)write_hid_report(hid, hid->touch_path, touch, touch_length);
+	(void)send_keyboard(hid);
+	const uint8_t mouse[4] = { 0 };
+	(void)queue_report(hid, &hid->mouse_queue, hid->mouse_path, mouse, sizeof(mouse), false, 0);
+	(void)send_absolute(hid, false);
 }
