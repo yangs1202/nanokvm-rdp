@@ -1,4 +1,5 @@
 #include "ffmpeg_decoder.h"
+#include "frame_flow.h"
 #include "h264.h"
 #include "hid.h"
 #include "protocol.h"
@@ -153,13 +154,11 @@ struct Client
 	bool bitmap_fallback_active;
 	bool gfx_ready;
 	bool gfx_opened;
-	bool inflight;
+	FrameFlow frame_flow;
 	bool need_idr;
 	uint64_t gfx_wait_started_at;
 	uint64_t gfx_opened_at;
-	uint32_t inflight_frame_id;
 	uint32_t next_frame_id;
-	uint64_t sent_at;
 	uint8_t* sps;
 	size_t sps_length;
 	uint8_t* pps;
@@ -630,12 +629,19 @@ static UINT on_gfx_frame_ack(RdpgfxServerContext* gfx,
 	                         const RDPGFX_FRAME_ACKNOWLEDGE_PDU* acknowledge)
 {
 	Client* client = (Client*)gfx->custom;
+	uint64_t elapsed = 0;
 	EnterCriticalSection(&client->lock);
-	if (client->inflight && acknowledge->frameId >= client->inflight_frame_id)
-		client->inflight = false;
-	if (acknowledge->queueDepth == SUSPEND_FRAME_ACKNOWLEDGEMENT)
-		client->need_idr = true;
+	const bool matched = frame_flow_ack(&client->frame_flow, acknowledge->frameId,
+	                                   acknowledge->queueDepth, monotonic_milliseconds(), &elapsed);
+	const unsigned pending = client->frame_flow.count;
 	LeaveCriticalSection(&client->lock);
+	char message[192];
+	(void)snprintf(message, sizeof(message),
+	               "RDP frame ACK id=%u decoded=%u queue_bytes=%u pending=%u matched=%u elapsed_ms=%llu",
+	               acknowledge->frameId, acknowledge->totalFramesDecoded, acknowledge->queueDepth,
+	               pending, (unsigned)matched, (unsigned long long)elapsed);
+	log_message(elapsed >= 200U ? "WARN" : "INFO", message);
+	if (client->bitmap_ready_event) (void)SetEvent(client->bitmap_ready_event);
 	return CHANNEL_RC_OK;
 }
 
@@ -1070,6 +1076,12 @@ static bool send_progressive_frame(Client* client, const uint8_t* bgra, size_t l
 	command.bottom = height;
 	command.width = width;
 	command.height = height;
+	/* Register before submission: the channel receiver may ACK concurrently. */
+	EnterCriticalSection(&client->lock);
+	const bool tracked = frame_flow_sent(&client->frame_flow, start.frameId,
+	                                     monotonic_milliseconds());
+	LeaveCriticalSection(&client->lock);
+	if (!tracked) return false;
 	const UINT error = client->gfx->SurfaceFrameCommand(client->gfx, &command, &start, &end);
 	command.data = NULL;
 	if (error != CHANNEL_RC_OK)
@@ -1244,7 +1256,13 @@ static bool client_flush_pending_bitmap(Client* client)
 	}
 	EnterCriticalSection(&client->lock);
 	client->bitmap_flushes++;
-	while (client->bitmap_queue_count > 0)
+	if (client->gfx_uses_progressive && frame_flow_blocked(&client->frame_flow))
+	{
+		LeaveCriticalSection(&client->lock);
+		return true;
+	}
+	/* Retain the latest frame even if capture stops while the client is decoding. */
+	while (client->bitmap_queue_count > 1)
 	{
 		const uint8_t stale_slot = client->bitmap_queue_head;
 		if (now - client->bitmap_queue_queued_at[stale_slot] <= max_queue_age)
@@ -2021,11 +2039,13 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		{
 			EnterCriticalSection(&client->lock);
 			const bool bitmap_pending = client->bitmap_queue_count > 0;
+			const bool waiting_for_ack = client->gfx_uses_progressive &&
+			                             frame_flow_blocked(&client->frame_flow);
 			const uint64_t last_send_started_at = client->bitmap_last_send_started_at;
 			LeaveCriticalSection(&client->lock);
 			const uint64_t interval = client->gfx_uses_progressive
 			                              ? PROGRESSIVE_MIN_SEND_INTERVAL_MS : BITMAP_FRAME_INTERVAL_MS;
-			if (bitmap_pending)
+			if (bitmap_pending && !waiting_for_ack)
 			{
 				const uint64_t now = monotonic_milliseconds();
 				if (last_send_started_at == 0 ||

@@ -14,6 +14,10 @@ set(CMAKE_C_EXTENSIONS ON)
 
 if(NANOKVM_RDP_BUILD_TESTS)
   enable_testing()
+  add_executable(nanokvm-frame-flow-test tests/frame_flow_test.c)
+  target_include_directories(nanokvm-frame-flow-test PRIVATE src)
+  target_compile_options(nanokvm-frame-flow-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  add_test(NAME nanokvm-frame-flow-test COMMAND nanokvm-frame-flow-test)
   add_executable(nanokvm-rdp-unit
     tests/test_main.c
     src/hid.c
