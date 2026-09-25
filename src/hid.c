@@ -158,7 +158,12 @@ static uint64_t hid_now(void)
  * buttons may replace older motion. Never merge clicks or relative deltas. */
 static bool write_paste_codepoint(HidState* hid, uint32_t codepoint);
 
-static bool flush_reports(HidState* hid, HidReportQueue* queue, const char* path, size_t length)
+static int endpoint_fd(const HidState* hid, uint8_t endpoint)
+{
+	return endpoint == 1 ? hid->keyboard_fd : endpoint == 2 ? hid->mouse_fd : hid->touch_fd;
+}
+
+static bool flush_reports(HidState* hid, HidReportQueue* queue)
 {
 	while (queue->count > 0)
 	{
@@ -171,6 +176,24 @@ static bool flush_reports(HidState* hid, HidReportQueue* queue, const char* path
 			return false;
 		}
 		HidReport* report = &queue->reports[queue->head];
+		/* Across USB endpoints, submission order is insufficient. Wait for the
+		 * previous endpoint to complete before a position becomes a click. */
+		if (queue->inflight_endpoint && queue->inflight_endpoint != report->endpoint)
+		{
+			struct pollfd previous = { .fd = endpoint_fd(hid, queue->inflight_endpoint), .events = POLLOUT };
+			const int ready = previous.fd < 0 ? -1 : poll(&previous, 1, 0);
+			if (ready == 0 || (ready < 0 && errno == EINTR))
+			{
+				if (!queue->blocked_at) queue->blocked_at = now;
+				return true;
+			}
+			if (ready < 0 || (previous.revents & (POLLERR | POLLHUP | POLLNVAL)))
+			{
+				hid->write_errors++;
+				return false;
+			}
+			queue->inflight_endpoint = 0;
+		}
 		if (report->paste_codepoint)
 		{
 			if (!write_paste_codepoint(hid, report->paste_codepoint))
@@ -182,7 +205,9 @@ static bool flush_reports(HidState* hid, HidReportQueue* queue, const char* path
 			queue->ready_at = now + 30U;
 			return true;
 		}
-		if (!write_hid_report(hid, path, report->data, length))
+		const char* path = report->endpoint == 1 ? hid->keyboard_path :
+		                   report->endpoint == 2 ? hid->mouse_path : hid->touch_path;
+		if (!write_hid_report(hid, path, report->data, report->length))
 		{
 			if (!queue->blocked_at)
 				queue->blocked_at = now;
@@ -196,6 +221,7 @@ static bool flush_reports(HidState* hid, HidReportQueue* queue, const char* path
 			return false;
 		}
 		queue->blocked_at = 0;
+		queue->inflight_endpoint = report->endpoint;
 		const uint64_t age = now - report->queued_at;
 		if (age > hid->max_queue_age_ms)
 			hid->max_queue_age_ms = age;
@@ -210,19 +236,21 @@ static bool flush_reports(HidState* hid, HidReportQueue* queue, const char* path
 static bool queue_report(HidState* hid, HidReportQueue* queue, const char* path,
                          const uint8_t* data, size_t length, bool motion, uint16_t delay_ms)
 {
+	const uint8_t endpoint = strcmp(path, hid->keyboard_path) == 0 ? 1 :
+	                         strcmp(path, hid->mouse_path) == 0 ? 2 : 3;
 	if (motion && queue->count > 0)
 	{
 		const unsigned last = (queue->head + queue->count - 1U) % HID_REPORT_QUEUE_CAPACITY;
 		HidReport* previous = &queue->reports[last];
-		if (previous->motion && previous->data[0] == data[0])
+		if (previous->motion && previous->endpoint == endpoint && previous->data[0] == data[0])
 		{
 			memcpy(previous->data, data, length);
-			return flush_reports(hid, queue, path, length);
+			return flush_reports(hid, queue);
 		}
 	}
 	if (queue->count == HID_REPORT_QUEUE_CAPACITY)
 	{
-		(void)flush_reports(hid, queue, path, length);
+		(void)flush_reports(hid, queue);
 		if (queue->count == HID_REPORT_QUEUE_CAPACITY)
 		{
 			hid->queue_overflows++;
@@ -231,12 +259,13 @@ static bool queue_report(HidState* hid, HidReportQueue* queue, const char* path,
 	}
 	const unsigned slot = (queue->head + queue->count) % HID_REPORT_QUEUE_CAPACITY;
 	queue->reports[slot] = (HidReport){ .delay_ms = delay_ms, .motion = motion,
+	                                  .endpoint = endpoint, .length = (uint8_t)length,
 	                                  .queued_at = hid_now(),
 	                                  .paste_codepoint = queue == &hid->keyboard_queue
 	                                      ? hid->keyboard_paste_codepoint : 0 };
 	memcpy(queue->reports[slot].data, data, length);
 	queue->count++;
-	return flush_reports(hid, queue, path, length);
+	return flush_reports(hid, queue);
 }
 
 void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char* touch)
@@ -360,44 +389,46 @@ void hid_keyboard_flush(HidState* hid)
 {
 	if (!hid)
 		return;
-	(void)flush_reports(hid, &hid->keyboard_queue, hid->keyboard_path, 8);
+	(void)flush_reports(hid, &hid->keyboard_queue);
 	hid->keyboard_desynced = hid->keyboard_queue.count > 0;
 }
 
 bool hid_pending(const HidState* hid)
 {
-	return hid && (hid->keyboard_queue.count || hid->mouse_queue.count || hid->touch_queue.count);
+	return hid && (hid->keyboard_queue.count || hid->pointer_queue.count);
 }
 
 bool hid_flush(HidState* hid)
 {
-	const bool keyboard = flush_reports(hid, &hid->keyboard_queue, hid->keyboard_path, 8);
-	const bool mouse = flush_reports(hid, &hid->mouse_queue, hid->mouse_path, 4);
-	const bool touch = flush_reports(hid, &hid->touch_queue, hid->touch_path,
-	                                  hid->absolute_report_length);
+	const bool keyboard = flush_reports(hid, &hid->keyboard_queue);
+	const bool pointer = flush_reports(hid, &hid->pointer_queue);
 	hid->keyboard_desynced = hid->keyboard_queue.count > 0;
-	return keyboard && mouse && touch;
+	return keyboard && pointer;
 }
 
 size_t hid_pollfds(const HidState* hid, struct pollfd* fds)
 {
-	const HidReportQueue* queues[] = { &hid->keyboard_queue, &hid->mouse_queue, &hid->touch_queue };
-	const int devices[] = { hid->keyboard_fd, hid->mouse_fd, hid->touch_fd };
+	const HidReportQueue* queues[] = { &hid->keyboard_queue, &hid->pointer_queue };
 	const uint64_t now = hid_now();
 	size_t count = 0;
-	for (size_t i = 0; i < 3; i++)
+	for (size_t i = 0; i < 2; i++)
 	{
-		if (queues[i]->count && now >= queues[i]->ready_at && devices[i] >= 0)
-			fds[count++] = (struct pollfd){ .fd = devices[i], .events = POLLOUT };
+		const HidReportQueue* queue = queues[i];
+		if (!queue->count || now < queue->ready_at) continue;
+		uint8_t endpoint = queue->reports[queue->head].endpoint;
+		if (queue->inflight_endpoint && queue->inflight_endpoint != endpoint)
+			endpoint = queue->inflight_endpoint;
+		const int fd = endpoint_fd(hid, endpoint);
+		if (fd >= 0) fds[count++] = (struct pollfd){ .fd = fd, .events = POLLOUT };
 	}
 	return count;
 }
 
 int hid_poll_timeout(const HidState* hid, int idle_ms)
 {
-	const HidReportQueue* queues[] = { &hid->keyboard_queue, &hid->mouse_queue, &hid->touch_queue };
+	const HidReportQueue* queues[] = { &hid->keyboard_queue, &hid->pointer_queue };
 	const uint64_t now = hid_now();
-	for (size_t i = 0; i < 3; i++)
+	for (size_t i = 0; i < 2; i++)
 	{
 		if (!queues[i]->count)
 			continue;
@@ -835,7 +866,7 @@ bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
 
 static uint8_t touch_buttons(uint8_t buttons)
 {
-	return (uint8_t)(buttons & HID_TOUCH_BUTTONS_MASK);
+	return (uint8_t)(buttons & 0x18U); /* Additional buttons exist only on hidg2. */
 }
 
 static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)
@@ -854,7 +885,7 @@ static bool send_absolute(HidState* hid, bool motion)
 	report[5] = (uint8_t)hid->wheel;
 	if (length == 7)
 		report[6] = (uint8_t)hid->pan;
-	const bool ok = queue_report(hid, &hid->touch_queue, hid->touch_path, report, length,
+	const bool ok = queue_report(hid, &hid->pointer_queue, hid->touch_path, report, length,
 	                             motion && hid->wheel == 0 && hid->pan == 0, 0);
 	/* Wheel and relative axes are deltas, not persistent state. */
 	hid->wheel = 0;
@@ -862,38 +893,46 @@ static bool send_absolute(HidState* hid, bool motion)
 	return ok;
 }
 
+/* Standard buttons live on the relative endpoint, where changing a button
+ * never restores an old absolute position. Both mouse endpoints share a FIFO. */
+static bool send_relative(HidState* hid, int8_t dx, int8_t dy, int8_t wheel)
+{
+	const uint8_t report[4] = { hid->buttons & HID_MOUSE_BUTTONS_MASK,
+	                           (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel };
+	return queue_report(hid, &hid->pointer_queue, hid->mouse_path, report, sizeof(report), false, 0);
+}
+
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
                   uint16_t flags)
 {
+	const uint8_t previous = hid->buttons;
 	hid->buttons = hid_pointer_buttons(hid->buttons, flags);
 	hid->mouse_buttons = hid->buttons;
 	hid->last_x = hid_scale_absolute(x, width);
 	hid->last_y = hid_scale_absolute(y, height);
-	/* The absolute endpoint alone owns buttons. Duplicating presses on two
-	 * USB mice creates independently stuck button states on the host. */
-	return send_absolute(hid, (flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3 |
-	                                    PTR_XFLAGS_BUTTON1 | PTR_XFLAGS_BUTTON2)) == 0);
+	const bool motion = (flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3 |
+	                              PTR_XFLAGS_BUTTON1 | PTR_XFLAGS_BUTTON2)) == 0;
+	if (!send_absolute(hid, motion)) return false;
+	return ((previous ^ hid->buttons) & HID_MOUSE_BUTTONS_MASK) == 0 || send_relative(hid, 0, 0, 0);
 }
 
 bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
 {
 	const uint8_t next = buttons & HID_TOUCH_BUTTONS_MASK;
-	const bool changed = hid->buttons != next;
+	const uint8_t changed = hid->buttons ^ next;
 	hid->buttons = next;
 	hid->mouse_buttons = next;
-	bool ok = !changed || send_absolute(hid, false);
-	/* Relative endpoint carries motion only. Split large deltas without loss. */
+	if ((changed & 0x18U) && !send_absolute(hid, false)) return false;
+	if (x == 0 && y == 0)
+		return !(changed & HID_MOUSE_BUTTONS_MASK) || send_relative(hid, 0, 0, 0);
 	while (x != 0 || y != 0)
 	{
 		const int8_t dx = x > 127 ? 127 : x < -127 ? -127 : (int8_t)x;
 		const int8_t dy = y > 127 ? 127 : y < -127 ? -127 : (int8_t)y;
-		const uint8_t report[4] = { 0, (uint8_t)dx, (uint8_t)dy, 0 };
-		if (!queue_report(hid, &hid->mouse_queue, hid->mouse_path, report, sizeof(report), false, 0))
-			return false;
-		x -= dx;
-		y -= dy;
+		if (!send_relative(hid, dx, dy, 0)) return false;
+		x -= dx; y -= dy;
 	}
-	return ok;
+	return true;
 }
 
 static int wheel_detents(uint16_t flags)
@@ -921,7 +960,7 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 		hid->pan = (int8_t)detents;
 	}
 	else
-		hid->wheel = (int8_t)detents;
+		return send_relative(hid, 0, 0, (int8_t)detents);
 	return send_absolute(hid, false);
 }
 
@@ -929,8 +968,7 @@ void hid_release_all(HidState* hid)
 {
 	/* Cancel stale actions and retry the neutral reports until USB accepts them. */
 	hid->keyboard_queue = (HidReportQueue){ 0 };
-	hid->mouse_queue = (HidReportQueue){ 0 };
-	hid->touch_queue = (HidReportQueue){ 0 };
+	hid->pointer_queue = (HidReportQueue){ 0 };
 	hid->keyboard_delay_ms = 0;
 	hid->keyboard_paste_codepoint = 0;
 	reset_keyboard_state(hid, false);
@@ -940,6 +978,6 @@ void hid_release_all(HidState* hid)
 	hid->pan = 0;
 	(void)send_keyboard(hid);
 	const uint8_t mouse[4] = { 0 };
-	(void)queue_report(hid, &hid->mouse_queue, hid->mouse_path, mouse, sizeof(mouse), false, 0);
+	(void)queue_report(hid, &hid->pointer_queue, hid->mouse_path, mouse, sizeof(mouse), false, 0);
 	(void)send_absolute(hid, false);
 }

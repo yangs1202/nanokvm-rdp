@@ -226,6 +226,10 @@ static void test_hid_release_all_absolute_length(void)
 
 	HidState hid;
 	hid_init(&hid, keyboard_template, "/dev/null", touch_template);
+	int mouse_pair[2];
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, mouse_pair) == 0);
+	assert(close(hid.mouse_fd) == 0);
+	hid.mouse_fd = mouse_pair[0];
 	hid.last_x = 0x1234;
 	hid.last_y = 0x5678;
 	hid.buttons = 0x02;
@@ -244,6 +248,9 @@ static void test_hid_release_all_absolute_length(void)
 	uint8_t keyboard[8] = { 0xff };
 	assert(read(keyboard_read, keyboard, sizeof(keyboard)) == (ssize_t)sizeof(keyboard));
 	assert(keyboard[0] == 0 && keyboard[2] == 0);
+	uint8_t mouse_report[4];
+	assert(read(mouse_pair[1], mouse_report, 4) == 4 && mouse_report[0] == 0);
+	close(mouse_pair[0]); close(mouse_pair[1]);
 	assert(close(keyboard_read) == 0);
 	assert(unlink(keyboard_template) == 0);
 	assert(close(touch_read) == 0);

@@ -71,29 +71,33 @@ static void test_button_mapping_and_mixed_motion(void)
 	uint8_t buttons = hid_pointer_buttons(0, 0xa000);
 	assert(buttons == 2);
 	assert(hid_absolute(&f.hid, 200, 300, 1920, 1080, 0xa000));
-	uint8_t touch[6]; read_exact(f.receiver[2], touch, 6); assert(touch[0] == 2);
-	empty(f.receiver[1]);
-	buttons = hid_pointer_buttons(buttons, 0x0800); /* move after absolute down */
+	uint8_t touch[6], mouse[4];
+	read_exact(f.receiver[2], touch, 6); assert(touch[0] == 0);
+	read_exact(f.receiver[1], mouse, 4); assert(mouse[0] == 2);
+	buttons = hid_pointer_buttons(buttons, 0x0800);
 	assert(hid_relative(&f.hid, 300, -270, buttons));
 	uint8_t moves[3][4]; read_exact(f.receiver[1], moves, sizeof(moves));
 	int x = 0, y = 0;
 	for (unsigned i = 0; i < 3; i++)
 	{
-		assert(moves[i][0] == 0); x += (int8_t)moves[i][1]; y += (int8_t)moves[i][2];
+		assert(moves[i][0] == 2); x += (int8_t)moves[i][1]; y += (int8_t)moves[i][2];
 	}
 	assert(x == 300 && y == -270 && f.hid.buttons == 2);
 	empty(f.receiver[2]);
-	usleep(400000); /* Legitimate hold/drag must not expire after 350 ms. */
-	assert(hid_flush(&f.hid)); empty(f.receiver[2]); assert(f.hid.buttons == 2);
+	usleep(400000);
+	assert(hid_flush(&f.hid)); empty(f.receiver[2]); empty(f.receiver[1]); assert(f.hid.buttons == 2);
 	buttons = hid_pointer_buttons(buttons, 0x2000);
 	assert(hid_relative(&f.hid, 0, 0, buttons));
-	read_exact(f.receiver[2], touch, 6); assert(touch[0] == 0);
+	read_exact(f.receiver[1], mouse, 4); assert(mouse[0] == 0);
+	empty(f.receiver[2]); /* Release after relative motion MUST NOT warp to old absolute coordinates. */
 	const uint16_t flags[] = {0x9000, 0x1000, 0xc000, 0x4000, 0x8001, 1, 0x8002, 2};
 	const uint8_t expected[] = {1, 0, 4, 0, 8, 0, 16, 0};
 	for (unsigned i = 0; i < 8; i++)
 	{
 		assert(hid_absolute(&f.hid, 200, 300, 1920, 1080, flags[i]));
-		read_exact(f.receiver[2], touch, 6); assert(touch[0] == expected[i]);
+		read_exact(f.receiver[2], touch, 6); assert(touch[0] == (expected[i] & 0x18));
+		if (i < 4) { read_exact(f.receiver[1], mouse, 4); assert(mouse[0] == expected[i]); }
+		else empty(f.receiver[1]);
 	}
 	cleanup(&f);
 }
@@ -108,19 +112,24 @@ static void test_final_release_and_coalescing(void)
 		for (unsigned x = 2; x < 2000; x++)
 			assert(hid_absolute(&f.hid, x, 20, 1920, 1080, 0x0800));
 		assert(hid_absolute(&f.hid, 1919, 20, 1920, 1080, 0x2000));
-		assert(f.hid.touch_queue.count == 3);
+		assert(f.hid.pointer_queue.count == 5);
+		empty(f.receiver[1]); /* Click cannot overtake a blocked position report. */
 		drain(f.receiver[2]); assert(hid_flush(&f.hid));
-		uint8_t report[7];
-		read_exact(f.receiver[2], report, length); assert(report[0] == 2);
-		read_exact(f.receiver[2], report, length); assert(report[0] == 2 && report[1] == 255 && report[2] == 127);
+		uint8_t report[7], mouse[4];
 		read_exact(f.receiver[2], report, length); assert(report[0] == 0);
+		read_exact(f.receiver[2], report, length); assert(report[0] == 0 && report[1] == 255 && report[2] == 127);
+		read_exact(f.receiver[2], report, length); assert(report[0] == 0);
+		read_exact(f.receiver[1], mouse, 4); assert(mouse[0] == 2);
+		read_exact(f.receiver[1], mouse, 4); assert(mouse[0] == 0);
 		empty(f.receiver[2]); empty(f.receiver[1]); assert(!hid_pending(&f.hid));
-		/* Release can also block after the press was already delivered. */
 		assert(hid_absolute(&f.hid, 100, 100, 1920, 1080, 0xa000));
-		read_exact(f.receiver[2], report, length); assert(report[0] == 2);
-		block_fd(f.hid.touch_fd);
-		assert(hid_absolute(&f.hid, 100, 100, 1920, 1080, 0x2000));
-		drain(f.receiver[2]); assert(hid_flush(&f.hid));
+		read_exact(f.receiver[2], report, length); read_exact(f.receiver[1], mouse, 4); assert(mouse[0] == 2);
+		block_fd(f.hid.mouse_fd);
+		assert(hid_relative(&f.hid, 0, 0, 0));
+		assert(hid_absolute(&f.hid, 200, 100, 1920, 1080, 0x0800));
+		empty(f.receiver[2]); /* Later movement cannot overtake a blocked release. */
+		drain(f.receiver[1]); assert(hid_flush(&f.hid));
+		read_exact(f.receiver[1], mouse, 4); assert(mouse[0] == 0);
 		read_exact(f.receiver[2], report, length); assert(report[0] == 0);
 	}
 	cleanup(&f);
@@ -160,10 +169,10 @@ static void test_cancel_retries_all_endpoints(void)
 	assert(hid_scancode(&f.hid, 0x1e, false, false));
 	assert(hid_absolute(&f.hid, 200, 300, 1920, 1080, 0xa000));
 	hid_release_all(&f.hid);
-	assert(f.hid.keyboard_queue.count == 1 && f.hid.mouse_queue.count == 1 && f.hid.touch_queue.count == 1);
+	assert(f.hid.keyboard_queue.count == 1 && f.hid.pointer_queue.count == 2);
 	for (unsigned i = 0; i < 3; i++) drain(f.receiver[i]);
-	struct pollfd fds[3]; assert(hid_pollfds(&f.hid, fds) == 3);
-	assert(poll(fds, 3, 10) == 3); assert(hid_flush(&f.hid));
+	struct pollfd fds[3]; assert(hid_pollfds(&f.hid, fds) == 2);
+	assert(poll(fds, 2, 10) == 2); assert(hid_flush(&f.hid));
 	uint8_t keyboard[8], mouse[4], touch[6];
 	read_exact(f.receiver[0], keyboard, 8); read_exact(f.receiver[1], mouse, 4); read_exact(f.receiver[2], touch, 6);
 	for (unsigned i = 0; i < 8; i++) assert(keyboard[i] == 0);
@@ -214,7 +223,8 @@ static void test_text_does_not_block_click_release(void)
 {
 	Fixture f; setup(&f);
 	assert(hid_absolute(&f.hid, 100, 100, 1920, 1080, 0xa000));
-	uint8_t report[6]; read_exact(f.receiver[2], report, 6);
+	uint8_t report[6], mouse[4]; read_exact(f.receiver[2], report, 6);
+	read_exact(f.receiver[1], mouse, 4); assert(mouse[0] == 2);
 	uint64_t start = now_ms();
 	const uint8_t text[] = "한글";
 	assert(hid_type_utf8(&f.hid, text, sizeof(text) - 1));
@@ -222,6 +232,7 @@ static void test_text_does_not_block_click_release(void)
 	assert(hid_keyboard_pending(&f.hid));
 	assert(hid_absolute(&f.hid, 100, 100, 1920, 1080, 0x2000));
 	read_exact(f.receiver[2], report, 6); assert(report[0] == 0);
+	read_exact(f.receiver[1], mouse, 4); assert(mouse[0] == 0);
 	while (hid_pending(&f.hid) && now_ms() - start < 1000)
 	{
 		assert(hid_flush(&f.hid));
@@ -282,9 +293,18 @@ static void test_wheel(void)
 	for (unsigned i = 0; i < 5; i++)
 	{
 		assert(hid_wheel(&f.hid, flags[i]));
-		uint8_t report[7]; read_exact(f.receiver[2], report, 7);
-		assert((int8_t)report[5] == vertical[i] && (int8_t)report[6] == horizontal[i]);
-		empty(f.receiver[2]);
+		uint8_t report[7];
+		if (vertical[i])
+		{
+			read_exact(f.receiver[1], report, 4);
+			assert((int8_t)report[3] == vertical[i]);
+		}
+		else
+		{
+			read_exact(f.receiver[2], report, 7);
+			assert(report[5] == 0 && (int8_t)report[6] == horizontal[i]);
+		}
+		empty(f.receiver[2]); empty(f.receiver[1]);
 	}
 	f.hid.absolute_report_length = 6;
 	assert(hid_wheel(&f.hid, 0x0478)); empty(f.receiver[2]);

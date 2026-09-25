@@ -11,6 +11,8 @@
 typedef struct
 {
 	uint8_t data[8];
+	uint8_t endpoint;
+	uint8_t length;
 	uint16_t delay_ms;
 	bool motion;
 	uint32_t paste_codepoint;
@@ -24,6 +26,7 @@ typedef struct
 	unsigned count;
 	uint64_t ready_at;
 	uint64_t blocked_at;
+	uint8_t inflight_endpoint;
 } HidReportQueue;
 
 typedef struct
@@ -31,8 +34,7 @@ typedef struct
 	uint8_t modifiers;
 	bool usages[256];
 	HidReportQueue keyboard_queue;
-	HidReportQueue mouse_queue;
-	HidReportQueue touch_queue;
+	HidReportQueue pointer_queue;
 	uint16_t keyboard_delay_ms;
 	uint32_t keyboard_paste_codepoint;
 	uint64_t reports_sent;

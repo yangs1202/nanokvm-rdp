@@ -591,13 +591,13 @@ int main(int argc, char* argv[])
 		if (now - agent.last_input_log_at >= 5000U)
 		{
 			(void)fprintf(stderr,
-			              "%s: INPUT events=%llu sent=%llu retry=%llu errors=%llu overflow=%llu pending=%u/%u/%u max_queue_ms=%llu max_handle_ms=%llu\n",
+			              "%s: INPUT events=%llu sent=%llu retry=%llu errors=%llu overflow=%llu pending=%u/%u max_queue_ms=%llu max_handle_ms=%llu\n",
 			              TAG, (unsigned long long)agent.input_events,
 			              (unsigned long long)agent.hid.reports_sent,
 			              (unsigned long long)agent.hid.write_retries,
 			              (unsigned long long)agent.hid.write_errors,
 			              (unsigned long long)agent.hid.queue_overflows,
-			              agent.hid.keyboard_queue.count, agent.hid.mouse_queue.count, agent.hid.touch_queue.count,
+			              agent.hid.keyboard_queue.count, agent.hid.pointer_queue.count,
 			              (unsigned long long)agent.hid.max_queue_age_ms,
 			              (unsigned long long)agent.max_input_handler_ms);
 			agent.hid.max_queue_age_ms = 0;
