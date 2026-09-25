@@ -188,6 +188,9 @@ static bool flush_reports(HidState* hid, HidReportQueue* queue)
 			return true;
 		if (queue->blocked_at && now - queue->blocked_at >= HID_REPORT_STALL_TIMEOUT_MS)
 		{
+			(void)fprintf(stderr, "HID: stalled at_ms=%llu blocked_ms=%llu pending=%u endpoint=%u\n",
+			              (unsigned long long)now, (unsigned long long)(now - queue->blocked_at),
+			              queue->count, queue->reports[queue->head].endpoint);
 			hid->write_errors++;
 			return false;
 		}
@@ -232,6 +235,8 @@ static bool flush_reports(HidState* hid, HidReportQueue* queue)
 				hid->write_retries++;
 				return true;
 			}
+			(void)fprintf(stderr, "HID: write_failed at_ms=%llu endpoint=%u errno=%d pending=%u\n",
+			              (unsigned long long)now, report->endpoint, errno, queue->count);
 			hid->write_errors++;
 			queue->ready_at = now + 100U;
 			return false;
@@ -239,6 +244,16 @@ static bool flush_reports(HidState* hid, HidReportQueue* queue)
 		queue->blocked_at = 0;
 		queue->inflight_endpoint = report->endpoint;
 		const uint64_t age = now - report->queued_at;
+		uint8_t* submitted = &hid->submitted_state[report->endpoint - 1U];
+		if (*submitted != report->data[0] || age >= 50U)
+		{
+			(void)fprintf(stderr,
+			              "HID: submitted at_ms=%llu report=%llu endpoint=%u state=0x%02x->0x%02x queue_ms=%llu pending=%u\n",
+			              (unsigned long long)now, (unsigned long long)(hid->reports_sent + 1),
+			              report->endpoint, *submitted, report->data[0],
+			              (unsigned long long)age, queue->count - 1U);
+		}
+		*submitted = report->data[0];
 		if (age > hid->max_queue_age_ms)
 			hid->max_queue_age_ms = age;
 		hid->reports_sent++;
@@ -1020,11 +1035,8 @@ bool hid_wheel(HidState* hid, uint16_t flags)
 	return send_absolute(hid, false);
 }
 
-void hid_release_all(HidState* hid)
+bool hid_synchronize(HidState* hid)
 {
-	/* Cancel stale actions and retry the neutral reports until USB accepts them. */
-	hid->keyboard_queue = (HidReportQueue){ 0 };
-	hid->pointer_queue = (HidReportQueue){ 0 };
 	hid->keyboard_delay_ms = 0;
 	hid->keyboard_paste_codepoint = 0;
 	reset_keyboard_state(hid, false);
@@ -1032,8 +1044,18 @@ void hid_release_all(HidState* hid)
 	hid->mouse_buttons = 0;
 	hid->wheel = 0;
 	hid->pan = 0;
-	(void)send_keyboard(hid);
+	const bool keyboard_ok = send_keyboard(hid);
 	const uint8_t mouse[4] = { 0 };
-	(void)queue_report(hid, &hid->pointer_queue, hid->mouse_path, mouse, sizeof(mouse), false, 0);
-	(void)send_absolute(hid, false);
+	const bool mouse_ok = queue_report(hid, &hid->pointer_queue, hid->mouse_path,
+	                                   mouse, sizeof(mouse), false, 0);
+	const bool absolute_ok = send_absolute(hid, false);
+	return keyboard_ok && mouse_ok && absolute_ok;
+}
+
+void hid_release_all(HidState* hid)
+{
+	/* Emergency cancellation, unlike an ordered RDP Synchronize event. */
+	hid->keyboard_queue = (HidReportQueue){ 0 };
+	hid->pointer_queue = (HidReportQueue){ 0 };
+	(void)hid_synchronize(hid);
 }

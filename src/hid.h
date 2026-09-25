@@ -46,6 +46,7 @@ typedef struct
 	uint64_t feedback_errors;
 	uint64_t feedback_retry_at;
 	uint8_t keyboard_leds;
+	uint8_t submitted_state[3]; /* Modifier/button byte last submitted per USB endpoint. */
 	uint16_t last_x;
 	uint16_t last_y;
 	uint8_t buttons;
@@ -81,6 +82,8 @@ int hid_poll_timeout(const HidState* hid, int idle_ms);
 struct pollfd;
 size_t hid_pollfds(const HidState* hid, struct pollfd* fds);
 void hid_release_all(HidState* hid);
+/* Ordered protocol resynchronization; preserve input already queued for USB. */
+bool hid_synchronize(HidState* hid);
 
 uint16_t hid_scale_absolute(uint16_t value, uint32_t dimension);
 uint16_t hid_clamp_absolute(uint16_t value, uint16_t dimension);

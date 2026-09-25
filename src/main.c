@@ -201,7 +201,8 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument);
 
 static void log_message(const char* level, const char* message)
 {
-	(void)fprintf(stderr, "%s: %s: %s\n", TAG, level, message);
+	(void)fprintf(stderr, "%s: %s: at_ms=%llu %s\n", TAG, level,
+	              (unsigned long long)monotonic_milliseconds(), message);
 }
 
 static bool server_send_control(Server* server, uint8_t type, const void* payload, uint16_t length)
@@ -1561,11 +1562,20 @@ static BOOL client_release_all_inputs(Client* client, const char* reason)
 	return sent;
 }
 
-static BOOL on_focus_in(rdpInput* input, UINT16 toggle_states)
+static BOOL on_synchronize(rdpInput* input, UINT32 toggle_states)
 {
-	(void)toggle_states;
 	Client* client = (Client*)input->context;
-	return client_release_all_inputs(client, "FocusInEvent");
+	char message[160];
+	(void)snprintf(message, sizeof(message),
+	               "RDP Synchronize toggles=0x%08X previous_modifiers=0x%02X previous_buttons=0x%02X",
+	               toggle_states, client->keyboard_modifiers, client->pointer_buttons);
+	log_message("INFO", message);
+	client->pointer_buttons = 0;
+	client->keyboard_modifiers = 0;
+	client->control_space_down = false;
+	/* TS_SYNC_EVENT resets held keys. Subsequent down events restore held keys;
+	 * do not cancel preceding input that is still waiting for USB delivery. */
+	return server_send_control(client->server, NANOKVM_CONTROL_SYNCHRONIZE, NULL, 0);
 }
 
 static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
@@ -1968,7 +1978,7 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 	peer->context->input->MouseEvent = on_mouse;
 	peer->context->input->RelMouseEvent = on_relative_mouse;
 	peer->context->input->ExtendedMouseEvent = on_extended_mouse;
-	peer->context->input->FocusInEvent = on_focus_in;
+	peer->context->input->SynchronizeEvent = on_synchronize;
 	return peer->Initialize(peer) == TRUE;
 }
 

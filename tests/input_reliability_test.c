@@ -386,6 +386,40 @@ static void test_control_space_with_host_feedback(void)
 	uint8_t release[8]; read_exact(f.receiver[0], release, 8); assert(release[0] == 0 && release[2] == 0);
 	close(feedback[0]); close(feedback[1]); cleanup(&f);
 }
+static void test_synchronize_preserves_pending_input(void)
+{
+	Fixture f; setup(&f);
+	block_fd(f.hid.keyboard_fd);
+	block_fd(f.hid.mouse_fd);
+	block_fd(f.hid.touch_fd);
+	/* Missing right Ctrl up must be repaired, without losing a queued Space tap. */
+	assert(hid_scancode(&f.hid, 0x1d, true, false));
+	assert(hid_scancode(&f.hid, 0x39, false, false));
+	assert(hid_scancode(&f.hid, 0x39, false, true));
+	assert(hid_relative(&f.hid, 0, 0, 2));
+	assert(hid_synchronize(&f.hid));
+	assert(f.hid.modifiers == 0 && f.hid.mouse_buttons == 0);
+	/* The client's held-key replay follows synchronization, even under EAGAIN. */
+	assert(hid_scancode(&f.hid, 0x1d, false, false));
+	assert(hid_scancode(&f.hid, 0x1d, false, true));
+	for (unsigned i = 0; i < 3; i++) drain(f.receiver[i]);
+	assert(hid_flush(&f.hid));
+	uint8_t keys[6][8], mouse[2][4], touch[6];
+	read_exact(f.receiver[0], keys, sizeof(keys));
+	assert(keys[0][0] == 0x10 && keys[0][2] == 0);
+	assert(keys[1][0] == 0x10 && keys[1][2] == 0x2c);
+	assert(keys[2][0] == 0x10 && keys[2][2] == 0);
+	assert(keys[3][0] == 0 && keys[3][2] == 0);
+	assert(keys[4][0] == 1 && keys[4][2] == 0);
+	assert(keys[5][0] == 0 && keys[5][2] == 0);
+	read_exact(f.receiver[1], mouse, sizeof(mouse));
+	assert(mouse[0][0] == 2 && mouse[1][0] == 0);
+	read_exact(f.receiver[2], touch, sizeof(touch)); assert(touch[0] == 0);
+	assert(!hid_pending(&f.hid));
+	for (unsigned i = 0; i < 3; i++) empty(f.receiver[i]);
+	cleanup(&f);
+}
+
 int main(void)
 {
 	test_button_mapping_and_mixed_motion(); test_final_release_and_coalescing();
@@ -393,5 +427,6 @@ int main(void)
 	test_overflow_and_stall(); test_endpoint_reopen(); test_text_does_not_block_click_release();
 	test_paste_order(); test_wheel(); test_fragmented_network_with_pending_release();
 	test_control_space_with_host_feedback();
-	puts("Input reliability: all 11 scenarios passed"); return 0;
+	test_synchronize_preserves_pending_input();
+	puts("Input reliability: all 12 scenarios passed"); return 0;
 }

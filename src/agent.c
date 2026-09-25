@@ -85,7 +85,6 @@ typedef struct
 	RtpH264Packetizer packetizer;
 	atomic_bool streaming;
 	atomic_bool wait_for_idr;
-	atomic_bool capture_deinit_requested;
 	uint32_t timestamp;
 	atomic_uint_fast32_t sent_packets;
 	atomic_uint_fast32_t dropped_packets;
@@ -206,7 +205,6 @@ static void disconnect_control(Agent* agent)
 	agent->control_fd = -1;
 	atomic_store(&agent->streaming, false);
 	atomic_store(&agent->wait_for_idr, true);
-	atomic_store(&agent->capture_deinit_requested, true);
 }
 
 static bool send_stats(Agent* agent)
@@ -279,6 +277,8 @@ static bool send_h264(Agent* agent, const uint8_t* data, size_t length)
 static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 {
 	const uint64_t started = monotonic_milliseconds();
+	const uint8_t previous_modifiers = agent->hid.modifiers;
+	const uint8_t previous_buttons = agent->hid.mouse_buttons;
 	bool succeeded = true;
 	switch (message->type)
 	{
@@ -290,7 +290,6 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 			break;
 		case NANOKVM_CONTROL_STOP_STREAM:
 			atomic_store(&agent->streaming, false);
-			atomic_store(&agent->capture_deinit_requested, true);
 			hid_release_all(&agent->hid);
 			(void)fprintf(stderr, "%s: STOP_STREAM 수신\n", TAG);
 			break;
@@ -347,6 +346,11 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 		case NANOKVM_CONTROL_RELEASE_ALL:
 			hid_release_all(&agent->hid);
 			break;
+		case NANOKVM_CONTROL_SYNCHRONIZE:
+			succeeded = hid_synchronize(&agent->hid);
+			(void)fprintf(stderr, "%s: INPUT Synchronize at_ms=%llu ok=%u\n",
+			              TAG, (unsigned long long)started, (unsigned)succeeded);
+			break;
 		case NANOKVM_CONTROL_PING:
 			(void)protocol_send(agent->control_fd, NANOKVM_CONTROL_PONG, NULL, 0);
 			break;
@@ -355,6 +359,18 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 			break;
 		default: break;
 	}
+	if (previous_modifiers != agent->hid.modifiers || previous_buttons != agent->hid.mouse_buttons ||
+	    message->type == NANOKVM_CONTROL_RELEASE_ALL || message->type == NANOKVM_CONTROL_SYNCHRONIZE ||
+	    !succeeded)
+	{
+		(void)fprintf(stderr,
+		              "%s: INPUT state at_ms=%llu event=%llu type=%u modifiers=0x%02x->0x%02x buttons=0x%02x->0x%02x pending=%u/%u elapsed_ms=%llu ok=%u\n",
+		              TAG, (unsigned long long)started, (unsigned long long)(agent->input_events + 1),
+		              message->type, previous_modifiers, agent->hid.modifiers,
+		              previous_buttons, agent->hid.mouse_buttons,
+		              agent->hid.keyboard_queue.count, agent->hid.pointer_queue.count,
+		              (unsigned long long)(monotonic_milliseconds() - started), (unsigned)succeeded);
+	}
 	if (!succeeded)
 	{
 		(void)fprintf(stderr, "%s: input delivery failed (type=%u); cancelling stale input and releasing HID\n",
@@ -362,7 +378,7 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 		hid_release_all(&agent->hid);
 	}
 	if ((message->type >= NANOKVM_CONTROL_KEY && message->type <= NANOKVM_CONTROL_RELEASE_ALL) ||
-	    message->type == NANOKVM_CONTROL_TEXT_UTF8)
+	    message->type == NANOKVM_CONTROL_TEXT_UTF8 || message->type == NANOKVM_CONTROL_SYNCHRONIZE)
 	{
 		agent->input_events++;
 		const uint64_t elapsed = monotonic_milliseconds() - started;
@@ -435,8 +451,8 @@ static void* video_loop(void* argument)
 			(void)nanosleep(&pause, NULL);
 			continue;
 		}
-		if (atomic_exchange(&agent->capture_deinit_requested, false))
-			capture_deinit_and_pause(&capture_initialized);
+		/* A session disconnect pauses streaming, not the hardware pipeline.
+		 * Reinitializing without a working vendor deinit leaks VB pools. */
 		if (!capture_initialized)
 		{
 			capture_fail_count = 0;
@@ -542,7 +558,6 @@ int main(int argc, char* argv[])
 	hid_release_all(&agent.hid);
 	atomic_init(&agent.streaming, false);
 	atomic_init(&agent.wait_for_idr, true);
-	atomic_init(&agent.capture_deinit_requested, false);
 	atomic_init(&agent.sent_packets, 0);
 	atomic_init(&agent.dropped_packets, 0);
 	atomic_init(&agent.capture_frames, 0);
