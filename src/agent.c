@@ -319,6 +319,9 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 			}
 			break;
 		case NANOKVM_CONTROL_TEXT_UTF8:
+			(void)fprintf(stderr, "%s: INPUT Unicode at_ms=%llu event=%llu bytes=%u pending=%u\n",
+			              TAG, (unsigned long long)started, (unsigned long long)(agent->input_events + 1),
+			              message->length, agent->hid.keyboard_queue.count);
 			if (message->length > 0 && !hid_type_utf8(&agent->hid, message->payload, message->length))
 			{
 				hid_release_all(&agent->hid);
@@ -471,8 +474,14 @@ static void* video_loop(void* argument)
 		}
 		uint8_t* data = NULL;
 		uint32_t length = 0;
+		const uint64_t capture_started = monotonic_milliseconds();
 		const int kind = agent->kvm.read_image(agent->width, agent->height, 1, agent->bitrate,
 		                                        &data, &length);
+		const uint64_t capture_elapsed = monotonic_milliseconds() - capture_started;
+		if (capture_elapsed >= 100U)
+			(void)fprintf(stderr, "%s: VIDEO slow capture at_ms=%llu elapsed_ms=%llu kind=%d bytes=%u\n",
+			              TAG, (unsigned long long)capture_started, (unsigned long long)capture_elapsed,
+			              kind, length);
 		if (kind < 0 || !data || length == 0)
 		{
 			if (data)

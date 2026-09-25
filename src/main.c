@@ -1313,6 +1313,14 @@ static bool client_flush_pending_bitmap(Client* client)
 	const uint64_t started_at = monotonic_milliseconds();
 	sent = send_bitmap_frame(client, bitmap, bitmap_length);
 	const uint64_t completed_at = monotonic_milliseconds();
+	if (completed_at - started_at >= 100U)
+	{
+		char message[128];
+		(void)snprintf(message, sizeof(message),
+		               "RDP slow frame send elapsed_ms=%llu ok=%u",
+		               (unsigned long long)(completed_at - started_at), (unsigned)sent);
+		log_message("WARN", message);
+	}
 	EnterCriticalSection(&client->lock);
 	if (sent)
 	{
@@ -1473,6 +1481,7 @@ static BOOL on_unicode_keyboard(rdpInput* input, UINT16 flags, UINT16 code)
 	Client* client = (Client*)input->context;
 	if ((flags & KBD_FLAGS_RELEASE) != 0)
 		return TRUE;
+	const uint64_t received_at = monotonic_milliseconds();
 	if (code == 0 || (code >= 0xd800U && code <= 0xdfffU))
 	{
 		char message[128];
@@ -1504,6 +1513,12 @@ static BOOL on_unicode_keyboard(rdpInput* input, UINT16 flags, UINT16 code)
 	}
 
 	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_TEXT_UTF8, payload, length);
+	char diagnostic[160];
+	(void)snprintf(diagnostic, sizeof(diagnostic),
+	               "RDP Unicode input received_ms=%llu ascii=%u bytes=%u forward_ms=%llu ok=%u",
+	               (unsigned long long)received_at, (unsigned)(code <= 0x7fU), length,
+	               (unsigned long long)(monotonic_milliseconds() - received_at), (unsigned)sent);
+	log_message("INFO", diagnostic);
 	if (!sent)
 		log_message("WARN", "RDP Unicode keyboard text를 NanoKVM agent에 전달하지 못했습니다");
 	return sent;
