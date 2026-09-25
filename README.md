@@ -101,7 +101,7 @@ Useful gateway options:
 The gateway advertises Korean keyboard layout `0x00000412` and forwards physical scan codes.
 Keyboard scan codes, including Control+Space, Right Alt, Right GUI, and Caps Lock, are forwarded as their real HID keys. The agent does not synthesize a language toggle. Unsent HID reports are retried in order when USB becomes writable, including the final key/button release when no further input arrives. See [input reliability](docs/input-reliability.md) for recovery behavior and diagnostics.
 Pass `-swap-alt-command` to exchange Alt and Command: Left/Right Alt become Left/Right Command, and Left/Right Command become Left/Right Alt.
-The absolute mouse carries the left, right, and middle buttons plus the vertical wheel. Horizontal wheel events use the absolute report AC Pan byte.
+The relative mouse carries the left, right, and middle buttons and vertical wheel; the absolute mouse carries position and extra buttons. Both endpoints share an ordered queue so clicks cannot overtake position changes. Horizontal wheel events require the absolute report AC Pan byte.
 
 Start the agent by supplying the gateway hostname or IPv4 address:
 

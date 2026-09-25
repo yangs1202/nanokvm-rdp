@@ -25,3 +25,12 @@ agent는 5초마다 INPUT 누적 이벤트/전송/재시도/오류/초과 횟수
 자동 회귀 테스트는 확인한 코드 결함의 재발을 검증한다. 일상 사용의 모든 기기·네트워크 조건에서 불편이 사라졌다는 증명과는 구분한다. 특히 USB 자체 분리나 RDP 클라이언트가 보내지 않은 키 해제는 서버가 즉시 알 수 없다.
 
 참고: [Linux 5.10 f_hid 구현](https://github.com/torvalds/linux/blob/v5.10/drivers/usb/gadget/function/f_hid.c), [FreeRDP 3.14 입력 플래그](https://github.com/FreeRDP/FreeRDP/blob/3.14.0/include/freerdp/input.h).
+
+## 배포 확인
+
+- 코드: `d2663df` (기반 수정 `8b7d2e8`). 게이트웨이 CI 실행 `36147955570` 성공.
+- 게이트웨이: `dev-1790346652`, 실행 digest `sha256:c6bde679e32afa9053eeb8e35ff2db9e2ad349e5c44f1c11012f16ac4790b96e`. GitOps `ae6f13f`, ArgoCD Synced/Healthy, 새 Pod 재시작 0회.
+- 에이전트: 실제 실행 파일 SHA-256 `d6a845884a2ffdeadae926464f84f48dca8cf09933b270e2841d126f0d8bdcf8`와 빌드 파일 일치. 교체 전 파일은 장치의 `nanokvm-agent.before-input-fix-20260925`에 보관했다.
+- 로컬 CTest 3개 대상 통과, 입력 회귀 10개 시나리오를 실제 RISC-V 장치에서도 통과했다. 입력 회귀의 AddressSanitizer/UndefinedBehaviorSanitizer 검사도 통과했다.
+- 25초 동안 조작 없는 FreeRDP Sample 클라이언트로 Progressive 전송을 확인했다. 안정 구간의 flush 증분은 5초당 178/180/192회였고, 같은 구간 프레임 증분은 115/111/113개였다. 배포 전 운영 연결의 5초당 수십만 회 반복이 사라졌다. 클라이언트가 다르므로 이 비교를 사용자의 종단 입력 지연 개선율로 해석하지 않는다.
+- 시험 연결 종료의 해제 처리까지 agent `errors=0`, `overflow=0`, `pending=0/0`, 처리 구간 `max_handle_ms=1`을 확인했다. 이 관측 구간에는 실제 사용자 타이핑/클릭이 없었으므로 일상 사용의 장시간 무재발을 입증한 것은 아니다.
