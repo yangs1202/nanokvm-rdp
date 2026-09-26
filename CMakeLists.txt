@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 project(nanokvm_rdp LANGUAGES C)
 
-option(NANOKVM_RDP_BUILD_SERVER "Build the gateway RDP server" ON)
+option(NANOKVM_RDP_BUILD_SERVER "Build the legacy C gateway" OFF)
 option(NANOKVM_RDP_BUILD_AGENT "Build the NanoKVM capture and HID agent" ON)
 option(NANOKVM_RDP_BUILD_TESTS "Build local unit tests" ON)
 

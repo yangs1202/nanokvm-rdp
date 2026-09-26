@@ -12,7 +12,7 @@
 `nanokvm-rdp` separates capture and RDP serving into two processes:
 
 - **`nanokvm-agent`** runs on the NanoKVM device. It reads H.264 Annex-B frames from `libkvm.so`, packetizes them as RTP/H.264, and forwards RDP input as USB HID reports.
-- **`nanokvm-rdp-gateway`** runs on a separate host. It receives the stream, decodes it with FFmpeg, and serves the resulting desktop through an RDP listener backed by FreeRDP.
+- **`nanokvm-rdp-gateway`** runs on a separate host. The Go process owns the agent control connection, RTP reception, and FFmpeg decode orchestration. FreeRDP remains in-process behind cgo and serves the RDP listener.
 
 The project supports one NanoKVM device and one connected RDP client at a time.
 
