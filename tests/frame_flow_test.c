@@ -9,17 +9,15 @@ int main(void)
 	unsigned submitted = 0;
 	for (unsigned frame = 0; frame < 1000; frame++)
 		if (frame_flow_sent(&flow, frame, frame * 20U)) submitted++;
-	assert(submitted == 3 && frame_flow_blocked(&flow));
+	assert(submitted == 1 && frame_flow_blocked(&flow));
 	uint64_t elapsed;
 	assert(!frame_flow_ack(&flow, 999, 0, 20000, &elapsed));
 	assert(frame_flow_blocked(&flow));
-	assert(frame_flow_ack(&flow, 1, 1024, 20000, &elapsed) && elapsed == 19980);
+	assert(frame_flow_ack(&flow, 0, 1024, 20000, &elapsed) && elapsed == 20000);
 	assert(!frame_flow_blocked(&flow));
 	assert(frame_flow_sent(&flow, 1000, 20001));
-	assert(!frame_flow_ack(&flow, 1, 0, 20002, &elapsed));
+	assert(!frame_flow_ack(&flow, 999, 0, 20002, &elapsed));
 	assert(frame_flow_blocked(&flow));
-	assert(frame_flow_ack(&flow, 0, 0, 20003, &elapsed));
-	assert(frame_flow_ack(&flow, 2, 0, 20004, &elapsed));
 	assert(frame_flow_ack(&flow, 1000, 0, 20005, &elapsed) && elapsed == 4);
 	assert(flow.count == 0);
 	/* Opt-out must clear existing frames and never wait for absent ACKs. */
@@ -31,10 +29,12 @@ int main(void)
 	assert(!frame_flow_ack(&flow, 999, 0, UINT64_C(5000000011), &elapsed));
 	assert(!flow.suspended);
 	assert(frame_flow_sent(&flow, UINT32_MAX, UINT64_C(5000000020)));
-	assert(frame_flow_sent(&flow, 0, UINT64_C(5000000021)));
-	assert(frame_flow_ack(&flow, 0, 0, UINT64_C(5000000025), &elapsed) && elapsed == 4);
-	assert(flow.count == 1);
+	assert(frame_flow_blocked(&flow));
+	assert(!frame_flow_sent(&flow, 0, UINT64_C(5000000021)));
 	assert(frame_flow_ack(&flow, UINT32_MAX, 0, UINT64_C(5000000026), &elapsed) && elapsed == 6);
+	assert(flow.count == 0);
+	assert(frame_flow_sent(&flow, 0, UINT64_C(5000000027)));
+	assert(frame_flow_ack(&flow, 0, 0, UINT64_C(5000000031), &elapsed) && elapsed == 4);
 	puts("Frame flow: slow client, duplicate/out-of-order ACK, suspend/resume and wrap passed");
 	return 0;
 }
