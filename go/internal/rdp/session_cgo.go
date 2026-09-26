@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"runtime/cgo"
 	"unsafe"
+
+	"github.com/yangs1202/nanokvm-rdp/go/go/internal/video"
 )
 
 type cgoSession struct {
@@ -28,6 +30,7 @@ type cgoSession struct {
 	inputs   chan Input
 	controls chan controlEvent
 	frames   chan []byte
+	decoder  *video.Decoder
 }
 
 type controlEvent struct {
@@ -164,13 +167,40 @@ func nanokvmReadH264(context unsafe.Pointer, data **C.uint8_t, length *C.size_t,
 
 //export nanokvmDecodeStart
 func nanokvmDecodeStart(context unsafe.Pointer, width C.uint16_t, height C.uint16_t) C.bool {
+	handle := *(*cgo.Handle)(context)
+	session := handle.Value().(*cgoSession)
+	decoder, err := video.StartDecoder(uint16(width), uint16(height), func(frame []byte) {
+		if session.session == nil {
+			return
+		}
+		C.nanokvm_session_submit_bitmap(session.session, (*C.uint8_t)(unsafe.Pointer(&frame[0])), C.size_t(len(frame)))
+	})
+	if err != nil {
+		return C.bool(false)
+	}
+	session.decoder = decoder
 	return C.bool(true)
 }
 
 //export nanokvmDecodePush
 func nanokvmDecodePush(context unsafe.Pointer, data *C.uint8_t, length C.size_t) C.bool {
+	handle := *(*cgo.Handle)(context)
+	session := handle.Value().(*cgoSession)
+	if session.decoder == nil || length == 0 {
+		return C.bool(false)
+	}
+	if err := session.decoder.Push(C.GoBytes(unsafe.Pointer(data), C.int(length))); err != nil {
+		return C.bool(false)
+	}
 	return C.bool(true)
 }
 
 //export nanokvmDecodeStop
-func nanokvmDecodeStop(context unsafe.Pointer) {}
+func nanokvmDecodeStop(context unsafe.Pointer) {
+	handle := *(*cgo.Handle)(context)
+	session := handle.Value().(*cgoSession)
+	if session.decoder != nil {
+		session.decoder.Stop()
+		session.decoder = nil
+	}
+}
