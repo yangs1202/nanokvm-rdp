@@ -220,7 +220,7 @@
         <p class="eyebrow">offline / target-side instrument</p>
         <h1>Presentation & input observation target</h1>
       </div>
-      <p class="lede">A bounded browser-side recorder. It does not measure capture-to-display latency, make a 50 ms decision, or collect events outside the focused target.</p>
+      <p class="lede">동시 촬영용 타이머 · 인수 기준: 측정 오차 상한 포함 80ms 미만. 이 페이지 자체는 원격 지연을 판정하지 않습니다.</p>
     </header>
 
     <section class="toolbar" aria-label="Session controls">
@@ -239,6 +239,10 @@
         </div>
         <div id="target" tabindex="0" aria-label="Focused latency test area">
           <div class="readout">
+            <span class="readout-label">ELAPSED MILLISECONDS</span>
+            <strong id="elapsedMs" style="display:block;font-size:clamp(2rem,7vw,6rem);font-variant-numeric:tabular-nums">00000000</strong>
+            <span>UPDATE <span id="timerSequence">0</span> · <span id="timerStatus">stopped</span></span>
+            <hr>
             <span class="readout-label">DOM VISUAL MARKER SEQUENCE</span>
             <strong id="markerNumber">000000</strong>
             <span id="phaseIndicator">IDLE / NO INPUT</span>
@@ -264,6 +268,7 @@
           <button id="markMissing" class="warn" disabled>Mark missing</button>
         </div>
 
+        <p class="note"><strong>사용법:</strong> Start 후 원본 화면과 Windows App 화면을 동시에 촬영하세요. 같은 촬영 프레임에서 두 ELAPSED 값을 비교합니다. 숫자의 단위는 ms지만 실제 정밀도는 화면 갱신·촬영 조건에 제한됩니다. 탭이 숨겨지면 자동 중지됩니다. 다시 Start하면 이전 기록이 지워지므로 먼저 Export하세요.</p>
         <p class="note"><strong>Important:</strong> “visual marker” is a DOM update timestamp, not proof that a frame was actually presented. Use a concurrent camera or a validated client-presentation measurement for that boundary.</p>
 
         <div class="legend">
@@ -281,6 +286,28 @@
       "use strict";
 
       const MAX_EVENTS = 2048;
+      const elapsedMs = document.getElementById("elapsedMs");
+      const timerSequence = document.getElementById("timerSequence");
+      const timerStatus = document.getElementById("timerStatus");
+      let timerHandle = null;
+      let timerUpdates = 0;
+      let lastTimerMs = 0;
+
+      function stopTimer(reason) {
+        if (timerHandle !== null) cancelAnimationFrame(timerHandle);
+        timerHandle = null;
+        timerStatus.textContent = reason;
+      }
+
+      function timerTick() {
+        timerHandle = null;
+        if (!state.active || document.hidden) return;
+        lastTimerMs = performance.now() - state.startedAt;
+        timerUpdates += 1;
+        elapsedMs.textContent = String(Math.floor(lastTimerMs)).padStart(8, "0");
+        timerSequence.textContent = String(timerUpdates);
+        timerHandle = requestAnimationFrame(timerTick);
+      }
       const target = document.getElementById("target");
       const markerNumber = document.getElementById("markerNumber");
       const phaseIndicator = document.getElementById("phaseIndicator");
@@ -374,15 +401,31 @@
       }
 
       start.addEventListener("click", () => {
+        stopTimer("stopped");
         resetRun();
+        timerUpdates = 0;
+        lastTimerMs = 0;
+        elapsedMs.textContent = "00000000";
+        timerSequence.textContent = "0";
         setRunning(true);
+        timerStatus.textContent = "running";
+        timerHandle = requestAnimationFrame(timerTick);
         record("session", { phase: "start" });
         target.focus();
       });
 
       stop.addEventListener("click", () => {
+        stopTimer("stopped");
         record("session", { phase: "stop" });
         state.stoppedAt = Number(performance.now().toFixed(3));
+        setRunning(false);
+      });
+
+      document.addEventListener("visibilitychange", () => {
+        if (!state.active || !document.hidden) return;
+        record("interruption", { reason: "page-hidden", timerUpdates, lastTimerMs });
+        state.stoppedAt = Number(performance.now().toFixed(3));
+        stopTimer("hidden — start a new session");
         setRunning(false);
       });
 
@@ -456,6 +499,7 @@
       exportButton.addEventListener("click", () => {
         const exportData = {
           schema: "nanokvm-latency-target/v1",
+          timer: { updates: timerUpdates, lastDisplayedValueMs: Math.floor(lastTimerMs), boundary: "DOM update only, not physical presentation", restart: "Start clears previous session; hidden page stops automatically" },
           exportedAt: new Date().toISOString(),
           session: {
             active: state.active,

@@ -427,6 +427,7 @@ func (g *Gateway) startMedia() bool {
 	ctx, cancel := context.WithCancel(context.Background())
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(g.cfg.ListenAddress), Port: int(g.cfg.VideoPort)})
 	if err != nil {
+		cancel()
 		g.mediaMu.Unlock()
 		g.log.Error("listen RTP", "error", err)
 		return false

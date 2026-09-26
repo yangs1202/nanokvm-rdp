@@ -1,4 +1,12 @@
-# Offline latency-target handoff
+# Browser latency-target handoff
+
+## 회사 Mac에서 브라우저로 접속
+
+대상 회사 Mac에서 http://10.97.11.124:48761/ 에 접속한다. SSH, Codex, 설치는 필요 없다. 이 주소는 메인 Mac의 임시 내부 서버이며 서버 실행과 내부망 경로가 유지되어야 한다. Start session 후 ELAPSED MILLISECONDS와 UPDATE 번호가 증가한다. 원본 화면과 Windows App의 원격 화면을 같은 카메라 프레임에 담아 타이머 값을 비교한다. Stop 또는 탭 숨김은 타이머를 멈춘다. 다시 Start하면 기록과 타이머를 초기화하므로 먼저 Export한다.
+
+인수 기준은 네트워크 transit 제외, 측정 오차 상한 포함 80ms 미만이다. 타이머 차는 직접적으로 display-to-display 지연이다. 원본 패널 표시와 NanoKVM 캡처의 차이, 화면 갱신/scanout, 촬영 노출/rolling shutter 및 판독 오차를 근거 있는 상한으로 포함해야 capture-to-presentation 인수에 사용할 수 있다. ms 숫자만으로 1ms 정밀도를 주장하지 않는다. 네트워크 포함 상한이 80ms 미만이면 차감 없이 보수적으로 통과 가능하다. 초과하면 네트워크 제외 기준 판정은 추가 측정이 필요하다. 입력 경로는 별도로 검증한다.
+
+아래 Codex 전달 절차는 선택 사항이다.
 
 ## 다른 Mac의 Codex에 전달할 요청
 
@@ -26,7 +34,7 @@ Stop session → Export JSON 결과를 보관해주세요.
 현재 nanokvm-gw.yangs.sh는 기존 C 게이트웨이일 수 있으므로
 Go 후보 버전의 배포 커밋/이미지가 확인되기 전에는 Go 성능으로 보고하지 마세요.
 HTML 기록은 대상 브라우저 도착과 DOM 변경만 보여줍니다.
-실제 Windows App 표시/OS 반영 전체 지연이나 50ms 통과를 주장하지 마세요.
+실제 Windows App 표시/OS 반영 전체 지연이나 80ms 통과를 주장하지 마세요.
 실제 표시를 관측할 동시 촬영 또는 검증된 계측 방법이 있는지도 확인하세요.
 다른 장비의 performance.now 값을 직접 빼거나 RTT/2를 차감하지 마세요.
 
@@ -66,7 +74,7 @@ For strict acceptance, measure each paired event externally:
 
 The target page alone cannot supply either source timestamp or actual physical presentation timestamp. Windows App actual presentation requires separate simultaneous high-speed capture or a presentation measurement method validated for that client. Do not subtract clocks from different devices directly, and do not estimate network time by subtracting RTT/2. Report p50, p95, p99, max, missing frames/events, and failures; averages alone are not sufficient.
 
-The tool does not calculate a 50 ms pass/fail result. overflowCount and droppedEventCount identify bounded-buffer loss; missingMarkersMarked and missing-marker records identify operator-observed gaps. Interpret those records together with the independent capture/presentation and OS-application evidence.
+The tool does not calculate a 80 ms pass/fail result. overflowCount and droppedEventCount identify bounded-buffer loss; missingMarkersMarked and missing-marker records identify operator-observed gaps. Interpret those records together with the independent capture/presentation and OS-application evidence.
 
 ## Safety and limits
 
