@@ -23,3 +23,10 @@ minus local reply time and remote wall time minus local request time. Use the
 smallest round trip and report the combined uncertainty plus millisecond log
 rounding; repeat calibration around the collection window to detect clock steps.
 Neither these logs nor ACKs alone establish source-to-display latency.
+
+The RISC-V build defaults to Release (`BUILD_TYPE=Debug` overrides it). The
+agent retries transient UDP send errors with the same packet and a 40 ms
+frame-wide retry deadline, sleeping 250 microseconds between attempts. Persistent
+failure abandons the access unit and waits for the next IDR. `send_retries` is a
+cumulative counter in sampled capture logs; `dropped` counts final failed packets,
+not successful retries. The deadline bounds retries, not kernel delivery time.
