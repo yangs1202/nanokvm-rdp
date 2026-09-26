@@ -20,18 +20,31 @@ import (
 	"errors"
 	"fmt"
 	"runtime/cgo"
+	"sync"
 	"unsafe"
 
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/video"
 )
 
+const controlQueueCapacity = 32
+
+func durableControl(kind byte) bool {
+	switch kind {
+	case 5, 9, 14, 16: // key, release-all, unicode, synchronize
+		return true
+	default:
+		return false
+	}
+}
+
 type cgoSession struct {
-	session  *C.NanokvmRdpSession
-	handle   *C.uintptr_t
-	inputs   chan Input
-	controls chan controlEvent
-	frames   chan []byte
-	decoder  *video.Decoder
+	session   *C.NanokvmRdpSession
+	handle    *C.uintptr_t
+	inputs    chan Input
+	controls  chan controlEvent
+	frames    chan []byte
+	decoder   *video.Decoder
+	controlMu sync.Mutex
 }
 
 type controlEvent struct {
@@ -43,7 +56,7 @@ func Start(config Config, inputs chan Input) (Session, error) {
 	if config.BindAddress == "" || config.Port == 0 {
 		return nil, errors.New("rdp listen address is incomplete")
 	}
-	session := &cgoSession{inputs: inputs, controls: make(chan controlEvent, 32), frames: make(chan []byte, 2)}
+	session := &cgoSession{inputs: inputs, controls: make(chan controlEvent, controlQueueCapacity), frames: make(chan []byte, 2)}
 	handle := cgo.NewHandle(session)
 	session.handle = (*C.uintptr_t)(C.malloc(C.size_t(unsafe.Sizeof(C.uintptr_t(0)))))
 	if session.handle == nil {
@@ -142,6 +155,45 @@ func (s *cgoSession) Controls() <-chan Control {
 	return out
 }
 
+func (s *cgoSession) enqueueControl(event controlEvent) bool {
+	if !durableControl(event.kind) {
+		select {
+		case s.controls <- event:
+			return true
+		default:
+			return false
+		}
+	}
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	select {
+	case s.controls <- event:
+		return true
+	default:
+	}
+	var kept []controlEvent
+	dropped := false
+	for {
+		select {
+		case queued := <-s.controls:
+			if !dropped && !durableControl(queued.kind) {
+				dropped = true
+				continue
+			}
+			kept = append(kept, queued)
+		default:
+			if !dropped {
+				return false
+			}
+			for _, queued := range kept {
+				s.controls <- queued
+			}
+			s.controls <- event
+			return true
+		}
+	}
+}
+
 //export nanokvmSendControl
 func nanokvmSendControl(context unsafe.Pointer, kind C.uint8_t, payload unsafe.Pointer, length C.uint16_t) C.bool {
 	handle := cgo.Handle(*(*C.uintptr_t)(context))
@@ -150,12 +202,10 @@ func nanokvmSendControl(context unsafe.Pointer, kind C.uint8_t, payload unsafe.P
 	if length > 0 && payload != nil {
 		event.payload = C.GoBytes(payload, C.int(length))
 	}
-	select {
-	case session.controls <- event:
+	if session.enqueueControl(event) {
 		return C.bool(true)
-	default:
-		return C.bool(false)
 	}
+	return C.bool(false)
 }
 
 //export nanokvmReadH264
