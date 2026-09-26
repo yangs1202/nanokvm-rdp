@@ -63,6 +63,12 @@ bool rtp_client_open(RtpClient* client, uint16_t port)
 	if (client->fd < 0)
 		return false;
 	int enabled = 1;
+	/* Absorb IDR bursts while RDP submission briefly occupies the reader.
+	 * This is capacity only: recvfrom still returns each datagram immediately. */
+	const int requested_buffer = 4 * 1024 * 1024;
+	(void)setsockopt(client->fd, SOL_SOCKET, SO_RCVBUF, &requested_buffer, sizeof(requested_buffer));
+	socklen_t buffer_size = sizeof(client->receive_buffer_bytes);
+	(void)getsockopt(client->fd, SOL_SOCKET, SO_RCVBUF, &client->receive_buffer_bytes, &buffer_size);
 	const struct timeval receive_timeout = { .tv_sec = 1, .tv_usec = 0 };
 	(void)setsockopt(client->fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
 	if (setsockopt(client->fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout,

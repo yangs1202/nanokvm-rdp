@@ -10,6 +10,7 @@
 typedef struct
 {
 	int fd;
+	int receive_buffer_bytes;
 	RtpH264Reassembler reassembler;
 	uint8_t* access_unit;
 	size_t access_unit_length;

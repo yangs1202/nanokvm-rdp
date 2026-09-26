@@ -773,6 +773,9 @@ static DWORD WINAPI video_thread(LPVOID argument)
 		return 0;
 	}
 	log_message("INFO", "RDPGFX RTP/H.264 passthrough 시작");
+	char buffer_message[128];
+	(void)snprintf(buffer_message, sizeof(buffer_message), "RTP receive buffer bytes=%d", rtp.receive_buffer_bytes);
+	log_message("INFO", buffer_message);
 	uint32_t observed_losses = 0;
 	while (!client_should_stop(client))
 	{
