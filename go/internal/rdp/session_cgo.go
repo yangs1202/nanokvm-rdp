@@ -2,7 +2,7 @@ package rdp
 
 /*
 #cgo pkg-config: freerdp3 freerdp-server3 winpr3
-#cgo LDFLAGS: -ldl -lpthread /opt/freerdp/lib/freerdp3/objects-Release/rdpgfx-server/rdpgfx_main.c.o /opt/freerdp/lib/freerdp3/objects-Release/rdpgfx-server/__/rdpgfx_common.c.o /usr/lib/x86_64-linux-gnu/libssl.a /usr/lib/x86_64-linux-gnu/libcrypto.a
+#cgo LDFLAGS: -ldl -lpthread ${NANOKVM_STATIC_LIBS}
 #cgo CFLAGS: -Wall -Wextra -Wno-deprecated-declarations
 #include "session_api.h"
 #include <stdlib.h>
