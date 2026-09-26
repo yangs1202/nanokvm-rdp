@@ -12,6 +12,7 @@ RUN apt-get update \
         libavcodec-dev \
         libavutil-dev \
         libssl-dev \
+        patchelf \
         pkg-config \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -70,7 +71,8 @@ RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -C /us
 ENV PATH=/usr/local/go/bin:${PATH}
 ENV PKG_CONFIG_PATH=/opt/freerdp/lib/pkgconfig
 ENV LD_LIBRARY_PATH=/opt/freerdp/lib
-RUN CGO_ENABLED=1 go build -o /usr/local/bin/nanokvm-rdp-gateway ./go/cmd/nanokvm-rdp-gateway
+RUN CGO_ENABLED=1 go build -o /usr/local/bin/nanokvm-rdp-gateway ./go/cmd/nanokvm-rdp-gateway && \
+    patchelf --set-rpath /usr/local/lib /usr/local/bin/nanokvm-rdp-gateway
 
 FROM debian:bookworm-slim
 
@@ -79,13 +81,16 @@ RUN apt-get update \
         ca-certificates \
         ffmpeg \
         libssl3 \
+        openssl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/nanokvm-rdp-gateway /usr/local/bin/nanokvm-rdp-gateway
-COPY --from=builder /opt/freerdp/lib/libfreerdp*.so* /opt/freerdp/lib/libwinpr*.so* /usr/local/lib/
-ENV LD_LIBRARY_PATH=/usr/local/lib
+COPY --from=builder /opt/freerdp/lib/ /usr/local/lib/
+RUN ldconfig
 
 EXPOSE 3389/tcp 3390/tcp 5004/udp
 
-ENTRYPOINT ["/usr/local/bin/nanokvm-rdp-gateway"]
+COPY docker/entrypoint.sh /usr/local/bin/nanokvm-rdp-entrypoint
+RUN chmod 755 /usr/local/bin/nanokvm-rdp-entrypoint
+ENTRYPOINT ["/usr/local/bin/nanokvm-rdp-entrypoint"]
 CMD ["-listen", "0.0.0.0:3389", "-cert", "/run/tls/tls.crt", "-key", "/run/tls/tls.key"]

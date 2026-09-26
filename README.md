@@ -121,6 +121,8 @@ Deployment scripts are provided in [`deploy/`](deploy/):
 - [`S100nanokvm-agent`](deploy/S100nanokvm-agent) installs and manages the NanoKVM agent.
 - [`S100nanokvm-rdp`](deploy/S100nanokvm-rdp) manages the legacy on-device RDP service.
 
+The gateway container listens on TCP `3389` for RDP, TCP `3390` for agent control, and UDP `5004` for video. Mount a certificate and key at `/run/tls/tls.crt` and `/run/tls/tls.key`, or let the container create a self-signed pair there on startup. The agent defaults in `deploy/S100nanokvm-agent` match the gateway defaults: 1920×1080 and 8000 kbps.
+
 Before starting the agent, update `GATEWAY`, `CONTROL_PORT`, `VIDEO_PORT`, `WIDTH`, `HEIGHT`, and `BITRATE` in `deploy/S100nanokvm-agent` for the target environment. Permit outbound traffic from NanoKVM to the gateway on TCP `3390` and UDP `5004`, and permit RDP clients to reach gateway TCP `3389`.
 
 Do not run this agent simultaneously with the device's existing FoldVNC or stock KVM service: they share the NanoKVM capture path. The agent deployment script stops those services before starting the agent.

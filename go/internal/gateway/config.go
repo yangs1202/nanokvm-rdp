@@ -24,8 +24,8 @@ func ParseArgs(args []string) (Config, error) {
 	cfg := Config{
 		BindAddress: "0.0.0.0",
 		RDPPort:     3389,
-		Certificate: "/root/nanokvm-rdp/cert.pem",
-		PrivateKey:  "/root/nanokvm-rdp/key.pem",
+		Certificate: "/run/tls/tls.crt",
+		PrivateKey:  "/run/tls/tls.key",
 		Width:       1920,
 		Height:      1080,
 		Bitrate:     8000,
