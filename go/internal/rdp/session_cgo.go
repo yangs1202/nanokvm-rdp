@@ -1,7 +1,7 @@
 package rdp
 
 /*
-#cgo pkg-config: freerdp3 freerdp-server3 winpr3
+#cgo pkg-config: freerdp3 freerdp-server3 winpr3 rdtk0
 #cgo LDFLAGS: -ldl -lpthread /usr/lib/x86_64-linux-gnu/libssl.a /usr/lib/x86_64-linux-gnu/libcrypto.a
 #cgo CFLAGS: -Wall -Wextra -Wno-deprecated-declarations
 #include "session_api.h"
