@@ -74,10 +74,10 @@ stop() {
     if is_running; then
         kill "$(cat "$PIDFILE")" 2>/dev/null || true
     fi
-    pkill -f "$DAEMON" 2>/dev/null || true
+    killall nanokvm-agent 2>/dev/null || true
     sleep 1
     is_running && kill -9 "$(cat "$PIDFILE")" 2>/dev/null || true
-    pkill -9 -f "$DAEMON" 2>/dev/null || true
+    killall -9 nanokvm-agent 2>/dev/null || true
     rm -f "$PIDFILE"
     echo OK
 }
