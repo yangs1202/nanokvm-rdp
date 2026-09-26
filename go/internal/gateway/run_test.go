@@ -15,7 +15,7 @@ func TestRunListensUntilCanceled(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, Config{BindAddress: "127.0.0.1", ControlPort: controlPort, VideoPort: videoPort, Width: 64, Height: 64})
+		done <- run(ctx, Config{BindAddress: "127.0.0.1", ControlPort: controlPort, VideoPort: videoPort, Width: 64, Height: 64}, false)
 	}()
 	deadline := time.Now().Add(time.Second)
 	for {

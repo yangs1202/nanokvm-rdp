@@ -15,15 +15,17 @@ type RuntimeConfig struct {
 	Control net.Listener
 	Video   net.PacketConn
 	RDP     rdp.Session
+	Inputs  <-chan rdp.Input
 }
 
 type Runtime struct {
-	bus   *session.Bus
-	agent *control.Agent
-	video net.PacketConn
-	rdp   rdp.Session
-	ctx   context.Context
-	stop  context.CancelFunc
+	bus    *session.Bus
+	agent  *control.Agent
+	video  net.PacketConn
+	rdp    rdp.Session
+	inputs <-chan rdp.Input
+	ctx    context.Context
+	stop   context.CancelFunc
 }
 
 func NewRuntime(cfg RuntimeConfig) *Runtime {
@@ -35,6 +37,7 @@ func NewRuntime(cfg RuntimeConfig) *Runtime {
 	}
 	rt.video = cfg.Video
 	rt.rdp = cfg.RDP
+	rt.inputs = cfg.Inputs
 	go rt.forwardInputs()
 	go rt.forwardFrames()
 	if rt.video != nil {
@@ -109,6 +112,29 @@ func (rt *Runtime) Close() {
 }
 
 func Run(ctx context.Context, cfg Config) error {
+	return run(ctx, cfg, true)
+}
+
+func run(ctx context.Context, cfg Config, startRDP bool) error {
+	var rdpSession rdp.Session
+	inputs := make(chan rdp.Input, 16)
+	if startRDP {
+		var err error
+		rdpSession, err = rdp.Start(rdp.Config{
+			BindAddress:    cfg.BindAddress,
+			Port:           cfg.RDPPort,
+			Certificate:    cfg.Certificate,
+			PrivateKey:     cfg.PrivateKey,
+			Width:          cfg.Width,
+			Height:         cfg.Height,
+			DirectGFX:      cfg.DirectGFX,
+			SwapAltCommand: cfg.SwapAltCommand,
+		}, inputs)
+		if err != nil {
+			return fmt.Errorf("start rdp: %w", err)
+		}
+		defer rdpSession.Close()
+	}
 	controlListener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.BindAddress, cfg.ControlPort))
 	if err != nil {
 		return fmt.Errorf("listen control: %w", err)
@@ -118,8 +144,32 @@ func Run(ctx context.Context, cfg Config) error {
 		_ = controlListener.Close()
 		return fmt.Errorf("listen video: %w", err)
 	}
-	rt := NewRuntime(RuntimeConfig{Control: controlListener, Video: video})
+	rt := NewRuntime(RuntimeConfig{Control: controlListener, Video: video, RDP: rdpSession, Inputs: inputs})
 	defer rt.Close()
+	go rt.forwardRDPInputs()
 	<-ctx.Done()
 	return nil
+}
+
+func (rt *Runtime) forwardRDPInputs() {
+	if rt.inputs == nil {
+		return
+	}
+	for {
+		select {
+		case <-rt.ctx.Done():
+			return
+		case input := <-rt.inputs:
+			kind := session.EventKey
+			payload := []byte{byte(input.Code), 0, 0}
+			if input.Flags&0x8000 != 0 {
+				payload[2] = 1
+			}
+			if input.Kind == rdp.InputMouse {
+				kind = session.EventPointer
+				payload = []byte{byte(input.X), byte(input.X >> 8), byte(input.Y), byte(input.Y >> 8)}
+			}
+			rt.bus.Input(session.Event{Kind: kind, Payload: payload})
+		}
+	}
 }
