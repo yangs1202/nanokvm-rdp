@@ -15,7 +15,7 @@ set(CMAKE_C_EXTENSIONS ON)
 if(NANOKVM_RDP_BUILD_TESTS)
   enable_testing()
   add_executable(nanokvm-frame-flow-test tests/frame_flow_test.c)
-  target_include_directories(nanokvm-frame-flow-test PRIVATE src)
+  target_include_directories(nanokvm-frame-flow-test PRIVATE cmd/nanokvm-rdp src)
   target_compile_options(nanokvm-frame-flow-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
   add_test(NAME nanokvm-frame-flow-test COMMAND nanokvm-frame-flow-test)
   add_executable(nanokvm-rdp-unit
@@ -57,7 +57,7 @@ if(NANOKVM_RDP_BUILD_TESTS)
   set_tests_properties(nanokvm-rtp-client-test PROPERTIES TIMEOUT 10)
 
   add_executable(nanokvm-bitmap-diff-test tests/bitmap_diff_test.c)
-  target_include_directories(nanokvm-bitmap-diff-test PRIVATE src)
+  target_include_directories(nanokvm-bitmap-diff-test PRIVATE cmd/nanokvm-rdp src)
   target_compile_options(nanokvm-bitmap-diff-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
   add_test(NAME nanokvm-bitmap-diff-test COMMAND nanokvm-bitmap-diff-test)
 endif()
@@ -77,84 +77,51 @@ if(NANOKVM_RDP_BUILD_AGENT)
 endif()
 
 if(NANOKVM_RDP_BUILD_SERVER)
+  find_program(NANOKVM_RDP_GO_EXECUTABLE go REQUIRED)
   option(NANOKVM_RDP_USE_INSTALLED_FREERDP
-         "Use an installed FreeRDP package instead of embedding its source tree" OFF)
-  set(NANOKVM_RDP_FREERDP_DIR "" CACHE PATH
-      "Optional FreeRDP source tree; omit when using an installed FreeRDP development package")
-  set(NANOKVM_RDP_OPENSSL_ROOT "" CACHE PATH
-      "Cross-compiled OpenSSL prefix (required for a cross build)")
-
-  if(NANOKVM_RDP_USE_INSTALLED_FREERDP)
-    find_package(FreeRDP 3 REQUIRED)
-    find_package(FreeRDP-Server 3 REQUIRED)
-  else()
-    if(NOT NANOKVM_RDP_FREERDP_DIR OR NOT EXISTS "${NANOKVM_RDP_FREERDP_DIR}/CMakeLists.txt")
-      message(FATAL_ERROR "Set NANOKVM_RDP_FREERDP_DIR to a FreeRDP source tree (gateway only); agent builds without FreeRDP")
-    endif()
-
-    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-    set(WITH_SERVER ON CACHE BOOL "" FORCE)
-    set(WITH_CLIENT OFF CACHE BOOL "" FORCE)
-    set(WITH_SAMPLE OFF CACHE BOOL "" FORCE)
-    set(WITH_SHADOW OFF CACHE BOOL "" FORCE)
-    set(WITH_PROXY OFF CACHE BOOL "" FORCE)
-    set(WITH_PLATFORM_SERVER OFF CACHE BOOL "" FORCE)
-    set(WITH_X11 OFF CACHE BOOL "" FORCE)
-    set(WITH_WAYLAND OFF CACHE BOOL "" FORCE)
-    set(WITH_CAIRO OFF CACHE BOOL "" FORCE)
-    set(WITH_FFMPEG OFF CACHE BOOL "" FORCE)
-    set(WITH_JPEG OFF CACHE BOOL "" FORCE)
-    set(WITH_PNG OFF CACHE BOOL "" FORCE)
-    set(WITH_ZLIB OFF CACHE BOOL "" FORCE)
-    set(WITH_CUPS OFF CACHE BOOL "" FORCE)
-    set(WITH_PCSC OFF CACHE BOOL "" FORCE)
-    set(WITH_LIBUSB OFF CACHE BOOL "" FORCE)
-    set(WITH_MANPAGES OFF CACHE BOOL "" FORCE)
-    set(WITH_SMARTCARD_EMULATE OFF CACHE BOOL "" FORCE)
-    set(WITH_KRB5 OFF CACHE BOOL "" FORCE)
-    set(WITH_ALSA OFF CACHE BOOL "" FORCE)
-    set(WITH_PULSE OFF CACHE BOOL "" FORCE)
-    set(WITH_UNICODE_BUILTIN ON CACHE BOOL "" FORCE)
-    set(WITH_JSON_DISABLED ON CACHE BOOL "" FORCE)
-    set(WITH_URIPARSER OFF CACHE BOOL "" FORCE)
-    set(WITH_FUSE OFF CACHE BOOL "" FORCE)
-    set(WITH_OPUS OFF CACHE BOOL "" FORCE)
-    set(WITH_AAD OFF CACHE BOOL "" FORCE)
-    set(USE_UNWIND OFF CACHE BOOL "" FORCE)
-    set(WITH_DSP_FFMPEG OFF CACHE BOOL "" FORCE)
-    set(WITH_VIDEO_FFMPEG OFF CACHE BOOL "" FORCE)
-    set(WITH_SWSCALE OFF CACHE BOOL "" FORCE)
-    set(WITH_GFX_H264 ON CACHE BOOL "" FORCE)
-    set(WITH_OPENSSL ON CACHE BOOL "" FORCE)
-    if(NANOKVM_RDP_OPENSSL_ROOT)
-      set(OPENSSL_ROOT_DIR "${NANOKVM_RDP_OPENSSL_ROOT}" CACHE PATH "" FORCE)
-    endif()
-
-    add_subdirectory("${NANOKVM_RDP_FREERDP_DIR}" "${CMAKE_BINARY_DIR}/freerdp")
+         "Use an installed FreeRDP package for the Go gateway" ON)
+  if(NOT NANOKVM_RDP_USE_INSTALLED_FREERDP)
+    message(FATAL_ERROR
+      "The Go gateway requires an installed FreeRDP pkg-config export; configure with "
+      "-DNANOKVM_RDP_USE_INSTALLED_FREERDP=ON -DCMAKE_PREFIX_PATH=/path/to/freerdp")
   endif()
+  find_package(FreeRDP 3 REQUIRED)
+  find_package(FreeRDP-Server 3 REQUIRED)
 
-  add_executable(nanokvm-rdp-gateway
-    src/main.c
-    src/ffmpeg_decoder.c
-    src/hid.c
-    src/h264.c
-    src/protocol.c
-    src/rtp_h264.c
-    src/rtp_client.c
+  set(NANOKVM_RDP_GO_PKG_CONFIG_PATH "" CACHE STRING
+      "PKG_CONFIG_PATH used while building the cgo FreeRDP shim")
+  if(NOT NANOKVM_RDP_GO_PKG_CONFIG_PATH AND CMAKE_PREFIX_PATH)
+    set(NANOKVM_RDP_GO_PKG_CONFIG_DIRS)
+    foreach(NANOKVM_RDP_PREFIX IN LISTS CMAKE_PREFIX_PATH)
+      list(APPEND NANOKVM_RDP_GO_PKG_CONFIG_DIRS
+        "${NANOKVM_RDP_PREFIX}/lib/pkgconfig"
+        "${NANOKVM_RDP_PREFIX}/lib64/pkgconfig")
+    endforeach()
+    string(REPLACE ";" ":" NANOKVM_RDP_GO_PKG_CONFIG_PATH
+      "${NANOKVM_RDP_GO_PKG_CONFIG_DIRS}")
+  endif()
+  set(NANOKVM_RDP_GATEWAY_BINARY "${CMAKE_CURRENT_BINARY_DIR}/nanokvm-rdp-gateway")
+  add_custom_target(nanokvm-rdp-gateway ALL
+    COMMAND ${CMAKE_COMMAND} -E env
+      "CGO_ENABLED=1"
+      "PKG_CONFIG_PATH=${NANOKVM_RDP_GO_PKG_CONFIG_PATH}"
+      "${NANOKVM_RDP_GO_EXECUTABLE}" build -a -trimpath -o "${NANOKVM_RDP_GATEWAY_BINARY}"
+      ./cmd/nanokvm-rdp
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    DEPENDS
+      go.mod
+      cmd/nanokvm-rdp/main.go
+      cmd/nanokvm-rdp/bridge.go
+      cmd/nanokvm-rdp/decoder.go
+      cmd/nanokvm-rdp/gateway.go
+      cmd/nanokvm-rdp/protocol.go
+      cmd/nanokvm-rdp/rtp.go
+      cmd/nanokvm-rdp/rdp_shim.c
+      cmd/nanokvm-rdp/rdp_shim.h
+      cmd/nanokvm-rdp/bitmap_diff.h
+      cmd/nanokvm-rdp/frame_flow.h
+    VERBATIM
   )
-  target_include_directories(nanokvm-rdp-gateway PRIVATE src)
-  if(NANOKVM_RDP_USE_INSTALLED_FREERDP)
-    target_include_directories(nanokvm-rdp-gateway PRIVATE "${FreeRDP_INCLUDE_DIR}")
-  else()
-    target_include_directories(nanokvm-rdp-gateway PRIVATE
-      "${NANOKVM_RDP_FREERDP_DIR}/include"
-      "${NANOKVM_RDP_FREERDP_DIR}/winpr/include"
-      "${CMAKE_BINARY_DIR}/freerdp/include"
-      "${CMAKE_BINARY_DIR}/freerdp/winpr/include"
-    )
-  endif()
-  target_compile_options(nanokvm-rdp-gateway PRIVATE -Wall -Wextra -Werror -Wno-deprecated-declarations)
-  target_link_libraries(nanokvm-rdp-gateway PRIVATE freerdp-server freerdp winpr dl)
 
   add_executable(nanokvm-rdp-vdec-probe
     tools/vdec_probe.c

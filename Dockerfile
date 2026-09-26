@@ -1,4 +1,4 @@
-FROM debian:bookworm AS builder
+FROM golang:1.23-bookworm AS builder
 
 ARG FREERDP_VERSION=3.14.0
 
@@ -57,7 +57,7 @@ RUN cmake -S freerdp -B build/freerdp \
         -DWITH_SWSCALE=OFF \
         -DWITH_GFX_H264=ON \
         -DWITH_OPENSSL=ON \
-    && cmake --build build/freerdp --parallel \
+    && cmake --build build/freerdp --parallel 1 \
     && cmake --install build/freerdp
 
 WORKDIR /src/nanokvm-rdp
