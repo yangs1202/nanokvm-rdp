@@ -6,6 +6,7 @@ import (
 	"net"
 
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/control"
+	"github.com/yangs1202/nanokvm-rdp/go/go/internal/rdp"
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/session"
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/video"
 )
@@ -13,12 +14,14 @@ import (
 type RuntimeConfig struct {
 	Control net.Listener
 	Video   net.PacketConn
+	RDP     rdp.Session
 }
 
 type Runtime struct {
 	bus   *session.Bus
 	agent *control.Agent
 	video net.PacketConn
+	rdp   rdp.Session
 	ctx   context.Context
 	stop  context.CancelFunc
 }
@@ -31,11 +34,27 @@ func NewRuntime(cfg RuntimeConfig) *Runtime {
 		rt.agent = agent
 	}
 	rt.video = cfg.Video
+	rt.rdp = cfg.RDP
 	go rt.forwardInputs()
+	go rt.forwardFrames()
 	if rt.video != nil {
 		go rt.receiveVideo()
 	}
 	return rt
+}
+
+func (rt *Runtime) forwardFrames() {
+	frames := rt.bus.Subscribe(rt.ctx)
+	for frame := range frames {
+		if rt.rdp == nil {
+			continue
+		}
+		rdpFrame := rdp.Frame{Kind: rdp.FrameH264, H264: frame.Data}
+		if frame.Kind == session.FrameBGRA {
+			rdpFrame = rdp.Frame{Kind: rdp.FrameBGRA, BGRA: frame.Data}
+		}
+		_ = rt.rdp.Submit(rdpFrame)
+	}
 }
 
 func (rt *Runtime) receiveVideo() {

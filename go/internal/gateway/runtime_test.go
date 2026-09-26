@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/control"
+	"github.com/yangs1202/nanokvm-rdp/go/go/internal/rdp"
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/session"
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/video"
 )
@@ -52,6 +53,38 @@ func TestRuntimeForwardsControlInputAndVideo(t *testing.T) {
 		}
 		return
 	}
+}
+
+type recordingSession struct {
+	frames []rdp.Frame
+	inputs chan rdp.Input
+}
+
+func (s *recordingSession) Submit(frame rdp.Frame) error {
+	s.frames = append(s.frames, frame)
+	return nil
+}
+
+func (s *recordingSession) Close() error { return nil }
+
+func TestRuntimeSubmitsPublishedFrameToRDP(t *testing.T) {
+	session := &recordingSession{inputs: make(chan rdp.Input, 1)}
+	rt := NewRuntime(RuntimeConfig{RDP: session})
+	defer rt.Close()
+	rt.bus.Publish(sessionFrame(t))
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(session.frames) == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("frames = %d", len(session.frames))
+}
+
+func sessionFrame(t *testing.T) session.Frame {
+	t.Helper()
+	return session.Frame{Kind: session.FrameH264, Data: []byte{0, 0, 0, 1, 0x65}}
 }
 
 func TestRuntimePublishesRTPAccessUnit(t *testing.T) {
