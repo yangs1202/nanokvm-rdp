@@ -68,6 +68,54 @@ func (s *recordingSession) Submit(frame rdp.Frame) error {
 func (s *recordingSession) Controls() <-chan rdp.Control { return nil }
 func (s *recordingSession) Close() error                 { return nil }
 
+type controlSession struct {
+	controls chan rdp.Control
+}
+
+func (s *controlSession) Submit(rdp.Frame) error       { return nil }
+func (s *controlSession) Close() error                 { return nil }
+func (s *controlSession) Controls() <-chan rdp.Control { return s.controls }
+
+func TestRuntimeForwardsSessionControlToAgent(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controls := make(chan rdp.Control, 1)
+	rt := NewRuntime(RuntimeConfig{Control: listener, RDP: &controlSession{controls: controls}})
+	defer rt.Close()
+	agent, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	if err := control.Write(agent, control.TypeHello, make([]byte, control.HelloBaseSize)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := rt.agent.Send(control.TypePing, nil); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	controls <- rdp.Control{Type: byte(control.TypeKey), Payload: []byte{0x1e, 0, 1}}
+	_ = agent.SetReadDeadline(deadline)
+	for {
+		msg, err := control.Read(agent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg.Type == control.TypePing {
+			continue
+		}
+		if msg.Type != control.TypeKey || msg.Payload[2] != 1 {
+			t.Fatalf("control = %+v", msg)
+		}
+		return
+	}
+}
+
 func TestRuntimeSubmitsPublishedFrameToRDP(t *testing.T) {
 	session := &recordingSession{inputs: make(chan rdp.Input, 1)}
 	rt := NewRuntime(RuntimeConfig{RDP: session})

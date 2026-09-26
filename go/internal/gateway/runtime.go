@@ -40,10 +40,28 @@ func NewRuntime(cfg RuntimeConfig) *Runtime {
 	rt.inputs = cfg.Inputs
 	go rt.forwardInputs()
 	go rt.forwardFrames()
+	go rt.forwardSessionControls()
 	if rt.video != nil {
 		go rt.receiveVideo()
 	}
 	return rt
+}
+
+func (rt *Runtime) forwardSessionControls() {
+	if rt.rdp == nil {
+		return
+	}
+	for {
+		select {
+		case <-rt.ctx.Done():
+			return
+		case event, ok := <-rt.rdp.Controls():
+			if !ok || rt.agent == nil {
+				return
+			}
+			_ = rt.agent.Send(control.Type(event.Type), event.Payload)
+		}
+	}
 }
 
 func (rt *Runtime) forwardFrames() {
