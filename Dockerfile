@@ -6,9 +6,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        curl \
         cmake \
         git \
-        golang-go \
         libavcodec-dev \
         libavutil-dev \
         libssl-dev \
@@ -65,6 +65,9 @@ WORKDIR /src/nanokvm-rdp
 
 COPY . .
 
+ARG GO_VERSION=1.26.4
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -C /usr/local -xz
+ENV PATH=/usr/local/go/bin:${PATH}
 ENV PKG_CONFIG_PATH=/opt/freerdp/lib/pkgconfig
 RUN CGO_ENABLED=1 go build -o /usr/local/bin/nanokvm-rdp-gateway ./go/cmd/nanokvm-rdp-gateway
 
