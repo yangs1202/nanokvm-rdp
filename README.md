@@ -75,10 +75,14 @@ when geometry changes. Container builds use Release optimization and run the tes
 before producing the runtime image.
 
 Progressive output starts at a 40 ms interval and adapts between 16 and 100 ms.
-Eight consecutive ACKs within 60 ms with an empty client queue reduce the interval
+Eight consecutive ACKs within 60 ms without a reported client backlog reduce the interval
 by 2 ms. ACKs over 120 ms, queues over 256 KiB, or local work exceeding the interval
 increase it by 8 ms (at most once per 100 ms). The three-frame in-flight limit stays
-in place. Clients that suspend ACKs retain a minimum 40 ms interval. `STATS` includes
+in place. Explicit ACK suspension resets stale congestion history to 20 ms, following
+the protocol indication that the client can decode faster than delivery. Slow
+local sends still increase that interval; eight successful sends costing at most
+half the interval reduce it by 2 ms toward 20 ms even without further ACKs.
+Clients that have not yet provided feedback start at 40 ms. `STATS` includes
 `converted` and `interval_ms`; `decode_ms` measures decode to raw-frame availability,
 and `rdp_send_ms` now includes BGRA conversion and RDP encoding/submission. Neither
 metric measures end-to-end display latency.

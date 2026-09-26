@@ -62,9 +62,29 @@ int main(void)
 	assert(frame_flow_interval(&flow) == 100);
 	flow.interval_ms = 16;
 	assert(!frame_flow_ack(&flow, 0, UINT32_MAX, 18000, &elapsed));
-	assert(frame_flow_interval(&flow) == 40 && !frame_flow_blocked(&flow));
+	assert(frame_flow_interval(&flow) == 20 && !frame_flow_blocked(&flow));
 	assert(!frame_flow_ack(&flow, 0, 0, 18001, &elapsed));
 	assert(frame_flow_interval(&flow) == 40); /* resumption needs fresh measured ACKs */
+	/* Production regression: backlog raised pacing to 62 ms, then the client
+	 * suspended ACKs. The old code stayed at 62 ms indefinitely (~16 fps). */
+	flow.interval_ms = 62;
+	assert(!frame_flow_ack(&flow, 10, UINT32_MAX, 20000, &elapsed));
+	assert(frame_flow_interval(&flow) == 20);
+	for (unsigned i = 0; i < 100; i++)
+	{
+		assert(frame_flow_sent(&flow, i, 20001 + i * 20));
+		frame_flow_send_cost(&flow, 9, 20010 + i * 20);
+	}
+	assert(frame_flow_interval(&flow) == 20 && flow.count == 0);
+	/* A real slow send still backs off, then recovers without future ACKs. */
+	frame_flow_send_cost(&flow, 80, 23000);
+	assert(frame_flow_interval(&flow) == 28);
+	for (unsigned i = 0; i < 32; i++) frame_flow_send_cost(&flow, 9, 23100 + i * 30);
+	assert(frame_flow_interval(&flow) == 20);
+	for (unsigned i = 0; i < 20; i++) frame_flow_send_cost(&flow, 80, 25000 + i * 100);
+	assert(frame_flow_interval(&flow) > 20);
+	assert(!frame_flow_ack(&flow, 100, 1000000, 28000, &elapsed));
+	assert(!flow.suspended && frame_flow_interval(&flow) >= 40);
 	puts("Frame flow: slow client, duplicate/out-of-order ACK, suspend/resume and wrap passed");
 	return 0;
 }
