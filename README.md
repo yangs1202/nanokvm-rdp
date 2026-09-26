@@ -46,7 +46,7 @@ The binary control protocol includes `HELLO`, `START_STREAM`, `STOP_STREAM`, `ID
 - CMake 3.24 or later
 - A C11 compiler and POSIX threads
 - A FreeRDP source tree when building the gateway
-- FFmpeg runtime libraries available to the gateway
+- FFmpeg development libraries (`libavcodec`, `libavutil`, `libswscale`) and pkg-config for gateway builds; corresponding runtime libraries on the gateway
 - NanoKVM runtime libraries, including `libkvm.so`, available to the agent at runtime
 
 ## Build and test
@@ -60,6 +60,13 @@ cmake -S . -B build/unit -G 'Unix Makefiles' \
 cmake --build build/unit --parallel 4
 ctest --test-dir build/unit --output-on-failure
 ```
+
+To also check live FFmpeg output buffering, configure with
+`-DNANOKVM_RDP_TEST_FFMPEG=ON` (requires `ffmpeg` with `libx264` on `PATH`).
+This test checks that each complete H.264 frame, including P-frames, is decoded
+without waiting for the next frame. The gateway passes RTP access units directly
+to libavcodec and converts them to BGRA with libswscale, avoiding subprocess pipes,
+byte-stream parser lookahead, and rawvideo output encoder buffering.
 
 Build only the NanoKVM agent:
 

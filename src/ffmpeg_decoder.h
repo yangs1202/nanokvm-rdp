@@ -4,31 +4,30 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdatomic.h>
-#include <pthread.h>
-#include <sys/types.h>
+
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
 
 typedef bool (*FfmpegFrameHandler)(void* context, const uint8_t* bgra, size_t length);
 
 typedef struct
 {
-	pid_t pid;
-	int input;
-	int output;
-	pthread_t output_thread;
-	bool output_thread_started;
-	atomic_bool output_failed;
+	AVCodecContext* codec;
+	AVFrame* decoded;
+	AVPacket* packet;
+	struct SwsContext* scaler;
 	uint8_t* frame;
 	size_t frame_size;
-	size_t frame_used;
-	uint8_t* pending_frame;
-	bool pending_frame_ready;
+	uint16_t width;
+	uint16_t height;
 	FfmpegFrameHandler frame_handler;
 	void* frame_context;
 } FfmpegDecoder;
 
 bool ffmpeg_decoder_start(FfmpegDecoder* decoder, uint16_t width, uint16_t height,
-	                      FfmpegFrameHandler frame_handler, void* frame_context);
+                          FfmpegFrameHandler frame_handler, void* frame_context);
+/* Each push must contain one complete Annex-B access unit, including parameter
+ * sets when needed. RTP marker boundaries supply this framing. */
 bool ffmpeg_decoder_push(FfmpegDecoder* decoder, const uint8_t* data, size_t length);
 void ffmpeg_decoder_stop(FfmpegDecoder* decoder);
 

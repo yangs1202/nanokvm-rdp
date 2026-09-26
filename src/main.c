@@ -1334,7 +1334,7 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 {
 	Client* client = (Client*)argument;
 	RtpClient rtp = { .fd = -1 };
-	FfmpegDecoder decoder = { .pid = -1, .input = -1, .output = -1 };
+	FfmpegDecoder decoder = { 0 };
 	const uint16_t width = client->render_width;
 	const uint16_t height = client->render_height;
 	bool backend_ready = false;

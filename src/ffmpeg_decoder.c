@@ -1,213 +1,115 @@
 #include "ffmpeg_decoder.h"
 
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <signal.h>
-#include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
-static bool set_nonblocking(int fd)
+static bool decoder_receive(FfmpegDecoder* decoder)
 {
-	const int flags = fcntl(fd, F_GETFL, 0);
-	return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
-}
-
-static bool decoder_drain(FfmpegDecoder* decoder, int timeout_ms)
-{
-	struct pollfd pollfd = { .fd = decoder->output, .events = POLLIN };
-	const int ready = poll(&pollfd, 1, timeout_ms);
-	if (ready < 0 && errno != EINTR)
-		return false;
-	if (ready <= 0)
-		return ready >= 0;
-	if ((pollfd.revents & (POLLERR | POLLNVAL)) != 0)
-		return false;
-	if ((pollfd.revents & POLLIN) == 0)
-		return (pollfd.revents & POLLHUP) == 0;
-
 	for (;;)
 	{
-		uint8_t buffer[32768];
-		const ssize_t length = read(decoder->output, buffer, sizeof(buffer));
-		if (length > 0)
-		{
-			size_t offset = 0;
-			while (offset < (size_t)length)
-			{
-				const size_t available = decoder->frame_size - decoder->frame_used;
-				const size_t copy_length =
-				    available < ((size_t)length - offset) ? available : ((size_t)length - offset);
-				memcpy(decoder->frame + decoder->frame_used, buffer + offset, copy_length);
-				decoder->frame_used += copy_length;
-				offset += copy_length;
-				if (decoder->frame_used == decoder->frame_size)
-				{
-					decoder->frame_used = 0;
-					/* 디코더 출력은 전송보다 빨리 쌓인다. 최신 프레임만 남기고
-					 * 이전 프레임은 버려야 화면이 실제보다 빨리 재생되지 않는다. */
-					if (!decoder->pending_frame)
-					{
-						decoder->pending_frame = malloc(decoder->frame_size);
-						if (!decoder->pending_frame)
-							return false;
-					}
-					memcpy(decoder->pending_frame, decoder->frame, decoder->frame_size);
-					decoder->pending_frame_ready = true;
-				}
-			}
-			continue;
-		}
-		if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-			break;
-		return false;
-	}
-	if (decoder->pending_frame_ready)
-	{
-		decoder->pending_frame_ready = false;
-		if (!decoder->frame_handler(decoder->frame_context, decoder->pending_frame,
-		                             decoder->frame_size))
+		const int result = avcodec_receive_frame(decoder->codec, decoder->decoded);
+		if (result == AVERROR(EAGAIN) || result == AVERROR_EOF ||
+		    result == AVERROR_INVALIDDATA)
+			return true;
+		if (result < 0)
+			return false;
+
+		const AVFrame* source = decoder->decoded;
+		if (source->width <= 0 || source->height <= 0)
+			return false;
+		int width = decoder->width;
+		int height = decoder->height;
+		if ((int64_t)source->width * height > (int64_t)source->height * width)
+			height = (int)((int64_t)source->height * width / source->width);
+		else
+			width = (int)((int64_t)source->width * height / source->height);
+		if (width < 1) width = 1;
+		if (height < 1) height = 1;
+		decoder->scaler = sws_getCachedContext(
+		    decoder->scaler, source->width, source->height, source->format,
+		    width, height, AV_PIX_FMT_BGRA, SWS_BICUBIC, NULL, NULL, NULL);
+		if (!decoder->scaler)
+			return false;
+		const int colorspace = source->colorspace == AVCOL_SPC_UNSPECIFIED
+		                           ? SWS_CS_DEFAULT : source->colorspace;
+		const int* coefficients = sws_getCoefficients(colorspace);
+		if (sws_setColorspaceDetails(decoder->scaler, coefficients,
+		                            source->color_range == AVCOL_RANGE_JPEG,
+		                            coefficients, 1, 0, 1 << 16, 1 << 16) < 0)
+			return false;
+		memset(decoder->frame, 0, decoder->frame_size);
+		for (size_t i = 3; i < decoder->frame_size; i += 4)
+			decoder->frame[i] = 255;
+		const int stride = decoder->width * 4;
+		const size_t offset = (size_t)((decoder->height - height) / 2) * stride +
+		                      (size_t)((decoder->width - width) / 2) * 4;
+		uint8_t* output[4] = { decoder->frame + offset, NULL, NULL, NULL };
+		const int strides[4] = { stride, 0, 0, 0 };
+		if (sws_scale(decoder->scaler, (const uint8_t* const*)source->data,
+		              source->linesize, 0, source->height, output, strides) != height)
+			return false;
+		const bool handled = decoder->frame_handler(decoder->frame_context,
+		                                           decoder->frame, decoder->frame_size);
+		av_frame_unref(decoder->decoded);
+		if (!handled)
 			return false;
 	}
-	return true;
-}
-
-static void* decoder_output_loop(void* context)
-{
-	FfmpegDecoder* decoder = context;
-	while (decoder_drain(decoder, 100))
-	{
-	}
-	atomic_store(&decoder->output_failed, true);
-	return NULL;
 }
 
 bool ffmpeg_decoder_start(FfmpegDecoder* decoder, uint16_t width, uint16_t height,
-	                      FfmpegFrameHandler frame_handler, void* frame_context)
+                          FfmpegFrameHandler frame_handler, void* frame_context)
 {
-	if (!decoder || width == 0 || height == 0 || !frame_handler)
+	if (!decoder || !width || !height || !frame_handler)
 		return false;
-	*decoder = (FfmpegDecoder){ .pid = -1, .input = -1, .output = -1 };
-	const size_t frame_size = (size_t)width * height * 4U;
-	decoder->frame = malloc(frame_size);
-	if (!decoder->frame)
+	*decoder = (FfmpegDecoder){ 0 };
+	const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+	if (!codec)
 		return false;
-	decoder->frame_size = frame_size;
+	decoder->codec = avcodec_alloc_context3(codec);
+	decoder->decoded = av_frame_alloc();
+	decoder->packet = av_packet_alloc();
+	decoder->frame_size = (size_t)width * height * 4U;
+	decoder->frame = malloc(decoder->frame_size);
+	if (!decoder->codec || !decoder->decoded || !decoder->packet || !decoder->frame)
+		goto fail;
+	decoder->codec->thread_count = 1;
+	decoder->codec->flags |= AV_CODEC_FLAG_LOW_DELAY;
+	if (avcodec_open2(decoder->codec, codec, NULL) < 0)
+		goto fail;
+	decoder->width = width;
+	decoder->height = height;
 	decoder->frame_handler = frame_handler;
 	decoder->frame_context = frame_context;
-	atomic_init(&decoder->output_failed, false);
-
-	int input[2] = { -1, -1 };
-	int output[2] = { -1, -1 };
-	if (pipe(input) != 0 || pipe(output) != 0)
-		goto fail;
-	decoder->pid = fork();
-	if (decoder->pid < 0)
-		goto fail;
-	if (decoder->pid == 0)
-	{
-		char scale[128] = { 0 };
-		(void)snprintf(scale, sizeof(scale),
-		               "scale=%u:%u:force_original_aspect_ratio=decrease,pad=%u:%u:(ow-iw)/2:(oh-ih)/2:black",
-		               width, height, width, height);
-		(void)dup2(input[0], STDIN_FILENO);
-		(void)dup2(output[1], STDOUT_FILENO);
-		(void)close(input[0]);
-		(void)close(input[1]);
-		(void)close(output[0]);
-		(void)close(output[1]);
-		execlp("ffmpeg", "ffmpeg", "-loglevel", "error", "-fflags", "nobuffer", "-avioflags",
-		      "direct", "-probesize", "32", "-analyzeduration", "0", "-threads", "1",
-		      "-flags", "low_delay", "-f", "h264", "-i", "pipe:0", "-an", "-pix_fmt", "bgra",
-		      "-vf", scale, "-enc_time_base", "1:30", "-fps_mode", "passthrough", "-flush_packets",
-		      "1", "-f", "rawvideo", "pipe:1", (char*)NULL);
-		_exit(127);
-	}
-	(void)close(input[0]);
-	(void)close(output[1]);
-	input[0] = -1;
-	output[1] = -1;
-	decoder->input = input[1];
-	decoder->output = output[0];
-	input[1] = -1;
-	output[0] = -1;
-	if (!set_nonblocking(decoder->input) || !set_nonblocking(decoder->output))
-		goto fail;
-	if (pthread_create(&decoder->output_thread, NULL, decoder_output_loop, decoder) != 0)
-		goto fail;
-	decoder->output_thread_started = true;
 	return true;
-
 fail:
-	if (input[0] >= 0)
-		(void)close(input[0]);
-	if (input[1] >= 0)
-		(void)close(input[1]);
-	if (output[0] >= 0)
-		(void)close(output[0]);
-	if (output[1] >= 0)
-		(void)close(output[1]);
 	ffmpeg_decoder_stop(decoder);
 	return false;
 }
 
 bool ffmpeg_decoder_push(FfmpegDecoder* decoder, const uint8_t* data, size_t length)
 {
-	if (!decoder || decoder->input < 0 || !data || length == 0)
+	if (!decoder || !decoder->codec || !data || !length || length > INT_MAX)
 		return false;
-	if (atomic_load(&decoder->output_failed))
+	/* av_new_packet adds the zero padding required by FFmpeg's bitstream reader. */
+	if (av_new_packet(decoder->packet, (int)length) < 0)
 		return false;
-	while (length > 0)
-	{
-		const ssize_t written = write(decoder->input, data, length);
-		if (written > 0)
-		{
-			data += written;
-			length -= (size_t)written;
-			continue;
-		}
-		if (written < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-			return false;
-
-		struct pollfd pollfd = { .fd = decoder->input, .events = POLLOUT };
-		const int ready = poll(&pollfd, 1, 100);
-		if (ready < 0 && errno != EINTR)
-			return false;
-		if (atomic_load(&decoder->output_failed))
-			return false;
-	}
-	return !atomic_load(&decoder->output_failed);
+	memcpy(decoder->packet->data, data, length);
+	const int result = avcodec_send_packet(decoder->codec, decoder->packet);
+	av_packet_unref(decoder->packet);
+	/* Loss recovery requests an IDR on the control channel. A damaged access
+	 * unit must not tear down the RDP session while that IDR is in flight. */
+	return result == AVERROR_INVALIDDATA || (result >= 0 && decoder_receive(decoder));
 }
 
 void ffmpeg_decoder_stop(FfmpegDecoder* decoder)
 {
 	if (!decoder)
 		return;
-	if (decoder->input >= 0)
-	{
-		(void)close(decoder->input);
-		decoder->input = -1;
-	}
-	if (decoder->output_thread_started)
-	{
-		(void)pthread_join(decoder->output_thread, NULL);
-		decoder->output_thread_started = false;
-	}
-	if (decoder->output >= 0)
-	{
-		(void)close(decoder->output);
-		decoder->output = -1;
-	}
-	if (decoder->pid > 0)
-	{
-		int status = 0;
-		(void)waitpid(decoder->pid, &status, 0);
-		decoder->pid = -1;
-	}
+	sws_freeContext(decoder->scaler);
+	av_packet_free(&decoder->packet);
+	av_frame_free(&decoder->decoded);
+	avcodec_free_context(&decoder->codec);
 	free(decoder->frame);
-	free(decoder->pending_frame);
-	*decoder = (FfmpegDecoder){ .pid = -1, .input = -1, .output = -1 };
+	*decoder = (FfmpegDecoder){ 0 };
 }

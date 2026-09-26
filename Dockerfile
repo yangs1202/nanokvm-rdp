@@ -10,6 +10,7 @@ RUN apt-get update \
         git \
         libavcodec-dev \
         libavutil-dev \
+        libswscale-dev \
         libssl-dev \
         pkg-config \
         zlib1g-dev \

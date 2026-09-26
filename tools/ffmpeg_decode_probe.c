@@ -49,7 +49,7 @@ static bool on_frame(void* context, const uint8_t* bgra, size_t length)
 int main(void)
 {
 	FoldVncClient foldvnc = { .fd = -1 };
-	FfmpegDecoder decoder = { .pid = -1, .input = -1, .output = -1 };
+	FfmpegDecoder decoder = { 0 };
 	ProbeState state = { 0 };
 	const uint64_t deadline = monotonic_milliseconds() + (PROBE_SECONDS * 1000U);
 	uint32_t submitted = 0;
