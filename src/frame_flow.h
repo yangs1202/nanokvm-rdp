@@ -5,14 +5,45 @@
 #include <stdint.h>
 
 #define FRAME_FLOW_LIMIT 3U
+#define FRAME_FLOW_DEFAULT_INTERVAL 40U
+#define FRAME_FLOW_MIN_INTERVAL 16U
+#define FRAME_FLOW_MAX_INTERVAL 100U
 
 typedef struct
 {
 	bool suspended;
+	bool have_ack;
+	unsigned interval_ms;
+	unsigned fast_acks;
+	uint64_t last_slow_at;
 	unsigned count;
 	uint32_t ids[FRAME_FLOW_LIMIT];
 	uint64_t sent_at[FRAME_FLOW_LIMIT];
 } FrameFlow;
+
+/* Unknown or ACK-suspended clients retain at least the old 40 ms pacing. */
+static inline unsigned frame_flow_interval(const FrameFlow* flow)
+{
+	unsigned interval = flow->interval_ms ? flow->interval_ms : FRAME_FLOW_DEFAULT_INTERVAL;
+	if ((!flow->have_ack || flow->suspended) && interval < FRAME_FLOW_DEFAULT_INTERVAL)
+		interval = FRAME_FLOW_DEFAULT_INTERVAL;
+	return interval;
+}
+
+static inline void frame_flow_slow(FrameFlow* flow, uint64_t now)
+{
+	flow->fast_acks = 0;
+	if (flow->last_slow_at && now - flow->last_slow_at < 100U) return;
+	unsigned interval = frame_flow_interval(flow) + 8U;
+	flow->interval_ms = interval > FRAME_FLOW_MAX_INTERVAL ? FRAME_FLOW_MAX_INTERVAL : interval;
+	flow->last_slow_at = now;
+}
+
+/* Include conversion and encoding cost; don't schedule faster than local work. */
+static inline void frame_flow_send_cost(FrameFlow* flow, uint64_t cost_ms, uint64_t now)
+{
+	if (cost_ms >= frame_flow_interval(flow)) frame_flow_slow(flow, now);
+}
 
 static inline bool frame_flow_blocked(const FrameFlow* flow)
 {
@@ -36,14 +67,33 @@ static inline bool frame_flow_ack(FrameFlow* flow, uint32_t id, uint32_t depth,
 	if (depth == UINT32_MAX)
 	{
 		flow->suspended = true;
+		flow->have_ack = false;
+		flow->fast_acks = 0;
+		if (flow->interval_ms < FRAME_FLOW_DEFAULT_INTERVAL)
+			flow->interval_ms = FRAME_FLOW_DEFAULT_INTERVAL;
 		flow->count = 0;
 		return false;
 	}
 	flow->suspended = false;
+	/* A queued byte count is useful even for ACKs sent before tracking resumed. */
+	if (depth > 256U * 1024U) frame_flow_slow(flow, now);
 	for (unsigned i = 0; i < flow->count; i++)
 	{
 		if (flow->ids[i] != id) continue;
 		*elapsed = now - flow->sent_at[i];
+		flow->have_ack = true;
+		if (*elapsed > 120U) frame_flow_slow(flow, now);
+		else if (depth == 0 && *elapsed <= 60U)
+		{
+			if (++flow->fast_acks >= 8U)
+			{
+				const unsigned interval = frame_flow_interval(flow);
+				flow->interval_ms = interval > FRAME_FLOW_MIN_INTERVAL + 1U
+				                        ? interval - 2U : FRAME_FLOW_MIN_INTERVAL;
+				flow->fast_acks = 0;
+			}
+		}
+		else flow->fast_acks = 0;
 		flow->count--;
 		for (unsigned j = i; j < flow->count; j++)
 		{

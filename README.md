@@ -68,6 +68,21 @@ without waiting for the next frame. The gateway passes RTP access units directly
 to libavcodec and converts them to BGRA with libswscale, avoiding subprocess pipes,
 byte-stream parser lookahead, and rawvideo output encoder buffering.
 
+The gateway retains only the newest decoded frame while waiting to send. All
+H.264 reference frames are decoded, but only frames selected for RDP output are
+converted to BGRA. The conversion buffer is reused; black padding is initialized
+when geometry changes. Container builds use Release optimization and run the tests
+before producing the runtime image.
+
+Progressive output starts at a 40 ms interval and adapts between 16 and 100 ms.
+Eight consecutive ACKs within 60 ms with an empty client queue reduce the interval
+by 2 ms. ACKs over 120 ms, queues over 256 KiB, or local work exceeding the interval
+increase it by 8 ms (at most once per 100 ms). The three-frame in-flight limit stays
+in place. Clients that suspend ACKs retain a minimum 40 ms interval. `STATS` includes
+`converted` and `interval_ms`; `decode_ms` measures decode to raw-frame availability,
+and `rdp_send_ms` now includes BGRA conversion and RDP encoding/submission. Neither
+metric measures end-to-end display latency.
+
 Build only the NanoKVM agent:
 
 ```sh

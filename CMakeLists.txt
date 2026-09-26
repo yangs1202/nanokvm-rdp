@@ -40,7 +40,7 @@ if(NANOKVM_RDP_BUILD_TESTS)
     src/musl_compat.c
   )
   target_include_directories(nanokvm-rdp-unit PRIVATE src)
-  target_compile_options(nanokvm-rdp-unit PRIVATE -Wall -Wextra -Werror)
+  target_compile_options(nanokvm-rdp-unit PRIVATE -Wall -Wextra -Werror -UNDEBUG)
   add_test(NAME nanokvm-rdp-unit COMMAND nanokvm-rdp-unit)
 
   add_executable(nanokvm-input-reliability-test tests/input_reliability_test.c src/hid.c src/protocol.c)
@@ -60,7 +60,7 @@ if(NANOKVM_RDP_BUILD_TESTS)
     src/rtp_h264.c
   )
   target_include_directories(nanokvm-rtp-loopback-test PRIVATE src)
-  target_compile_options(nanokvm-rtp-loopback-test PRIVATE -Wall -Wextra -Werror)
+  target_compile_options(nanokvm-rtp-loopback-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
   add_test(NAME nanokvm-rtp-loopback-test COMMAND nanokvm-rtp-loopback-test)
 
   add_executable(nanokvm-rtp-client-test tests/rtp_client_test.c src/rtp_client.c src/rtp_h264.c)

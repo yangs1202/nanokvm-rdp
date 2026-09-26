@@ -7,6 +7,7 @@ RUN apt-get update \
         build-essential \
         ca-certificates \
         cmake \
+        ffmpeg \
         git \
         libavcodec-dev \
         libavutil-dev \
@@ -66,11 +67,14 @@ WORKDIR /src/nanokvm-rdp
 COPY . .
 
 RUN cmake -S . -B build/gateway \
+        -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_PREFIX_PATH=/opt/freerdp \
         -DNANOKVM_RDP_BUILD_AGENT=OFF \
-        -DNANOKVM_RDP_BUILD_TESTS=OFF \
+        -DNANOKVM_RDP_BUILD_TESTS=ON \
+        -DNANOKVM_RDP_TEST_FFMPEG=ON \
         -DNANOKVM_RDP_USE_INSTALLED_FREERDP=ON \
-    && cmake --build build/gateway --target nanokvm-rdp-gateway --parallel
+    && cmake --build build/gateway --parallel \
+    && ctest --test-dir build/gateway --output-on-failure
 
 FROM debian:bookworm-slim
 
