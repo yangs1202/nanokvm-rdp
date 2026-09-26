@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Offline latency target</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --ink: #f4f1de;
+      --muted: #a7a997;
+      --panel: #151a1a;
+      --panel-strong: #202827;
+      --line: #4e5a53;
+      --lime: #d7ff54;
+      --amber: #ffbd4a;
+      --red: #ff655e;
+      --blue: #75d7ff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      background:
+        linear-gradient(135deg, rgba(215, 255, 84, .04) 25%, transparent 25%) 0 0 / 18px 18px,
+        #0b0e0e;
+      color: var(--ink);
+      font-family: "SF Mono", "Cascadia Code", "Menlo", monospace;
+      letter-spacing: .01em;
+    }
+
+    main { max-width: 1500px; margin: 0 auto; padding: 28px; }
+
+    .masthead {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 18px;
+    }
+
+    h1, h2, p { margin: 0; }
+    h1 { font-size: clamp(1.25rem, 2vw, 2rem); letter-spacing: -.06em; }
+    h2 { font-size: .82rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+    .eyebrow { color: var(--lime); font-size: .7rem; letter-spacing: .16em; text-transform: uppercase; margin-bottom: 8px; }
+    .lede { max-width: 58ch; color: var(--muted); font-size: .76rem; line-height: 1.6; text-align: right; }
+
+    .toolbar, .panel {
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      border: 1px solid var(--line);
+      box-shadow: 8px 8px 0 #070909;
+    }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin: 24px 0;
+      padding: 12px;
+    }
+
+    button, input {
+      font: inherit;
+      font-size: .78rem;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      background: #29322f;
+      color: var(--ink);
+      padding: 11px 14px;
+      cursor: pointer;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+
+    button:hover:not(:disabled), button:focus-visible {
+      border-color: var(--lime);
+      color: var(--lime);
+      outline: 2px solid var(--lime);
+      outline-offset: 2px;
+    }
+
+    button.primary { background: var(--lime); border-color: var(--lime); color: #0b0e0e; }
+    button.warn { color: var(--amber); }
+    button:disabled { cursor: not-allowed; opacity: .38; }
+
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-left: auto;
+      color: var(--muted);
+      font-size: .72rem;
+    }
+
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); }
+    .status.active { color: var(--lime); }
+    .status.active .dot { background: var(--lime); box-shadow: 0 0 14px var(--lime); }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.55fr) minmax(300px, .75fr);
+      gap: 24px;
+      align-items: start;
+    }
+
+    .panel { padding: 18px; }
+    .target-panel { padding: 0; overflow: hidden; }
+    .panel-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 14px; }
+    .panel-head p { color: var(--muted); font-size: .68rem; }
+
+    #target {
+      --pattern-angle: 0deg;
+      --pattern-shift: 0px;
+      min-height: min(66vh, 720px);
+      position: relative;
+      display: grid;
+      place-items: center;
+      isolation: isolate;
+      overflow: hidden;
+      border-top: 1px solid var(--line);
+      background: #f4f1de;
+      color: #090c0c;
+      cursor: crosshair;
+      outline: none;
+    }
+
+    #target::before {
+      content: "";
+      position: absolute;
+      inset: -30%;
+      z-index: -1;
+      background: repeating-conic-gradient(
+        from var(--pattern-angle),
+        #f4f1de 0 8deg,
+        #090c0c 8deg 16deg
+      );
+      transform: translateX(var(--pattern-shift)) rotate(-8deg);
+    }
+
+    #target::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      background: repeating-linear-gradient(
+        90deg,
+        transparent 0 44px,
+        rgba(215, 255, 84, .5) 44px 48px
+      );
+      mix-blend-mode: difference;
+    }
+
+    #target:focus-visible { box-shadow: inset 0 0 0 5px var(--blue); }
+
+    .readout {
+      width: min(76%, 720px);
+      padding: 24px;
+      background: rgba(9, 12, 12, .9);
+      color: var(--lime);
+      border: 3px solid var(--lime);
+      box-shadow: 12px 12px 0 rgba(9, 12, 12, .75);
+      text-align: center;
+    }
+
+    .readout-label { color: var(--amber); font-size: clamp(.7rem, 1.5vw, .95rem); letter-spacing: .18em; }
+    #markerNumber { display: block; font-size: clamp(4rem, 15vw, 12rem); line-height: .95; letter-spacing: -.1em; }
+    #phaseIndicator { display: block; color: var(--blue); font-size: clamp(.7rem, 1.5vw, .95rem); letter-spacing: .14em; margin: 12px 0; }
+    .readout-hint { color: var(--ink); font-size: .7rem; line-height: 1.5; }
+
+    .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .stat { border: 1px solid var(--line); padding: 12px; background: var(--panel-strong); }
+    .stat-label { color: var(--muted); font-size: .65rem; text-transform: uppercase; }
+    .stat-value { display: block; color: var(--lime); font-size: 1.35rem; margin-top: 6px; }
+    .stat-value.alert { color: var(--amber); }
+
+    .annotation {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    input {
+      width: 100%;
+      min-width: 0;
+      border: 1px solid var(--line);
+      background: #0b0e0e;
+      color: var(--ink);
+      padding: 10px;
+    }
+
+    input:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+    .note { color: var(--muted); font-size: .68rem; line-height: 1.55; margin-top: 14px; }
+    .note strong { color: var(--amber); }
+
+    .legend { display: grid; gap: 9px; margin-top: 18px; }
+    .legend div { display: flex; gap: 10px; align-items: start; font-size: .69rem; line-height: 1.45; color: var(--muted); }
+    .legend b { color: var(--ink); min-width: 92px; }
+
+    @media (max-width: 850px) {
+      main { padding: 16px; }
+      .masthead { display: block; }
+      .lede { text-align: left; margin-top: 12px; }
+      .layout { grid-template-columns: 1fr; }
+      .status { margin-left: 0; width: 100%; }
+      #target { min-height: 58vh; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">offline / target-side instrument</p>
+        <h1>Presentation & input observation target</h1>
+      </div>
+      <p class="lede">A bounded browser-side recorder. It does not measure capture-to-display latency, make a 50 ms decision, or collect events outside the focused target.</p>
+    </header>
+
+    <section class="toolbar" aria-label="Session controls">
+      <button id="start" class="primary">Start session</button>
+      <button id="stop" disabled>Stop session</button>
+      <button id="advanceMarker" disabled>Advance visual marker</button>
+      <button id="export" disabled>Export JSON</button>
+      <span id="status" class="status"><i class="dot" aria-hidden="true"></i><span>stopped</span></span>
+    </section>
+
+    <div class="layout">
+      <section class="panel target-panel">
+        <div class="panel-head" style="padding: 18px 18px 0">
+          <h2>Focused test area</h2>
+          <p>click here to focus · keyboard is local only</p>
+        </div>
+        <div id="target" tabindex="0" aria-label="Focused latency test area">
+          <div class="readout">
+            <span class="readout-label">DOM VISUAL MARKER SEQUENCE</span>
+            <strong id="markerNumber">000000</strong>
+            <span id="phaseIndicator">IDLE / NO INPUT</span>
+            <span class="readout-hint">DOM update marker only; not proof of an actual presented frame</span>
+          </div>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <div class="panel-head">
+          <h2>Run ledger</h2>
+          <p>max events: 2048</p>
+        </div>
+        <div class="stats">
+          <div class="stat"><span class="stat-label">events kept</span><strong id="eventsKept" class="stat-value">0</strong></div>
+          <div class="stat"><span class="stat-label">visual advances</span><strong id="visualAdvances" class="stat-value">0</strong></div>
+          <div class="stat"><span class="stat-label">missing markers</span><strong id="missingMarkers" class="stat-value alert">0</strong></div>
+          <div class="stat"><span class="stat-label">overflow drops</span><strong id="overflowDrops" class="stat-value alert">0</strong></div>
+        </div>
+
+        <div class="annotation">
+          <input id="missingCount" type="number" min="1" max="1000000" value="1" aria-label="Number of missing markers">
+          <button id="markMissing" class="warn" disabled>Mark missing</button>
+        </div>
+
+        <p class="note"><strong>Important:</strong> “visual marker” is a DOM update timestamp, not proof that a frame was actually presented. Use a concurrent camera or a validated client-presentation measurement for that boundary.</p>
+
+        <div class="legend">
+          <div><b>Clock</b><span>Event times use this page’s <code>performance.now()</code> clock. Do not subtract clocks across devices or estimate network time with RTT/2.</span></div>
+          <div><b>Input</b><span>Records begin only while this area is focused. Keyboard content is never stored; only phase, kind, sequence, and timestamp are exported.</span></div>
+          <div><b>Boundary</b><span>Input arrival means the browser application-handler boundary, not the earliest HID or target-OS timestamp.</span></div>
+          <div><b>rAF</b><span>Neither a requested nor completed <code>requestAnimationFrame</code> callback is presentation evidence. This tool does not use rAF as proof.</span></div>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const MAX_EVENTS = 2048;
+      const target = document.getElementById("target");
+      const markerNumber = document.getElementById("markerNumber");
+      const phaseIndicator = document.getElementById("phaseIndicator");
+      const start = document.getElementById("start");
+      const stop = document.getElementById("stop");
+      const advanceMarker = document.getElementById("advanceMarker");
+      const markMissing = document.getElementById("markMissing");
+      const missingCount = document.getElementById("missingCount");
+      const exportButton = document.getElementById("export");
+      const status = document.getElementById("status");
+      const eventsKept = document.getElementById("eventsKept");
+      const visualAdvances = document.getElementById("visualAdvances");
+      const missingMarkers = document.getElementById("missingMarkers");
+      const overflowDrops = document.getElementById("overflowDrops");
+
+      const state = {
+        active: false,
+        startedAt: null,
+        stoppedAt: null,
+        visualSequence: 0,
+        lastInputPhase: "IDLE / NO INPUT",
+        visualAdvanceCount: 0,
+        missingMarkerCount: 0,
+        overflowCount: 0,
+        droppedEventCount: 0,
+        eventSequence: 0,
+        events: []
+      };
+
+      function setStatus(text, active) {
+        status.classList.toggle("active", active);
+        status.lastElementChild.textContent = text;
+      }
+
+      function renderLedger() {
+        eventsKept.textContent = String(state.events.length);
+        visualAdvances.textContent = String(state.visualAdvanceCount);
+        missingMarkers.textContent = String(state.missingMarkerCount);
+        overflowDrops.textContent = String(state.droppedEventCount);
+      }
+
+      function renderFrame() {
+        markerNumber.textContent = String(state.visualSequence).padStart(6, "0");
+        phaseIndicator.textContent = state.lastInputPhase;
+        target.style.setProperty("--pattern-angle", (state.visualSequence % 18) * 10 + "deg");
+        target.style.setProperty("--pattern-shift", (state.visualSequence % 2 ? 28 : -28) + "px");
+        target.dataset.visualSequence = String(state.visualSequence);
+      }
+
+      function record(kind, details = {}) {
+        if (!state.active) return;
+        state.eventSequence += 1;
+        const event = {
+          seq: state.eventSequence,
+          t: Number(performance.now().toFixed(3)),
+          kind,
+          ...details
+        };
+        if (state.events.length >= MAX_EVENTS) {
+          state.events.shift();
+          state.overflowCount += 1;
+          state.droppedEventCount += 1;
+        }
+        state.events.push(event);
+        renderLedger();
+      }
+
+      function resetRun() {
+        state.startedAt = Number(performance.now().toFixed(3));
+        state.stoppedAt = null;
+        state.visualSequence = 0;
+        state.lastInputPhase = "IDLE / NO INPUT";
+        state.visualAdvanceCount = 0;
+        state.missingMarkerCount = 0;
+        state.overflowCount = 0;
+        state.droppedEventCount = 0;
+        state.eventSequence = 0;
+        state.events = [];
+        renderFrame();
+        renderLedger();
+      }
+
+      function setRunning(running) {
+        state.active = running;
+        start.disabled = running;
+        stop.disabled = !running;
+        advanceMarker.disabled = !running;
+        markMissing.disabled = !running;
+        exportButton.disabled = false;
+        setStatus(running ? "recording · target area armed" : "stopped", running);
+      }
+
+      start.addEventListener("click", () => {
+        resetRun();
+        setRunning(true);
+        record("session", { phase: "start" });
+        target.focus();
+      });
+
+      stop.addEventListener("click", () => {
+        record("session", { phase: "stop" });
+        state.stoppedAt = Number(performance.now().toFixed(3));
+        setRunning(false);
+      });
+
+      advanceMarker.addEventListener("click", () => {
+        if (!state.active) return;
+        state.visualSequence += 1;
+        state.visualAdvanceCount += 1;
+        renderFrame();
+        record("visual-marker-advance", { visualSequence: state.visualSequence });
+      });
+
+      markMissing.addEventListener("click", () => {
+        if (!state.active) return;
+        const count = Math.max(1, Math.min(1000000, Number.parseInt(missingCount.value, 10) || 1));
+        state.missingMarkerCount += count;
+        record("missing-marker", { count, visualSequence: state.visualSequence });
+        renderLedger();
+      });
+
+      function targetIsFocused() {
+        return document.activeElement === target;
+      }
+
+      function recordInput(kind, details = {}) {
+        if (!state.active || !targetIsFocused()) return false;
+        state.visualSequence += 1;
+        state.lastInputPhase = details.phase
+          ? kind.toUpperCase() + " / " + details.phase.toUpperCase()
+          : kind.toUpperCase();
+        renderFrame();
+        record(kind, { visualSequence: state.visualSequence, ...details });
+        return true;
+      }
+
+      target.addEventListener("keydown", (event) => {
+        if (!recordInput("keyboard", { phase: "down" })) return;
+        if (event.key !== "Tab") event.preventDefault();
+      });
+
+      target.addEventListener("keyup", (event) => {
+        recordInput("keyboard", { phase: "up" });
+      });
+
+      target.addEventListener("pointerdown", (event) => {
+        if (state.active) target.focus();
+        recordInput("pointer", { phase: "down", pointerType: event.pointerType || "unknown", button: event.button });
+      });
+
+      target.addEventListener("pointerup", (event) => {
+        recordInput("pointer", { phase: "up", pointerType: event.pointerType || "unknown", button: event.button });
+      });
+
+      target.addEventListener("pointermove", (event) => {
+        recordInput("pointer", { phase: "move", pointerType: event.pointerType || "unknown", buttons: event.buttons });
+      });
+
+      target.addEventListener("pointercancel", (event) => {
+        recordInput("pointer", { phase: "cancel", pointerType: event.pointerType || "unknown" });
+      });
+
+      target.addEventListener("wheel", (event) => {
+        if (!recordInput("wheel", {
+          phase: "scroll",
+          deltaX: Number(event.deltaX.toFixed(3)),
+          deltaY: Number(event.deltaY.toFixed(3)),
+          deltaMode: event.deltaMode
+        })) return;
+        event.preventDefault();
+      }, { passive: false });
+
+      exportButton.addEventListener("click", () => {
+        const exportData = {
+          schema: "nanokvm-latency-target/v1",
+          exportedAt: new Date().toISOString(),
+          session: {
+            active: state.active,
+            startedAtPerformanceMs: state.startedAt,
+            stoppedAtPerformanceMs: state.stoppedAt,
+            performanceTimeOriginMs: performance.timeOrigin
+          },
+          limits: {
+            maxEvents: MAX_EVENTS,
+            eventsKept: state.events.length,
+            overflowCount: state.overflowCount,
+            droppedEventCount: state.droppedEventCount
+          },
+          counters: {
+            visualMarkerAdvances: state.visualAdvanceCount,
+            missingMarkersMarked: state.missingMarkerCount,
+            lastVisualSequence: state.visualSequence
+          },
+          boundary: {
+            input: "browser application-handler arrival in the focused target area",
+            notMeasured: "earliest HID arrival, target OS application effect, or actual client presentation"
+          },
+          interpretation: {
+            passFail: "not computed by this tool",
+            raf: "requestAnimationFrame requests or callbacks are not presentation evidence",
+            clocks: "do not subtract timestamps from different devices; do not subtract RTT/2",
+            presentation: "use concurrent high-speed video or validated client-presentation instrumentation"
+          },
+          events: state.events
+        };
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: "application/json" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = "nanokvm-latency-target.json";
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(link.href), 0);
+      });
+
+      renderFrame();
+      renderLedger();
+    })();
+  </script>
+</body>
+</html>
