@@ -36,6 +36,12 @@ if(NANOKVM_RDP_BUILD_TESTS)
   add_test(NAME nanokvm-input-reliability-test COMMAND nanokvm-input-reliability-test)
   set_tests_properties(nanokvm-input-reliability-test PROPERTIES TIMEOUT 10)
 
+  add_executable(nanokvm-hid-keepalive-test tests/hid_keepalive_test.c src/hid.c)
+  target_include_directories(nanokvm-hid-keepalive-test PRIVATE src)
+  target_compile_options(nanokvm-hid-keepalive-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  add_test(NAME nanokvm-hid-keepalive-test COMMAND nanokvm-hid-keepalive-test)
+  set_tests_properties(nanokvm-hid-keepalive-test PROPERTIES TIMEOUT 10)
+
   add_executable(nanokvm-rtp-loopback-test
     tests/rtp_loopback_test.c
     src/rtp_h264.c
@@ -43,6 +49,17 @@ if(NANOKVM_RDP_BUILD_TESTS)
   target_include_directories(nanokvm-rtp-loopback-test PRIVATE src)
   target_compile_options(nanokvm-rtp-loopback-test PRIVATE -Wall -Wextra -Werror)
   add_test(NAME nanokvm-rtp-loopback-test COMMAND nanokvm-rtp-loopback-test)
+
+  add_executable(nanokvm-rtp-client-test tests/rtp_client_test.c src/rtp_client.c src/rtp_h264.c)
+  target_include_directories(nanokvm-rtp-client-test PRIVATE src)
+  target_compile_options(nanokvm-rtp-client-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  add_test(NAME nanokvm-rtp-client-test COMMAND nanokvm-rtp-client-test)
+  set_tests_properties(nanokvm-rtp-client-test PROPERTIES TIMEOUT 10)
+
+  add_executable(nanokvm-bitmap-diff-test tests/bitmap_diff_test.c)
+  target_include_directories(nanokvm-bitmap-diff-test PRIVATE src)
+  target_compile_options(nanokvm-bitmap-diff-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  add_test(NAME nanokvm-bitmap-diff-test COMMAND nanokvm-bitmap-diff-test)
 endif()
 
 if(NANOKVM_RDP_BUILD_AGENT)

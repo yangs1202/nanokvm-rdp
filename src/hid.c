@@ -316,6 +316,8 @@ void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char
 	(void)snprintf(hid->paste_path, sizeof(hid->paste_path), "%s.paste", hid->keyboard_path);
 	hid->last_x = 0x3fff;
 	hid->last_y = 0x3fff;
+	hid->keepalive_at = hid_now() + HID_KEEPALIVE_INTERVAL_MS;
+	hid->keepalive_dx = 1;
 	hid->absolute_report_length = absolute_report_length(hid->touch_path);
 	hid->keyboard_fd = open_hid_fd(hid->keyboard_path);
 	hid->keyboard_feedback_fd = open_keyboard_feedback(hid->keyboard_path);
@@ -983,6 +985,24 @@ static bool send_relative(HidState* hid, int8_t dx, int8_t dy, int8_t wheel)
 	const uint8_t report[4] = { hid->buttons & HID_MOUSE_BUTTONS_MASK,
 	                           (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel };
 	return queue_report(hid, &hid->pointer_queue, hid->mouse_path, report, sizeof(report), false, 0);
+}
+
+bool hid_keepalive(HidState* hid, uint64_t now_ms)
+{
+	if (now_ms < hid->keepalive_at || hid_pending(hid) || hid->buttons || hid->modifiers)
+		return true;
+	for (unsigned usage = 0; usage < 256; usage++)
+	{
+		if (hid->usages[usage])
+			return true;
+	}
+	/* Schedule from this attempt: no catch-up bursts after a delayed loop or
+	 * hot retry loop when the USB host is unavailable. */
+	hid->keepalive_at = now_ms + HID_KEEPALIVE_INTERVAL_MS;
+	const bool ok = send_relative(hid, hid->keepalive_dx, 0, 0);
+	if (ok)
+		hid->keepalive_dx = (int8_t)-hid->keepalive_dx;
+	return ok;
 }
 
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,

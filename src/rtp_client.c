@@ -90,16 +90,12 @@ bool rtp_client_read_h264(RtpClient* client, uint8_t** data, size_t* length)
 		return false;
 	*data = NULL;
 	*length = 0;
-	bool frame_ready = false;
 	for (;;)
 	{
 		uint8_t packet[1500] = { 0 };
-		const int flags = frame_ready ? MSG_DONTWAIT : 0;
-		const ssize_t received = recv(client->fd, packet, sizeof(packet), flags);
+		const ssize_t received = recv(client->fd, packet, sizeof(packet), 0);
 		if (received < 0 && errno == EINTR)
 			continue;
-		if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && frame_ready)
-			return true;
 		if (received <= 0)
 			return false;
 		if (!rtp_h264_reassembler_push(&client->reassembler, packet, (size_t)received, save_nal,
@@ -107,14 +103,16 @@ bool rtp_client_read_h264(RtpClient* client, uint8_t** data, size_t* length)
 			continue;
 		if ((packet[1] & 0x80U) == 0 || client->access_unit_length == 0)
 			continue;
-		free(*data);
 		*data = client->access_unit;
 		*length = client->access_unit_length;
 		client->access_unit = NULL;
 		client->access_unit_length = 0;
 		client->access_unit_capacity = 0;
 		client->have_access_unit = false;
-		frame_ready = true;
+		/* H.264 P frames depend on earlier access units. Only decoded bitmaps
+		 * may be coalesced; draining to the newest compressed frame corrupts
+		 * the decoder's reference pictures even without any RTP packet loss. */
+		return true;
 	}
 }
 

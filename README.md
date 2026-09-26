@@ -105,6 +105,8 @@ The relative mouse carries the left, right, and middle buttons and vertical whee
 
 Start the agent by supplying the gateway hostname or IPv4 address:
 
+While running, the agent sends one unit of relative HID mouse motion every five minutes to keep the connected computer awake, even without a gateway connection or RDP session. Motion alternates left and right and is deferred while keys, buttons, or queued input are active. The visible distance depends on the host's pointer settings and may differ from one screen pixel.
+
 ```sh
 ./build/agent/nanokvm-agent -gateway nanokvm-gw.yangs.sh \
   -control-port 3390 -video-port 5004 \

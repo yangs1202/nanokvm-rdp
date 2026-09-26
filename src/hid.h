@@ -7,6 +7,7 @@
 
 #define HID_REPORT_QUEUE_CAPACITY 256U
 #define HID_REPORT_STALL_TIMEOUT_MS 1000U
+#define HID_KEEPALIVE_INTERVAL_MS 300000U
 
 typedef struct
 {
@@ -49,6 +50,8 @@ typedef struct
 	uint8_t submitted_state[3]; /* Modifier/button byte last submitted per USB endpoint. */
 	uint16_t last_x;
 	uint16_t last_y;
+	uint64_t keepalive_at;
+	int8_t keepalive_dx;
 	uint8_t buttons;
 	uint8_t mouse_buttons;
 	bool keyboard_desynced;
@@ -74,6 +77,8 @@ bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length);
 bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
 	              uint16_t flags);
 bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons);
+/* Periodic one-unit relative motion; defer while keys/buttons or input are pending. */
+bool hid_keepalive(HidState* hid, uint64_t now_ms);
 bool hid_wheel(HidState* hid, uint16_t flags);
 /* Pump every input endpoint even when no new network input arrives. */
 bool hid_flush(HidState* hid);

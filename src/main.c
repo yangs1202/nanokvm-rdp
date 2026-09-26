@@ -1,3 +1,4 @@
+#include "bitmap_diff.h"
 #include "ffmpeg_decoder.h"
 #include "frame_flow.h"
 #include "h264.h"
@@ -66,8 +67,6 @@
 #define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
 #define CLASSIC_BITMAP_BATCH 1U
 #define CLASSIC_MAX_UPDATE_SIZE (32U * 1024U)
-#define CLASSIC_PIXEL_DIFF_THRESHOLD 10U
-#define CLASSIC_CHANGED_PIXEL_THRESHOLD 8U
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define STATS_LOG_INTERVAL_MS 5000U
@@ -845,35 +844,6 @@ static bool bitmap_stream_nsc_supported(const rdpSettings* settings)
 	       (supported & SURFCMDS_SET_SURFACE_BITS) != 0;
 }
 
-static bool classic_tile_changed(const uint8_t* previous, const uint8_t* current, uint16_t width,
-                                 uint16_t left, uint16_t top, uint16_t columns, uint16_t rows)
-{
-	if (!previous)
-		return true;
-	uint32_t changed_pixels = 0;
-	for (uint16_t row = 0; row < rows; row++)
-	{
-		const size_t offset = ((size_t)(top + row) * width + left) * 4U;
-		for (uint16_t column = 0; column < columns; column++)
-		{
-			const size_t pixel = offset + (size_t)column * 4U;
-			const uint8_t* before = previous + pixel;
-			const uint8_t* after = current + pixel;
-			const unsigned blue = before[0] > after[0] ? before[0] - after[0] : after[0] - before[0];
-			const unsigned green = before[1] > after[1] ? before[1] - after[1] : after[1] - before[1];
-			const unsigned red = before[2] > after[2] ? before[2] - after[2] : after[2] - before[2];
-			if (blue >= CLASSIC_PIXEL_DIFF_THRESHOLD ||
-			    green >= CLASSIC_PIXEL_DIFF_THRESHOLD || red >= CLASSIC_PIXEL_DIFF_THRESHOLD)
-			{
-				changed_pixels++;
-				if (changed_pixels >= CLASSIC_CHANGED_PIXEL_THRESHOLD)
-					return true;
-			}
-		}
-	}
-	return false;
-}
-
 static void classic_tile_copy(uint8_t* destination, const uint8_t* source, uint16_t width,
 	                          uint16_t left, uint16_t top, uint16_t columns, uint16_t rows)
 {
@@ -924,7 +894,7 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 		{
 			const uint16_t columns = MIN(CLASSIC_TILE_WIDTH, (uint16_t)(width - left));
 			if (client->previous_bitmap_valid &&
-			    !classic_tile_changed(client->previous_bitmap, bgra, width, left, top, columns, rows))
+			    !bitmap_tile_changed(client->previous_bitmap, bgra, width, left, top, columns, rows))
 				continue;
 			BITMAP_DATA* rectangle = &rectangles[rectangle_count];
 			uint32_t encoded_length = CLASSIC_TILE_MAX_ENCODED;
@@ -1035,7 +1005,7 @@ static bool send_progressive_frame(Client* client, const uint8_t* bgra, size_t l
 			const uint16_t top = (uint16_t)(tile_y * 64U);
 			const uint16_t columns = (uint16_t)(left + 64U > width ? (uint16_t)(width - left) : 64U);
 			const uint16_t rows = (uint16_t)(top + 64U > height ? (uint16_t)(height - top) : 64U);
-			if (previous && !classic_tile_changed(previous, bgra, width, left, top, columns, rows))
+			if (previous && !bitmap_tile_changed(previous, bgra, width, left, top, columns, rows))
 				continue;
 			RECTANGLE_16 rect = { .left = left, .top = top,
 				.right = (UINT16)(left + columns), .bottom = (UINT16)(top + rows) };

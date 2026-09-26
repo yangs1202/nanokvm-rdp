@@ -580,7 +580,8 @@ int main(int argc, char* argv[])
 	uint64_t last_hid_error_log = 0;
 	while (!stop_requested)
 	{
-		if (!hid_flush(&agent.hid))
+		/* Keep the USB host awake even without an RDP session or gateway connection. */
+		if (!hid_flush(&agent.hid) || !hid_keepalive(&agent.hid, monotonic_milliseconds()))
 		{
 			const uint64_t error_at = monotonic_milliseconds();
 			if (error_at - last_hid_error_log >= 5000U)
