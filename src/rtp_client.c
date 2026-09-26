@@ -103,6 +103,8 @@ bool rtp_client_read_h264(RtpClient* client, uint8_t** data, size_t* length)
 			continue;
 		if ((packet[1] & 0x80U) == 0 || client->access_unit_length == 0)
 			continue;
+		client->access_unit_ssrc = ((uint32_t)packet[8] << 24) | ((uint32_t)packet[9] << 16) |
+		                           ((uint32_t)packet[10] << 8) | packet[11];
 		*data = client->access_unit;
 		*length = client->access_unit_length;
 		client->access_unit = NULL;

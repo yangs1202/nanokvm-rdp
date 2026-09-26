@@ -1,6 +1,7 @@
 #include "bitmap_diff.h"
 #include "ffmpeg_decoder.h"
 #include "frame_flow.h"
+#include "frame_trace.h"
 #include "h264.h"
 #include "hid.h"
 #include "protocol.h"
@@ -145,6 +146,7 @@ struct Client
 	bool gfx_ready;
 	bool gfx_opened;
 	FrameFlow frame_flow;
+	FrameTrace frame_trace;
 	bool need_idr;
 	uint64_t gfx_wait_started_at;
 	uint64_t gfx_opened_at;
@@ -609,8 +611,15 @@ static UINT on_gfx_frame_ack(RdpgfxServerContext* gfx,
 	Client* client = (Client*)gfx->custom;
 	uint64_t elapsed = 0;
 	EnterCriticalSection(&client->lock);
-	const bool matched = frame_flow_ack(&client->frame_flow, acknowledge->frameId,
+	bool matched = frame_flow_ack(&client->frame_flow, acknowledge->frameId,
 	                                   acknowledge->queueDepth, monotonic_milliseconds(), &elapsed);
+	FrameTraceEntry trace = { 0 };
+	const uint64_t acknowledged_at = monotonic_milliseconds();
+	if (!client->gfx_uses_progressive)
+	{
+		matched = frame_trace_ack(&client->frame_trace, acknowledge->frameId, acknowledged_at, &trace);
+		elapsed = matched ? acknowledged_at - trace.sent_at : 0;
+	}
 	const unsigned pending = client->frame_flow.count;
 	LeaveCriticalSection(&client->lock);
 	char message[192];
@@ -619,6 +628,16 @@ static UINT on_gfx_frame_ack(RdpgfxServerContext* gfx,
 	               acknowledge->frameId, acknowledge->totalFramesDecoded, acknowledge->queueDepth,
 	               pending, (unsigned)matched, (unsigned long long)elapsed);
 	log_message(elapsed >= 200U ? "WARN" : "INFO", message);
+	if (trace.valid && frame_trace_sample(trace.rtp_timestamp))
+	{
+		char detail[256];
+		(void)snprintf(detail, sizeof(detail),
+		               "FRAME_ACK ssrc=%u rtp_ts=%u frame_id=%u ack_ms=%llu send_to_ack_ms=%llu receive_to_ack_ms=%llu queue_bytes=%u",
+		               trace.ssrc, trace.rtp_timestamp, trace.frame_id,
+		               (unsigned long long)acknowledged_at, (unsigned long long)elapsed,
+		               (unsigned long long)(acknowledged_at - trace.received_at), acknowledge->queueDepth);
+		log_message("INFO", detail);
+	}
 	if (client->bitmap_ready_event) (void)SetEvent(client->bitmap_ready_event);
 	return CHANNEL_RC_OK;
 }
@@ -662,7 +681,9 @@ static bool make_idr_payload(Client* client, const uint8_t* data, size_t length,
 	return true;
 }
 
-static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length)
+static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length,
+                              uint32_t ssrc, uint32_t rtp_timestamp, uint64_t received_at,
+                              uint64_t receive_wall)
 {
 	RECTANGLE_16 rect = { .left = 0, .top = 0, .right = client->server->config.width,
 		.bottom = client->server->config.height };
@@ -701,10 +722,29 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 	command.height = client->server->config.height;
 	command.extra = &avc;
 
+	const uint64_t send_started = monotonic_milliseconds();
+	EnterCriticalSection(&client->lock);
+	frame_trace_sent(&client->frame_trace, start.frameId, ssrc, rtp_timestamp, received_at, send_started);
+	LeaveCriticalSection(&client->lock);
 	if (!client->gfx || !client->gfx->SurfaceFrameCommand)
 		error = ERROR_INVALID_HANDLE;
 	else
 		error = client->gfx->SurfaceFrameCommand(client->gfx, &command, &start, &end);
+	const uint64_t send_done = monotonic_milliseconds();
+	EnterCriticalSection(&client->lock);
+	client->last_rdp_send_ms = send_done - send_started;
+	LeaveCriticalSection(&client->lock);
+	if (frame_trace_sample(rtp_timestamp))
+	{
+		char detail[384];
+		(void)snprintf(detail, sizeof(detail),
+		               "FRAME_SEND ssrc=%u rtp_ts=%u frame_id=%u receive_ms=%llu receive_wall_ms=%llu send_start_ms=%llu send_done_ms=%llu receive_to_send_ms=%llu submit_ms=%llu bytes=%zu ok=%u",
+		               ssrc, rtp_timestamp, start.frameId, (unsigned long long)received_at,
+		               (unsigned long long)receive_wall, (unsigned long long)send_started,
+		               (unsigned long long)send_done, (unsigned long long)(send_started - received_at),
+		               (unsigned long long)(send_done - send_started), length, error == CHANNEL_RC_OK);
+		log_message("INFO", detail);
+	}
 	if (error != CHANNEL_RC_OK)
 	{
 		EnterCriticalSection(&client->lock);
@@ -754,6 +794,8 @@ static DWORD WINAPI video_thread(LPVOID argument)
 			free(data);
 			continue;
 		}
+		const uint64_t received_at = monotonic_milliseconds();
+		const uint64_t receive_wall = frame_trace_wall_ms();
 		if (rtp.losses != observed_losses)
 		{
 			observed_losses = rtp.losses;
@@ -795,7 +837,9 @@ static DWORD WINAPI video_thread(LPVOID argument)
 			bool payload_ok = true;
 			if (idr)
 				payload_ok = make_idr_payload(client, data, length, &owned, &payload, &payload_length);
-			if (!payload_ok || !send_avc420_frame(client, payload, payload_length))
+			if (!payload_ok || !send_avc420_frame(client, payload, payload_length,
+			                                          rtp.access_unit_ssrc, rtp.access_unit_timestamp,
+			                                          received_at, receive_wall))
 				client_stop(client);
 			free(owned);
 		}

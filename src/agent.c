@@ -1,4 +1,5 @@
 #include "h264.h"
+#include "frame_trace.h"
 #include "hid.h"
 #include "protocol.h"
 #include "rtp_h264.h"
@@ -477,7 +478,9 @@ static void* video_loop(void* argument)
 		const uint64_t capture_started = monotonic_milliseconds();
 		const int kind = agent->kvm.read_image(agent->width, agent->height, 1, agent->bitrate,
 		                                        &data, &length);
-		const uint64_t capture_elapsed = monotonic_milliseconds() - capture_started;
+		const uint64_t capture_done = monotonic_milliseconds();
+		const uint64_t capture_wall = frame_trace_wall_ms();
+		const uint64_t capture_elapsed = capture_done - capture_started;
 		if (capture_elapsed >= 100U)
 			(void)fprintf(stderr, "%s: VIDEO slow capture at_ms=%llu elapsed_ms=%llu kind=%d bytes=%u\n",
 			              TAG, (unsigned long long)capture_started, (unsigned long long)capture_elapsed,
@@ -518,8 +521,16 @@ static void* video_loop(void* argument)
 		    (kind == KVM_FRAME_SPS || kind == KVM_FRAME_PPS || kind == KVM_FRAME_IDR ||
 		     (!atomic_load(&agent->wait_for_idr) && kind == KVM_FRAME_P)))
 		{
-			if (!send_h264(agent, data, length))
-				(void)atomic_fetch_add(&agent->dropped_frames, 1);
+			const bool sent = send_h264(agent, data, length);
+			const uint64_t send_done = monotonic_milliseconds();
+			if (!sent) (void)atomic_fetch_add(&agent->dropped_frames, 1);
+			if (frame_trace_sample(agent->timestamp))
+				(void)fprintf(stderr, "%s: FRAME_CAPTURE ssrc=%u rtp_ts=%u capture_start_ms=%llu capture_done_ms=%llu capture_wall_ms=%llu send_done_ms=%llu capture_call_ms=%llu packetize_send_ms=%llu bytes=%u sent=%u\n",
+				              TAG, agent->packetizer.ssrc, agent->timestamp,
+				              (unsigned long long)capture_started, (unsigned long long)capture_done,
+				              (unsigned long long)capture_wall, (unsigned long long)send_done,
+				              (unsigned long long)capture_elapsed,
+				              (unsigned long long)(send_done - capture_done), length, (unsigned)sent);
 		}
 		else if (kind == KVM_FRAME_P)
 			(void)atomic_fetch_add(&agent->dropped_frames, 1);

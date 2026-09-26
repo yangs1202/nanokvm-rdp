@@ -15,6 +15,7 @@ typedef struct
 	size_t access_unit_length;
 	size_t access_unit_capacity;
 	uint32_t access_unit_timestamp;
+	uint32_t access_unit_ssrc;
 	bool have_access_unit;
 	uint32_t losses;
 } RtpClient;

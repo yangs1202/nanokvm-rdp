@@ -57,6 +57,8 @@ int main(void)
 		uint8_t* data = NULL;
 		size_t length = 0;
 		assert(rtp_client_read_h264(&receiver, &data, &length));
+		assert(receiver.access_unit_ssrc == 42);
+		assert(receiver.access_unit_timestamp == i * 3000U);
 		const size_t prefix = i == 0 ? sizeof(sps) + 4U : 0;
 		assert(length == prefix + 4U + sizeof(frames[i]));
 		const uint8_t start_code[] = { 0, 0, 0, 1 };
