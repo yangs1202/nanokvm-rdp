@@ -70,12 +70,11 @@ cmake -S . -B build/agent -G 'Unix Makefiles' \
 cmake --build build/agent --target nanokvm-agent --parallel 4
 ```
 
-Build the gateway. `NANOKVM_RDP_FREERDP_DIR` must point to a FreeRDP source tree; it is deliberately not hard-coded in this repository.
+Build the gateway. FreeRDP stays behind the cgo bridge, so `pkg-config` must find `freerdp3` and `freerdp-server3`.
 
 ```sh
-cmake -S . -B build/gateway -G 'Unix Makefiles' \
-  -DNANOKVM_RDP_FREERDP_DIR=/path/to/FreeRDP
-cmake --build build/gateway --target nanokvm-rdp-gateway --parallel 4
+CGO_ENABLED=1 go build -o build/gateway/nanokvm-rdp-gateway ./go/cmd/nanokvm-rdp-gateway
+go test ./go/...
 ```
 
 For a cross-compiled gateway, also set `-DNANOKVM_RDP_OPENSSL_ROOT=/path/to/openssl-prefix` when needed by the toolchain.

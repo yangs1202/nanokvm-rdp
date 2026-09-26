@@ -8,6 +8,7 @@ RUN apt-get update \
         ca-certificates \
         cmake \
         git \
+        golang-go \
         libavcodec-dev \
         libavutil-dev \
         libssl-dev \
@@ -64,12 +65,8 @@ WORKDIR /src/nanokvm-rdp
 
 COPY . .
 
-RUN cmake -S . -B build/gateway \
-        -DCMAKE_PREFIX_PATH=/opt/freerdp \
-        -DNANOKVM_RDP_BUILD_AGENT=OFF \
-        -DNANOKVM_RDP_BUILD_TESTS=OFF \
-        -DNANOKVM_RDP_USE_INSTALLED_FREERDP=ON \
-    && cmake --build build/gateway --target nanokvm-rdp-gateway --parallel
+ENV PKG_CONFIG_PATH=/opt/freerdp/lib/pkgconfig
+RUN CGO_ENABLED=1 go build -o /usr/local/bin/nanokvm-rdp-gateway ./go/cmd/nanokvm-rdp-gateway
 
 FROM debian:bookworm-slim
 
@@ -79,7 +76,7 @@ RUN apt-get update \
         ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /src/nanokvm-rdp/build/gateway/nanokvm-rdp-gateway /usr/local/bin/nanokvm-rdp-gateway
+COPY --from=builder /usr/local/bin/nanokvm-rdp-gateway /usr/local/bin/nanokvm-rdp-gateway
 
 EXPOSE 3389/tcp 3390/tcp 5004/udp
 
