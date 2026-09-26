@@ -21,6 +21,4 @@ jobs:
           sudo apt-get install -y --no-install-recommends freerdp3-dev pkg-config ffmpeg
 
       - name: Test Go gateway
-        env:
-          NANOKVM_STATIC_LIBS: -lssl -lcrypto
         run: CGO_ENABLED=1 go test ./go/...

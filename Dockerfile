@@ -69,7 +69,7 @@ ARG GO_VERSION=1.26.4
 RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -C /usr/local -xz
 ENV PATH=/usr/local/go/bin:${PATH}
 ENV PKG_CONFIG_PATH=/opt/freerdp/lib/pkgconfig
-ENV NANOKVM_STATIC_LIBS="/opt/freerdp/lib/freerdp3/objects-Release/rdpgfx-server/rdpgfx_main.c.o /opt/freerdp/lib/freerdp3/objects-Release/rdpgfx-server/__/rdpgfx_common.c.o /usr/lib/x86_64-linux-gnu/libssl.a /usr/lib/x86_64-linux-gnu/libcrypto.a"
+ENV CGO_LDFLAGS="/opt/freerdp/lib/freerdp3/objects-Release/rdpgfx-server/rdpgfx_main.c.o /opt/freerdp/lib/freerdp3/objects-Release/rdpgfx-server/__/rdpgfx_common.c.o /usr/lib/x86_64-linux-gnu/libssl.a /usr/lib/x86_64-linux-gnu/libcrypto.a"
 RUN CGO_ENABLED=1 go build -o /usr/local/bin/nanokvm-rdp-gateway ./go/cmd/nanokvm-rdp-gateway
 
 FROM debian:bookworm-slim
