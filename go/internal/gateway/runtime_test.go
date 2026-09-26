@@ -7,6 +7,7 @@ import (
 
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/control"
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/session"
+	"github.com/yangs1202/nanokvm-rdp/go/go/internal/video"
 )
 
 func TestRuntimeForwardsControlInputAndVideo(t *testing.T) {
@@ -50,5 +51,36 @@ func TestRuntimeForwardsControlInputAndVideo(t *testing.T) {
 			t.Fatalf("input = %+v", msg)
 		}
 		return
+	}
+}
+
+func TestRuntimePublishesRTPAccessUnit(t *testing.T) {
+	videoConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := NewRuntime(RuntimeConfig{Video: videoConn})
+	defer rt.Close()
+	sub := rt.bus.Subscribe(rt.ctx)
+	sender, err := net.Dial("udp", videoConn.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	packetizer := video.Packetizer{Sequence: 1, SSRC: 7, MTU: video.DefaultMTU}
+	nal := []byte{0x65, 0x01, 0x02}
+	if err := packetizer.Packetize(nal, 1000, true, func(packet []byte) error {
+		_, err := sender.Write(packet)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-sub:
+		if len(frame.Data) < 5 || frame.Data[4] != 0x65 {
+			t.Fatalf("frame = %x", frame.Data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no video frame")
 	}
 }

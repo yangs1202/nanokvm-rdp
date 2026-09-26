@@ -6,6 +6,7 @@ import (
 
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/control"
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/session"
+	"github.com/yangs1202/nanokvm-rdp/go/go/internal/video"
 )
 
 type RuntimeConfig struct {
@@ -30,7 +31,26 @@ func NewRuntime(cfg RuntimeConfig) *Runtime {
 	}
 	rt.video = cfg.Video
 	go rt.forwardInputs()
+	if rt.video != nil {
+		go rt.receiveVideo()
+	}
 	return rt
+}
+
+func (rt *Runtime) receiveVideo() {
+	var reassembler video.Reassembler
+	buffer := make([]byte, 1500)
+	for {
+		n, _, err := rt.video.ReadFrom(buffer)
+		if err != nil {
+			return
+		}
+		unit, _, err := reassembler.Push(append([]byte(nil), buffer[:n]...))
+		if err != nil || unit == nil {
+			continue
+		}
+		rt.bus.Publish(session.Frame{Kind: session.FrameH264, Data: unit})
+	}
 }
 
 func (rt *Runtime) forwardInputs() {
