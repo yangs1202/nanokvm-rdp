@@ -18,7 +18,7 @@ jobs:
       - name: Install FreeRDP development packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libfreerdp-dev libwinpr-dev pkg-config ffmpeg
+          sudo apt-get install -y --no-install-recommends freerdp3-dev pkg-config ffmpeg
 
       - name: Test Go gateway
         run: CGO_ENABLED=1 go test ./go/...
