@@ -47,3 +47,19 @@ func TestBusInputFanInPreservesOrder(t *testing.T) {
 		t.Fatalf("order = %v", got)
 	}
 }
+
+func TestBusReplaysLatestFrameToNewSubscriber(t *testing.T) {
+	bus := NewBus(1)
+	bus.Publish(Frame{Data: []byte{9}, Kind: FrameH264})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sub := bus.Subscribe(ctx)
+	select {
+	case frame := <-sub:
+		if frame.Data[0] != 9 {
+			t.Fatalf("frame = %v", frame.Data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("latest frame was not replayed")
+	}
+}

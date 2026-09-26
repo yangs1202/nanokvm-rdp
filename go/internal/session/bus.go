@@ -32,6 +32,7 @@ type Event struct {
 type Bus struct {
 	subs   []chan Frame
 	inputs chan Event
+	latest *Frame
 }
 
 func NewBus(subscribers int) *Bus {
@@ -43,6 +44,9 @@ func NewBus(subscribers int) *Bus {
 
 func (b *Bus) Subscribe(ctx context.Context) <-chan Frame {
 	out := make(chan Frame, 1)
+	if b.latest != nil {
+		out <- *b.latest
+	}
 	b.subs = append(b.subs, out)
 	go func() {
 		defer close(out)
@@ -52,6 +56,7 @@ func (b *Bus) Subscribe(ctx context.Context) <-chan Frame {
 }
 
 func (b *Bus) Publish(frame Frame) {
+	b.latest = &frame
 	for _, sub := range b.subs {
 		select {
 		case <-sub:
