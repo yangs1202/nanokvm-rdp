@@ -420,6 +420,38 @@ static void test_synchronize_preserves_pending_input(void)
 	cleanup(&f);
 }
 
+static void test_unicode_shortcuts_preserve_modifiers(void)
+{
+	const uint8_t codes[] = { 0x1d, 0x1d, 0x5b, 0x38, 0x2a };
+	const bool extended[] = { false, true, true, false, false };
+	const uint8_t masks[] = { 1, 0x10, 8, 4, 2 };
+	const uint8_t characters[] = { ' ', 'c', 'v', 'x', 'A' };
+	const uint8_t usages[] = { 0x2c, 0x06, 0x19, 0x1b, 0x04 };
+	for (unsigned i = 0; i < sizeof(codes); i++)
+	{
+		Fixture f; setup(&f);
+		block_fd(f.hid.keyboard_fd);
+		assert(hid_scancode(&f.hid, codes[i], extended[i], false));
+		assert(hid_type_utf8(&f.hid, &characters[i], 1));
+		assert(f.hid.modifiers == masks[i]);
+		assert(hid_scancode(&f.hid, codes[i], extended[i], true));
+		drain(f.receiver[0]);
+		const uint64_t deadline = now_ms() + 500;
+		while (hid_pending(&f.hid) && now_ms() < deadline)
+		{
+			assert(hid_flush(&f.hid));
+			usleep(1000);
+		}
+		assert(!hid_pending(&f.hid));
+		uint8_t reports[4][8]; read_exact(f.receiver[0], reports, sizeof(reports));
+		assert(reports[0][0] == masks[i] && reports[0][2] == 0);
+		assert(reports[1][0] == masks[i] && reports[1][2] == usages[i]);
+		assert(reports[2][0] == masks[i] && reports[2][2] == 0);
+		assert(reports[3][0] == 0 && reports[3][2] == 0);
+		empty(f.receiver[0]); cleanup(&f);
+	}
+}
+
 int main(void)
 {
 	test_button_mapping_and_mixed_motion(); test_final_release_and_coalescing();
@@ -428,5 +460,6 @@ int main(void)
 	test_paste_order(); test_wheel(); test_fragmented_network_with_pending_release();
 	test_control_space_with_host_feedback();
 	test_synchronize_preserves_pending_input();
-	puts("Input reliability: all 12 scenarios passed"); return 0;
+	test_unicode_shortcuts_preserve_modifiers();
+	puts("Input reliability: all 13 scenarios passed"); return 0;
 }

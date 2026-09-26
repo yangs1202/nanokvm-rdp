@@ -791,12 +791,14 @@ static bool utf8_decode(const uint8_t* text, size_t length, size_t* offset, uint
 
 static bool tap_text_key(HidState* hid, HidTextKey key)
 {
-	hid->modifiers = key.modifier;
+	const uint8_t saved_modifiers = hid->modifiers;
+	const bool saved_usage = hid->usages[key.usage];
+	hid->modifiers = saved_modifiers | key.modifier;
 	hid->usages[key.usage] = true;
 	if (!send_keyboard(hid))
 		return false;
-	hid->modifiers = 0;
-	hid->usages[key.usage] = false;
+	hid->modifiers = saved_modifiers;
+	hid->usages[key.usage] = saved_usage;
 	if (!send_keyboard(hid))
 		return false;
 	return true;
@@ -918,6 +920,16 @@ bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
 		return false;
 	/* Pacing belongs to the output queue; never sleep in the control receiver. */
 	hid->keyboard_delay_ms = 20;
+	/* Mobile clients mix scancode modifiers with Unicode shortcut keys.
+	 * A single ASCII key must retain the held modifiers until their own key-up. */
+	HidTextKey shortcut = { 0 };
+	if (length == 1 && hid->modifiers != 0 && ascii_to_hid(text[0], &shortcut))
+	{
+		const bool ok = tap_text_key(hid, shortcut);
+		hid->keyboard_delay_ms = 0;
+		if (!ok) hid_release_all(hid);
+		return ok;
+	}
 	reset_keyboard_state(hid, false);
 	bool ok = send_keyboard(hid);
 	for (size_t offset = 0; ok && offset < length;)
