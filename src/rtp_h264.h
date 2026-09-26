@@ -38,6 +38,8 @@ bool rtp_h264_packetize(RtpH264Packetizer* packetizer, const uint8_t* nal, size_
 bool rtp_h264_packetize_marker(RtpH264Packetizer* packetizer, const uint8_t* nal, size_t length,
 	                            uint32_t timestamp, bool marker,
 	                            RtpH264PacketCallback callback, void* context);
+bool rtp_h264_packetize_access_unit(RtpH264Packetizer* packetizer, const uint8_t* data, size_t length,
+                                    uint32_t timestamp, RtpH264PacketCallback callback, void* context);
 void rtp_h264_reassembler_init(RtpH264Reassembler* reassembler);
 void rtp_h264_reassembler_free(RtpH264Reassembler* reassembler);
 bool rtp_h264_reassembler_push(RtpH264Reassembler* reassembler, const uint8_t* packet,

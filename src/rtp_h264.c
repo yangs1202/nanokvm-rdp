@@ -192,3 +192,51 @@ bool rtp_h264_reassembler_push(RtpH264Reassembler* reassembler, const uint8_t* p
 		return false;
 	return end ? deliver(reassembler, nal_callback, nal_context, marker) : true;
 }
+
+static size_t start_code_length(const uint8_t* data, size_t length, size_t offset)
+{
+	if (offset + 3 <= length && data[offset] == 0 && data[offset + 1] == 0 && data[offset + 2] == 1)
+		return 3;
+	if (offset + 4 <= length && data[offset] == 0 && data[offset + 1] == 0 && data[offset + 2] == 0 &&
+	    data[offset + 3] == 1)
+		return 4;
+	return 0;
+}
+
+bool rtp_h264_packetize_access_unit(RtpH264Packetizer* packetizer, const uint8_t* data, size_t length,
+                                    uint32_t timestamp, RtpH264PacketCallback callback, void* context)
+{
+	if (!packetizer || !data || !length || !callback) return false;
+	size_t first = length;
+	for (size_t offset = 0; offset < length; offset++)
+	{
+		const size_t code = start_code_length(data, length, offset);
+		if (code != 0)
+		{
+			first = offset;
+			break;
+		}
+	}
+	if (first == length)
+		return rtp_h264_packetize(packetizer, data, length, timestamp, callback, context);
+	bool sent = false;
+	for (size_t offset = first; offset < length;)
+	{
+		const size_t code = start_code_length(data, length, offset);
+		if (code == 0)
+			return false;
+		const size_t start = offset + code;
+		size_t next = start;
+		while (next < length && start_code_length(data, length, next) == 0)
+			next++;
+		if (start < next)
+		{
+			if (!rtp_h264_packetize_marker(packetizer, data + start, next - start,
+			                                timestamp, next == length, callback, context))
+				return false;
+			sent = true;
+		}
+		offset = next;
+	}
+	return sent;
+}

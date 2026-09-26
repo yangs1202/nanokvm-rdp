@@ -39,8 +39,37 @@ static bool receive_nal(void* context, const uint8_t* nal, size_t length, uint32
 	return true;
 }
 
+typedef struct { unsigned calls; unsigned fail_at; unsigned markers; } FaultSender;
+
+static bool fault_packet(void* context, const uint8_t* packet, size_t length)
+{
+	FaultSender* sender = context;
+	assert(length > 12);
+	sender->calls++;
+	if (sender->calls == sender->fail_at) return false;
+	if (packet[1] & 0x80U) sender->markers++;
+	return true;
+}
+
+static void test_access_unit_failure(void)
+{
+	const uint8_t au[] = {0,0,0,1,0x67,1, 0,0,1,0x68,2, 0,0,0,1,0x65,3};
+	RtpH264Packetizer packetizer;
+	for (unsigned fail = 1; fail <= 3; fail++)
+	{
+		rtp_h264_packetizer_init(&packetizer, RTP_H264_DEFAULT_MTU, 42);
+		FaultSender sender = { .fail_at = fail };
+		assert(!rtp_h264_packetize_access_unit(&packetizer, au, sizeof(au), 1, fault_packet, &sender));
+		assert(sender.calls == fail && sender.markers == 0);
+	}
+	FaultSender sender = { 0 };
+	assert(rtp_h264_packetize_access_unit(&packetizer, au, sizeof(au), 2, fault_packet, &sender));
+	assert(sender.calls == 3 && sender.markers == 1);
+}
+
 int main(void)
 {
+	test_access_unit_failure();
 	const int receiver_fd = socket(AF_INET, SOCK_DGRAM, 0);
 	const int sender_fd = socket(AF_INET, SOCK_DGRAM, 0);
 	assert(receiver_fd >= 0 && sender_fd >= 0);

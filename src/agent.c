@@ -87,6 +87,8 @@ typedef struct
 	atomic_bool streaming;
 	atomic_bool wait_for_idr;
 	uint32_t timestamp;
+	uint64_t send_deadline_ms;
+	uint64_t send_retries;
 	atomic_uint_fast32_t sent_packets;
 	atomic_uint_fast32_t dropped_packets;
 	atomic_uint_fast32_t capture_frames;
@@ -221,58 +223,30 @@ static bool send_stats(Agent* agent)
 static bool send_packet(void* context, const uint8_t* packet, size_t length)
 {
 	Agent* agent = context;
-	const ssize_t result = sendto(agent->video_fd, packet, length, MSG_DONTWAIT,
-	                              (const struct sockaddr*)&agent->video_address,
-	                              sizeof(agent->video_address));
-	if (result == (ssize_t)length)
+	int send_error = 0;
+	for (;;)
 	{
-		(void)atomic_fetch_add(&agent->sent_packets, 1);
-		return true;
+		const ssize_t result = sendto(agent->video_fd, packet, length, MSG_DONTWAIT,
+		                              (const struct sockaddr*)&agent->video_address,
+		                              sizeof(agent->video_address));
+		if (result == (ssize_t)length)
+		{
+			(void)atomic_fetch_add(&agent->sent_packets, 1);
+			return true;
+		}
+		send_error = result < 0 ? errno : EIO;
+		if (stop_requested || monotonic_milliseconds() >= agent->send_deadline_ms ||
+		    (send_error != EINTR && send_error != EAGAIN && send_error != EWOULDBLOCK &&
+		     send_error != ENOBUFS)) break;
+		agent->send_retries++;
+		/* Retry the same RTP packet, with a frame-wide deadline and no busy spin. */
+		const struct timespec pause = { .tv_nsec = 250000L };
+		(void)nanosleep(&pause, NULL);
 	}
+	(void)fprintf(stderr, "%s: VIDEO send failed errno=%d retries=%llu rtp_ts=%u\n",
+	              TAG, send_error, (unsigned long long)agent->send_retries, agent->timestamp);
 	(void)atomic_fetch_add(&agent->dropped_packets, 1);
 	return false;
-}
-
-static size_t start_code_length(const uint8_t* data, size_t length, size_t offset)
-{
-	if (offset + 3 <= length && data[offset] == 0 && data[offset + 1] == 0 && data[offset + 2] == 1)
-		return 3;
-	if (offset + 4 <= length && data[offset] == 0 && data[offset + 1] == 0 && data[offset + 2] == 0 &&
-	    data[offset + 3] == 1)
-		return 4;
-	return 0;
-}
-
-static bool send_h264(Agent* agent, const uint8_t* data, size_t length)
-{
-	size_t first = length;
-	for (size_t offset = 0; offset < length; offset++)
-	{
-		const size_t code = start_code_length(data, length, offset);
-		if (code != 0)
-		{
-			first = offset;
-			break;
-		}
-	}
-	if (first == length)
-		return rtp_h264_packetize(&agent->packetizer, data, length, agent->timestamp, send_packet, agent);
-	bool sent = false;
-	for (size_t offset = first; offset < length;)
-	{
-		const size_t code = start_code_length(data, length, offset);
-		if (code == 0)
-			return false;
-		const size_t start = offset + code;
-		size_t next = start;
-		while (next < length && start_code_length(data, length, next) == 0)
-			next++;
-		if (start < next)
-			sent |= rtp_h264_packetize_marker(&agent->packetizer, data + start, next - start,
-		                                   agent->timestamp, next == length, send_packet, agent);
-		offset = next;
-	}
-	return sent;
 }
 
 static void handle_control(Agent* agent, const NanokvmControlMessage* message)
@@ -521,16 +495,23 @@ static void* video_loop(void* argument)
 		    (kind == KVM_FRAME_SPS || kind == KVM_FRAME_PPS || kind == KVM_FRAME_IDR ||
 		     (!atomic_load(&agent->wait_for_idr) && kind == KVM_FRAME_P)))
 		{
-			const bool sent = send_h264(agent, data, length);
+			agent->send_deadline_ms = monotonic_milliseconds() + 40U;
+			const bool sent = rtp_h264_packetize_access_unit(&agent->packetizer, data, length,
+			                                                agent->timestamp, send_packet, agent);
 			const uint64_t send_done = monotonic_milliseconds();
-			if (!sent) (void)atomic_fetch_add(&agent->dropped_frames, 1);
+			if (!sent)
+			{
+				(void)atomic_fetch_add(&agent->dropped_frames, 1);
+				atomic_store(&agent->wait_for_idr, true);
+			}
 			if (frame_trace_sample(agent->timestamp))
-				(void)fprintf(stderr, "%s: FRAME_CAPTURE ssrc=%u rtp_ts=%u capture_start_ms=%llu capture_done_ms=%llu capture_wall_ms=%llu send_done_ms=%llu capture_call_ms=%llu packetize_send_ms=%llu bytes=%u sent=%u\n",
+				(void)fprintf(stderr, "%s: FRAME_CAPTURE ssrc=%u rtp_ts=%u capture_start_ms=%llu capture_done_ms=%llu capture_wall_ms=%llu send_done_ms=%llu capture_call_ms=%llu packetize_send_ms=%llu bytes=%u sent=%u send_retries=%llu\n",
 				              TAG, agent->packetizer.ssrc, agent->timestamp,
 				              (unsigned long long)capture_started, (unsigned long long)capture_done,
 				              (unsigned long long)capture_wall, (unsigned long long)send_done,
 				              (unsigned long long)capture_elapsed,
-				              (unsigned long long)(send_done - capture_done), length, (unsigned)sent);
+				              (unsigned long long)(send_done - capture_done), length, (unsigned)sent,
+			              (unsigned long long)agent->send_retries);
 		}
 		else if (kind == KVM_FRAME_P)
 			(void)atomic_fetch_add(&agent->dropped_frames, 1);
