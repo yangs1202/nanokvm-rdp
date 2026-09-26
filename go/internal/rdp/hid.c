@@ -1,0 +1,1093 @@
+#include "hid.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/stat.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define KBD_FLAGS_RELEASE 0x8000
+#define PTR_FLAGS_WHEEL 0x0200
+#define PTR_FLAGS_WHEEL_NEGATIVE 0x0100
+#define PTR_FLAGS_HWHEEL 0x0400
+#define PTR_FLAGS_DOWN 0x8000
+#define PTR_FLAGS_BUTTON1 0x1000
+#define PTR_FLAGS_BUTTON2 0x2000
+#define PTR_FLAGS_BUTTON3 0x4000
+#define PTR_XFLAGS_BUTTON1 0x0001
+#define PTR_XFLAGS_BUTTON2 0x0002
+#define WHEEL_ROTATION_MASK 0x01FF
+#define HID_MOUSE_BUTTONS_MASK 0x07
+#define HID_TOUCH_BUTTONS_MASK 0x1f
+#define HID_MODIFIER_RIGHT_ALT 0x40
+
+static bool is_hid_gadget(const char* path)
+{
+	return path && strncmp(path, "/dev/hidg", 9) == 0;
+}
+
+static int* hid_fd_slot(HidState* hid, const char* path)
+{
+	if (!hid || !path)
+		return NULL;
+	if (strcmp(path, hid->keyboard_path) == 0)
+		return &hid->keyboard_fd;
+	if (strcmp(path, hid->mouse_path) == 0)
+		return &hid->mouse_fd;
+	if (strcmp(path, hid->touch_path) == 0)
+		return &hid->touch_fd;
+	if (hid->paste_path[0] != '\0' && strcmp(path, hid->paste_path) == 0)
+		return &hid->paste_fd;
+	return NULL;
+}
+
+static int open_hid_fd(const char* path)
+{
+	const int fd = open(path, O_WRONLY | O_CLOEXEC | O_NONBLOCK);
+	if (fd < 0)
+		return -1;
+	struct stat status;
+	if (fstat(fd, &status) != 0 || (is_hid_gadget(path) && !S_ISCHR(status.st_mode)))
+	{
+		(void)close(fd);
+		errno = ENODEV;
+		return -1;
+	}
+	return fd;
+}
+
+static int open_keyboard_feedback(const char* path)
+{
+	if (!is_hid_gadget(path))
+		return -1;
+	const int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+	if (fd < 0)
+		return -1;
+	struct stat status;
+	if (fstat(fd, &status) != 0 || !S_ISCHR(status.st_mode))
+	{
+		(void)close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static int hid_fd(HidState* hid, const char* path)
+{
+	int* slot = hid_fd_slot(hid, path);
+	if (slot && *slot >= 0)
+	{
+		struct pollfd ready = { .fd = *slot, .events = POLLOUT };
+		if (poll(&ready, 1, 0) >= 0 && !(ready.revents & (POLLERR | POLLHUP | POLLNVAL)))
+			return *slot;
+		(void)close(*slot);
+		*slot = -1;
+	}
+	const int fd = open_hid_fd(path);
+	if (slot && fd >= 0)
+		*slot = fd;
+	return fd;
+}
+
+static bool write_open_report(int fd, const uint8_t* report, size_t length, bool* retryable)
+{
+	if (retryable)
+		*retryable = false;
+	if (fd < 0)
+		return false;
+	ssize_t written = -1;
+	do
+	{
+		written = write(fd, report, length);
+	} while (written < 0 && errno == EINTR);
+	const int saved_errno = errno;
+	errno = saved_errno;
+	if (written == (ssize_t)length)
+		return true;
+	if (retryable)
+		*retryable = saved_errno == EAGAIN || saved_errno == EWOULDBLOCK;
+	return false;
+}
+
+static bool write_hid_report(HidState* hid, const char* path, const uint8_t* report, size_t length)
+{
+	int* slot = hid_fd_slot(hid, path);
+	int fd = slot ? hid_fd(hid, path) : open_hid_fd(path);
+	bool retryable = false;
+	bool wrote = write_open_report(fd, report, length, &retryable);
+	/* EAGAIN means the previous USB transfer is still pending. Retry the
+	 * same report when writable; reopening the fd does not drain that transfer. */
+	if (!wrote && slot && fd >= 0 && !retryable)
+	{
+		(void)close(fd);
+		*slot = -1;
+		errno = EIO;
+	}
+	if (!slot && fd >= 0)
+		(void)close(fd);
+	return wrote;
+}
+
+static uint8_t absolute_report_length(const char* path)
+{
+	const char* configured = getenv("NANOKVM_HID_ABSOLUTE_REPORT_LENGTH");
+	if (configured && configured[0] != '\0')
+	{
+		const long value = strtol(configured, NULL, 10);
+		if (value == 6 || value == 7)
+			return (uint8_t)value;
+	}
+	if (!path || strcmp(path, "/dev/hidg2") != 0)
+		return 6;
+	const int fd = open("/sys/kernel/config/usb_gadget/g0/functions/hid.GS2/report_desc",
+	                     O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 6;
+	uint8_t descriptor[96] = { 0 };
+	const ssize_t length = read(fd, descriptor, sizeof(descriptor));
+	(void)close(fd);
+	if (length < 8)
+		return 6;
+	for (ssize_t index = 0; index + 2 < length; index++)
+	{
+		if (descriptor[index] == 0x0a && descriptor[index + 1] == 0x38 &&
+		    descriptor[index + 2] == 0x02)
+			return 7;
+	}
+	return 6;
+}
+
+static uint64_t hid_now(void)
+{
+	struct timespec now = { 0 };
+	(void)clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+/* A successful write submits one USB report; EAGAIN must retain that report.
+ * Keep transitions in order. Only adjacent absolute motion with unchanged
+ * buttons may replace older motion. Never merge clicks or relative deltas. */
+static bool write_paste_codepoint(HidState* hid, uint32_t codepoint);
+
+static int endpoint_fd(const HidState* hid, uint8_t endpoint)
+{
+	return endpoint == 1 ? hid->keyboard_fd : endpoint == 2 ? hid->mouse_fd : hid->touch_fd;
+}
+
+static bool flush_reports(HidState* hid, HidReportQueue* queue)
+{
+	while (queue->count > 0)
+	{
+		const uint64_t now = hid_now();
+		if (now < queue->ready_at)
+			return true;
+		if (queue->blocked_at && now - queue->blocked_at >= HID_REPORT_STALL_TIMEOUT_MS)
+		{
+			(void)fprintf(stderr, "HID: stalled at_ms=%llu blocked_ms=%llu pending=%u endpoint=%u\n",
+			              (unsigned long long)now, (unsigned long long)(now - queue->blocked_at),
+			              queue->count, queue->reports[queue->head].endpoint);
+			hid->write_errors++;
+			return false;
+		}
+		HidReport* report = &queue->reports[queue->head];
+		/* Across USB endpoints, submission order is insufficient. Wait for the
+		 * previous endpoint to complete before a position becomes a click. */
+		if (queue->inflight_endpoint && queue->inflight_endpoint != report->endpoint)
+		{
+			struct pollfd previous = { .fd = endpoint_fd(hid, queue->inflight_endpoint), .events = POLLOUT };
+			const int ready = previous.fd < 0 ? -1 : poll(&previous, 1, 0);
+			if (ready == 0 || (ready < 0 && errno == EINTR))
+			{
+				if (!queue->blocked_at) queue->blocked_at = now;
+				return true;
+			}
+			if (ready < 0 || (previous.revents & (POLLERR | POLLHUP | POLLNVAL)))
+			{
+				hid->write_errors++;
+				return false;
+			}
+			queue->inflight_endpoint = 0;
+		}
+		if (report->paste_codepoint)
+		{
+			if (!write_paste_codepoint(hid, report->paste_codepoint))
+			{
+				hid->write_errors++;
+				return false;
+			}
+			report->paste_codepoint = 0;
+			queue->ready_at = now + 30U;
+			return true;
+		}
+		const char* path = report->endpoint == 1 ? hid->keyboard_path :
+		                   report->endpoint == 2 ? hid->mouse_path : hid->touch_path;
+		if (!write_hid_report(hid, path, report->data, report->length))
+		{
+			if (!queue->blocked_at)
+				queue->blocked_at = now;
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+			{
+				hid->write_retries++;
+				return true;
+			}
+			(void)fprintf(stderr, "HID: write_failed at_ms=%llu endpoint=%u errno=%d pending=%u\n",
+			              (unsigned long long)now, report->endpoint, errno, queue->count);
+			hid->write_errors++;
+			queue->ready_at = now + 100U;
+			return false;
+		}
+		queue->blocked_at = 0;
+		queue->inflight_endpoint = report->endpoint;
+		const uint64_t age = now - report->queued_at;
+		uint8_t* submitted = &hid->submitted_state[report->endpoint - 1U];
+		if (*submitted != report->data[0] || age >= 50U)
+		{
+			(void)fprintf(stderr,
+			              "HID: submitted at_ms=%llu report=%llu endpoint=%u state=0x%02x->0x%02x queue_ms=%llu pending=%u\n",
+			              (unsigned long long)now, (unsigned long long)(hid->reports_sent + 1),
+			              report->endpoint, *submitted, report->data[0],
+			              (unsigned long long)age, queue->count - 1U);
+		}
+		*submitted = report->data[0];
+		if (age > hid->max_queue_age_ms)
+			hid->max_queue_age_ms = age;
+		hid->reports_sent++;
+		queue->ready_at = now + report->delay_ms;
+		queue->head = (queue->head + 1U) % HID_REPORT_QUEUE_CAPACITY;
+		queue->count--;
+	}
+	return true;
+}
+
+static bool queue_report(HidState* hid, HidReportQueue* queue, const char* path,
+                         const uint8_t* data, size_t length, bool motion, uint16_t delay_ms)
+{
+	const uint8_t endpoint = strcmp(path, hid->keyboard_path) == 0 ? 1 :
+	                         strcmp(path, hid->mouse_path) == 0 ? 2 : 3;
+	if (motion && queue->count > 0)
+	{
+		const unsigned last = (queue->head + queue->count - 1U) % HID_REPORT_QUEUE_CAPACITY;
+		HidReport* previous = &queue->reports[last];
+		if (previous->motion && previous->endpoint == endpoint && previous->data[0] == data[0])
+		{
+			memcpy(previous->data, data, length);
+			return flush_reports(hid, queue);
+		}
+	}
+	if (queue->count == HID_REPORT_QUEUE_CAPACITY)
+	{
+		(void)flush_reports(hid, queue);
+		if (queue->count == HID_REPORT_QUEUE_CAPACITY)
+		{
+			hid->queue_overflows++;
+			return false;
+		}
+	}
+	const unsigned slot = (queue->head + queue->count) % HID_REPORT_QUEUE_CAPACITY;
+	queue->reports[slot] = (HidReport){ .delay_ms = delay_ms, .motion = motion,
+	                                  .endpoint = endpoint, .length = (uint8_t)length,
+	                                  .queued_at = hid_now(),
+	                                  .paste_codepoint = queue == &hid->keyboard_queue
+	                                      ? hid->keyboard_paste_codepoint : 0 };
+	memcpy(queue->reports[slot].data, data, length);
+	queue->count++;
+	return flush_reports(hid, queue);
+}
+
+void hid_init(HidState* hid, const char* keyboard, const char* mouse, const char* touch)
+{
+	memset(hid, 0, sizeof(*hid));
+	hid->keyboard_fd = -1;
+	hid->keyboard_feedback_fd = -1;
+	hid->mouse_fd = -1;
+	hid->touch_fd = -1;
+	hid->paste_fd = -1;
+	(void)snprintf(hid->keyboard_path, sizeof(hid->keyboard_path), "%s",
+	               keyboard ? keyboard : "/dev/hidg0");
+	(void)snprintf(hid->mouse_path, sizeof(hid->mouse_path), "%s",
+	               mouse ? mouse : "/dev/hidg1");
+	(void)snprintf(hid->touch_path, sizeof(hid->touch_path), "%s",
+	               touch ? touch : "/dev/hidg2");
+	(void)snprintf(hid->paste_path, sizeof(hid->paste_path), "%s.paste", hid->keyboard_path);
+	hid->last_x = 0x3fff;
+	hid->last_y = 0x3fff;
+	hid->keepalive_at = hid_now() + HID_KEEPALIVE_INTERVAL_MS;
+	hid->keepalive_dx = 1;
+	hid->absolute_report_length = absolute_report_length(hid->touch_path);
+	hid->keyboard_fd = open_hid_fd(hid->keyboard_path);
+	hid->keyboard_feedback_fd = open_keyboard_feedback(hid->keyboard_path);
+	hid->mouse_fd = open_hid_fd(hid->mouse_path);
+	hid->touch_fd = open_hid_fd(hid->touch_path);
+	hid->paste_fd = open_hid_fd(hid->paste_path);
+}
+
+static void reset_keyboard_state(HidState* hid, bool desynced)
+{
+	memset(hid->usages, 0, sizeof(hid->usages));
+	hid->modifiers = 0;
+	hid->keyboard_desynced = desynced;
+}
+
+uint16_t hid_scale_absolute(uint16_t value, uint32_t dimension)
+{
+	if (dimension <= 1)
+		return 0x3fff;
+	uint32_t scaled = ((uint32_t)value * 0x7fffU) / (dimension - 1U);
+	if (scaled < 1U)
+		scaled = 1U;
+	if (scaled > 0x7fffU)
+		scaled = 0x7fffU;
+	return (uint16_t)scaled;
+}
+
+uint16_t hid_clamp_absolute(uint16_t value, uint16_t dimension)
+{
+	if (dimension == 0)
+		return 0;
+	return value < dimension ? value : (uint16_t)(dimension - 1U);
+}
+
+uint16_t hid_pointer_flags_from_extended(uint16_t flags)
+{
+	/* Reserve the low two bits of absolute control flags for USB buttons 4/5. */
+	return flags & (PTR_FLAGS_DOWN | PTR_XFLAGS_BUTTON1 | PTR_XFLAGS_BUTTON2);
+}
+
+uint8_t hid_pointer_buttons(uint8_t buttons, uint16_t flags)
+{
+	const uint16_t bits[] = { PTR_FLAGS_BUTTON1, PTR_FLAGS_BUTTON2, PTR_FLAGS_BUTTON3,
+	                          PTR_XFLAGS_BUTTON1, PTR_XFLAGS_BUTTON2 };
+	for (unsigned i = 0; i < 5; i++)
+	{
+		if (flags & bits[i])
+		{
+			if (flags & PTR_FLAGS_DOWN)
+				buttons |= (uint8_t)(1U << i);
+			else
+				buttons &= (uint8_t)~(1U << i);
+		}
+	}
+	return buttons;
+}
+
+void hid_map_scancode(uint8_t code, bool extended, bool swap_alt_command,
+                      uint8_t* mapped_code, bool* mapped_extended)
+{
+	*mapped_code = code;
+	*mapped_extended = extended;
+	if (!swap_alt_command)
+		return;
+	if (code == 0x38)
+	{
+		*mapped_code = extended ? 0x5c : 0x5b;
+		*mapped_extended = true;
+	}
+	else if (extended && code == 0x5b)
+	{
+		*mapped_code = 0x38;
+		*mapped_extended = false;
+	}
+	else if (extended && code == 0x5c)
+	{
+		*mapped_code = 0x38;
+		*mapped_extended = true;
+	}
+}
+
+static bool send_keyboard(HidState* hid)
+{
+	uint8_t report[8] = { 0 };
+	report[0] = hid->modifiers;
+	size_t index = 2;
+	for (unsigned usage = 0; usage < 256 && index < sizeof(report); usage++)
+	{
+		if (hid->usages[usage])
+			report[index++] = (uint8_t)usage;
+	}
+	const bool ok = queue_report(hid, &hid->keyboard_queue, hid->keyboard_path,
+	                             report, sizeof(report), false, hid->keyboard_delay_ms);
+	hid->keyboard_desynced = hid->keyboard_queue.count > 0;
+	return ok;
+}
+
+bool hid_keyboard_pending(const HidState* hid)
+{
+	return hid && hid->keyboard_queue.count > 0;
+}
+
+void hid_keyboard_flush(HidState* hid)
+{
+	if (!hid)
+		return;
+	(void)flush_reports(hid, &hid->keyboard_queue);
+	hid->keyboard_desynced = hid->keyboard_queue.count > 0;
+}
+
+bool hid_pending(const HidState* hid)
+{
+	return hid && (hid->keyboard_queue.count || hid->pointer_queue.count);
+}
+
+static void drain_keyboard_feedback(HidState* hid)
+{
+	const uint64_t now = hid_now();
+	if (hid->keyboard_feedback_fd < 0 && now >= hid->feedback_retry_at)
+	{
+		hid->keyboard_feedback_fd = open_keyboard_feedback(hid->keyboard_path);
+		hid->feedback_retry_at = now + 1000U;
+	}
+	if (hid->keyboard_feedback_fd < 0)
+		return;
+	/* HID OUT requests are rearmed only after userspace reads them. Leaving
+	 * LED reports unread can stall host keyboard synchronization although
+	 * every gadget-to-host key write succeeds. Bound each batch for fairness. */
+	for (unsigned batch = 0; batch < 32; batch++)
+	{
+		uint8_t report[64];
+		const ssize_t length = read(hid->keyboard_feedback_fd, report, sizeof(report));
+		if (length > 0)
+		{
+			hid->feedback_reports++;
+			hid->keyboard_leds = report[0] & 0x1fU;
+			continue;
+		}
+		if (length < 0 && errno == EINTR)
+			continue;
+		if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			return;
+		hid->feedback_errors++;
+		(void)close(hid->keyboard_feedback_fd);
+		hid->keyboard_feedback_fd = -1;
+		hid->feedback_retry_at = now + 1000U;
+		return;
+	}
+}
+
+bool hid_flush(HidState* hid)
+{
+	drain_keyboard_feedback(hid);
+	const bool keyboard = flush_reports(hid, &hid->keyboard_queue);
+	const bool pointer = flush_reports(hid, &hid->pointer_queue);
+	hid->keyboard_desynced = hid->keyboard_queue.count > 0;
+	return keyboard && pointer;
+}
+
+size_t hid_pollfds(const HidState* hid, struct pollfd* fds)
+{
+	const HidReportQueue* queues[] = { &hid->keyboard_queue, &hid->pointer_queue };
+	const uint64_t now = hid_now();
+	size_t count = 0;
+	for (size_t i = 0; i < 2; i++)
+	{
+		const HidReportQueue* queue = queues[i];
+		if (!queue->count || now < queue->ready_at) continue;
+		uint8_t endpoint = queue->reports[queue->head].endpoint;
+		if (queue->inflight_endpoint && queue->inflight_endpoint != endpoint)
+			endpoint = queue->inflight_endpoint;
+		const int fd = endpoint_fd(hid, endpoint);
+		if (fd >= 0) fds[count++] = (struct pollfd){ .fd = fd, .events = POLLOUT };
+	}
+	if (hid->keyboard_feedback_fd >= 0)
+		fds[count++] = (struct pollfd){ .fd = hid->keyboard_feedback_fd, .events = POLLIN };
+	return count;
+}
+
+int hid_poll_timeout(const HidState* hid, int idle_ms)
+{
+	const HidReportQueue* queues[] = { &hid->keyboard_queue, &hid->pointer_queue };
+	const uint64_t now = hid_now();
+	for (size_t i = 0; i < 2; i++)
+	{
+		if (!queues[i]->count)
+			continue;
+		const uint64_t delay = queues[i]->ready_at > now ? queues[i]->ready_at - now : 5U;
+		if (delay < (uint64_t)idle_ms)
+			idle_ms = (int)delay;
+	}
+	return idle_ms;
+}
+
+bool hid_translate_scancode(uint8_t code, bool extended, uint8_t* usage, uint8_t* modifier)
+{
+	static const uint8_t normal[128] = {
+		[0x01] = 0x29, [0x02] = 0x1e, [0x03] = 0x1f, [0x04] = 0x20,
+		[0x05] = 0x21, [0x06] = 0x22, [0x07] = 0x23, [0x08] = 0x24,
+		[0x09] = 0x25, [0x0a] = 0x26, [0x0b] = 0x27, [0x0c] = 0x2d,
+		[0x0d] = 0x2e, [0x0e] = 0x2a, [0x0f] = 0x2b, [0x10] = 0x14,
+		[0x11] = 0x1a, [0x12] = 0x08, [0x13] = 0x15, [0x14] = 0x17,
+		[0x15] = 0x1c, [0x16] = 0x18, [0x17] = 0x0c, [0x18] = 0x12,
+		[0x19] = 0x13, [0x1a] = 0x2f, [0x1b] = 0x30, [0x1c] = 0x28,
+		[0x1e] = 0x04, [0x1f] = 0x16, [0x20] = 0x07, [0x21] = 0x09,
+		[0x22] = 0x0a, [0x23] = 0x0b, [0x24] = 0x0d, [0x25] = 0x0e,
+		[0x26] = 0x0f, [0x27] = 0x33, [0x28] = 0x34, [0x29] = 0x35,
+		[0x2b] = 0x31, [0x2c] = 0x1d, [0x2d] = 0x1b, [0x2e] = 0x06,
+		[0x2f] = 0x19, [0x30] = 0x05, [0x31] = 0x11, [0x32] = 0x10,
+		[0x33] = 0x36, [0x34] = 0x37, [0x35] = 0x38, [0x37] = 0x55,
+		[0x39] = 0x2c, [0x3a] = 0x39, [0x3b] = 0x3a, [0x3c] = 0x3b,
+		[0x3d] = 0x3c, [0x3e] = 0x3d, [0x3f] = 0x3e, [0x40] = 0x3f,
+		[0x41] = 0x40, [0x42] = 0x41, [0x43] = 0x42, [0x44] = 0x43,
+		[0x45] = 0x53, [0x46] = 0x47, [0x47] = 0x5f, [0x48] = 0x60,
+		[0x49] = 0x61, [0x4a] = 0x56, [0x4b] = 0x5c, [0x4c] = 0x5d,
+		[0x4d] = 0x5e, [0x4e] = 0x57, [0x4f] = 0x59, [0x50] = 0x5a,
+		[0x51] = 0x5b, [0x52] = 0x62, [0x53] = 0x63, [0x56] = 0x64,
+		[0x54] = 0x67, [0x59] = 0x4c, [0x5c] = 0x49, [0x5d] = 0x4d,
+		[0x5e] = 0x4b, [0x5f] = 0x4e, [0x60] = 0x4a, [0x61] = 0x4f,
+		[0x62] = 0x50, [0x63] = 0x51, [0x64] = 0x52, [0x65] = 0x4c,
+		[0x66] = 0x65,
+		[0x57] = 0x44, [0x58] = 0x45,
+	};
+
+	*usage = 0;
+	*modifier = 0;
+	if (extended)
+	{
+		switch (code)
+		{
+			case 0x1c: *usage = 0x58; return true;
+			case 0x1d: *modifier = 0x10; return true;
+			case 0x35: *usage = 0x54; return true;
+			case 0x37: *usage = 0x46; return true;
+			case 0x38: *modifier = HID_MODIFIER_RIGHT_ALT; return true;
+			case 0x47: *usage = 0x4a; return true;
+			case 0x48: *usage = 0x52; return true;
+			case 0x49: *usage = 0x4b; return true;
+			case 0x4b: *usage = 0x50; return true;
+			case 0x4d: *usage = 0x4f; return true;
+			case 0x4f: *usage = 0x4d; return true;
+			case 0x50: *usage = 0x51; return true;
+			case 0x51: *usage = 0x4e; return true;
+			case 0x52: *usage = 0x49; return true;
+			case 0x53: *usage = 0x4c; return true;
+			case 0x5b: *modifier = 0x08; return true;
+			case 0x5c: *modifier = 0x80; return true;
+			case 0x5d: *usage = 0x65; return true;
+			case 0x5e: *usage = 0x66; return true;
+			case 0x5f: *usage = 0x82; return true;
+			case 0x63: *usage = 0x81; return true;
+			default: return false;
+		}
+	}
+
+	switch (code)
+	{
+		case 0x1d: *modifier = 0x01; return true;
+		case 0x2a: *modifier = 0x02; return true;
+		case 0x36: *modifier = 0x20; return true;
+		case 0x38: *modifier = 0x04; return true;
+		default: break;
+	}
+	if (code >= sizeof(normal) || normal[code] == 0)
+		return false;
+	*usage = normal[code];
+	return true;
+}
+
+bool hid_scancode(HidState* hid, uint8_t code, bool extended, bool release)
+{
+	uint8_t usage = 0;
+	uint8_t modifier = 0;
+	if (!hid_translate_scancode(code, extended, &usage, &modifier))
+		return true;
+	if ((modifier != 0 ? (hid->modifiers & modifier) != 0 : hid->usages[usage]) == !release)
+		return true;
+	if (modifier != 0)
+	{
+		if (release)
+			hid->modifiers &= (uint8_t)~modifier;
+		else
+			hid->modifiers |= modifier;
+	}
+	else
+		hid->usages[usage] = !release;
+	/* 가젯이 막혀 있어도 이번 보고를 큐에 남긴다. 최신 상태만 다시 쓰면
+	 * 아직 나가지 않은 글자가 사라진다. */
+	return send_keyboard(hid);
+}
+
+typedef struct
+{
+	uint8_t modifier;
+	uint8_t usage;
+} HidTextKey;
+
+static bool ascii_to_hid(uint8_t character, HidTextKey* key)
+{
+	if (character >= 'a' && character <= 'z')
+	{
+		key->modifier = 0;
+		key->usage = (uint8_t)(0x04U + character - 'a');
+		return true;
+	}
+	if (character >= 'A' && character <= 'Z')
+	{
+		key->modifier = 0x02;
+		key->usage = (uint8_t)(0x04U + character - 'A');
+		return true;
+	}
+	if (character >= '1' && character <= '9')
+	{
+		key->modifier = 0;
+		key->usage = (uint8_t)(0x1eU + character - '1');
+		return true;
+	}
+	if (character == '0')
+	{
+		key->modifier = 0;
+		key->usage = 0x27;
+		return true;
+	}
+
+	switch (character)
+	{
+		case '\b': key->modifier = 0; key->usage = 0x2a; return true;
+		case '\t': key->modifier = 0; key->usage = 0x2b; return true;
+		case '\n': case '\r': key->modifier = 0; key->usage = 0x28; return true;
+		case '\x1b': key->modifier = 0; key->usage = 0x29; return true;
+		case ' ': key->modifier = 0; key->usage = 0x2c; return true;
+		case '-': key->modifier = 0; key->usage = 0x2d; return true;
+		case '_': key->modifier = 0x02; key->usage = 0x2d; return true;
+		case '=': key->modifier = 0; key->usage = 0x2e; return true;
+		case '+': key->modifier = 0x02; key->usage = 0x2e; return true;
+		case '[': key->modifier = 0; key->usage = 0x2f; return true;
+		case '{': key->modifier = 0x02; key->usage = 0x2f; return true;
+		case ']': key->modifier = 0; key->usage = 0x30; return true;
+		case '}': key->modifier = 0x02; key->usage = 0x30; return true;
+		case '\\': key->modifier = 0; key->usage = 0x31; return true;
+		case '|': key->modifier = 0x02; key->usage = 0x31; return true;
+		case ';': key->modifier = 0; key->usage = 0x33; return true;
+		case ':': key->modifier = 0x02; key->usage = 0x33; return true;
+		case '\'': key->modifier = 0; key->usage = 0x34; return true;
+		case '"': key->modifier = 0x02; key->usage = 0x34; return true;
+		case '`': key->modifier = 0; key->usage = 0x35; return true;
+		case '~': key->modifier = 0x02; key->usage = 0x35; return true;
+		case ',': key->modifier = 0; key->usage = 0x36; return true;
+		case '<': key->modifier = 0x02; key->usage = 0x36; return true;
+		case '.': key->modifier = 0; key->usage = 0x37; return true;
+		case '>': key->modifier = 0x02; key->usage = 0x37; return true;
+		case '/': key->modifier = 0; key->usage = 0x38; return true;
+		case '?': key->modifier = 0x02; key->usage = 0x38; return true;
+		case '!': key->modifier = 0x02; key->usage = 0x1e; return true;
+		case '@': key->modifier = 0x02; key->usage = 0x1f; return true;
+		case '#': key->modifier = 0x02; key->usage = 0x20; return true;
+		case '$': key->modifier = 0x02; key->usage = 0x21; return true;
+		case '%': key->modifier = 0x02; key->usage = 0x22; return true;
+		case '^': key->modifier = 0x02; key->usage = 0x23; return true;
+		case '&': key->modifier = 0x02; key->usage = 0x24; return true;
+		case '*': key->modifier = 0x02; key->usage = 0x25; return true;
+		case '(': key->modifier = 0x02; key->usage = 0x26; return true;
+		case ')': key->modifier = 0x02; key->usage = 0x27; return true;
+		default: return false;
+	}
+}
+
+static const char* hangul_jamo_sequence(uint32_t codepoint)
+{
+	switch (codepoint)
+	{
+		case 0x3131: return "r"; case 0x3132: return "R"; case 0x3133: return "rt";
+		case 0x3134: return "s"; case 0x3135: return "sw"; case 0x3136: return "sg";
+		case 0x3137: return "e"; case 0x3138: return "E"; case 0x3139: return "f";
+		case 0x313a: return "fr"; case 0x313b: return "fa"; case 0x313c: return "fq";
+		case 0x313d: return "ft"; case 0x313e: return "fx"; case 0x313f: return "fv";
+		case 0x3140: return "fg"; case 0x3141: return "a"; case 0x3142: return "q";
+		case 0x3143: return "Q"; case 0x3144: return "qt"; case 0x3145: return "t";
+		case 0x3146: return "T"; case 0x3147: return "d"; case 0x3148: return "w";
+		case 0x3149: return "W"; case 0x314a: return "c"; case 0x314b: return "z";
+		case 0x314c: return "x"; case 0x314d: return "v"; case 0x314e: return "g";
+		case 0x314f: return "k"; case 0x3150: return "o"; case 0x3151: return "i";
+		case 0x3152: return "O"; case 0x3153: return "j"; case 0x3154: return "p";
+		case 0x3155: return "u"; case 0x3156: return "P"; case 0x3157: return "h";
+		case 0x3158: return "hk"; case 0x3159: return "ho"; case 0x315a: return "hl";
+		case 0x315b: return "y"; case 0x315c: return "n"; case 0x315d: return "nj";
+		case 0x315e: return "np"; case 0x315f: return "nl"; case 0x3160: return "b";
+		case 0x3161: return "m"; case 0x3162: return "ml"; case 0x3163: return "l";
+		default: return NULL;
+	}
+}
+
+static bool codepoint_to_hangul_sequences(uint32_t codepoint, const char** lead, const char** vowel,
+                                           const char** trail)
+{
+	static const char* const lead_keys[] = {
+		"r", "R", "s", "e", "E", "f", "a", "q", "Q", "t", "T", "d", "w", "W", "c", "z", "x", "v", "g",
+	};
+	static const char* const vowel_keys[] = {
+		"k", "o", "i", "O", "j", "p", "u", "P", "h", "hk", "ho", "hl", "y", "n", "nj", "np", "nl", "b", "m", "ml", "l",
+	};
+	static const char* const trail_keys[] = {
+		"", "r", "R", "rt", "s", "sw", "sg", "e", "f", "fr", "fa", "fq", "ft", "fx", "fv", "fg", "a", "q", "qt", "t", "T", "d", "w", "c", "z", "x", "v", "g",
+	};
+
+	if (codepoint < 0xac00 || codepoint > 0xd7a3)
+		return false;
+	const uint32_t offset = codepoint - 0xac00;
+	const uint32_t lead_index = offset / (21U * 28U);
+	const uint32_t vowel_index = (offset % (21U * 28U)) / 28U;
+	const uint32_t trail_index = offset % 28U;
+	*lead = lead_keys[lead_index];
+	*vowel = vowel_keys[vowel_index];
+	*trail = trail_keys[trail_index];
+	return true;
+}
+
+
+static bool is_utf8_continuation(uint8_t byte)
+{
+	return (byte & 0xc0U) == 0x80U;
+}
+
+static bool utf8_decode(const uint8_t* text, size_t length, size_t* offset, uint32_t* codepoint)
+{
+	if (*offset >= length)
+		return false;
+	const uint8_t first = text[(*offset)++];
+	if (first < 0x80U)
+	{
+		*codepoint = first;
+		return true;
+	}
+	if (first >= 0xc2U && first <= 0xdfU)
+	{
+		if (*offset >= length || !is_utf8_continuation(text[*offset]))
+			return false;
+		*codepoint = ((uint32_t)(first & 0x1fU) << 6U) | (text[(*offset)++] & 0x3fU);
+		return true;
+	}
+	if (first >= 0xe0U && first <= 0xefU)
+	{
+		if (*offset + 1U >= length || !is_utf8_continuation(text[*offset]) ||
+		    !is_utf8_continuation(text[*offset + 1U]) ||
+		    (first == 0xe0U && text[*offset] < 0xa0U) ||
+		    (first == 0xedU && text[*offset] > 0x9fU))
+			return false;
+		const uint8_t second = text[(*offset)++];
+		const uint8_t third = text[(*offset)++];
+		*codepoint = ((uint32_t)(first & 0x0fU) << 12U) |
+		             ((uint32_t)(second & 0x3fU) << 6U) |
+		             (third & 0x3fU);
+		return true;
+	}
+	if (first >= 0xf0U && first <= 0xf4U)
+	{
+		if (*offset + 2U >= length || !is_utf8_continuation(text[*offset]) ||
+		    !is_utf8_continuation(text[*offset + 1U]) || !is_utf8_continuation(text[*offset + 2U]) ||
+		    (first == 0xf0U && text[*offset] < 0x90U) ||
+		    (first == 0xf4U && text[*offset] > 0x8fU))
+			return false;
+		const uint8_t second = text[(*offset)++];
+		const uint8_t third = text[(*offset)++];
+		const uint8_t fourth = text[(*offset)++];
+		*codepoint = ((uint32_t)(first & 0x07U) << 18U) |
+		             ((uint32_t)(second & 0x3fU) << 12U) |
+		             ((uint32_t)(third & 0x3fU) << 6U) |
+		             (fourth & 0x3fU);
+		return true;
+	}
+	return false;
+}
+
+static bool tap_text_key(HidState* hid, HidTextKey key)
+{
+	const uint8_t saved_modifiers = hid->modifiers;
+	const bool saved_usage = hid->usages[key.usage];
+	hid->modifiers = saved_modifiers | key.modifier;
+	hid->usages[key.usage] = true;
+	if (!send_keyboard(hid))
+		return false;
+	hid->modifiers = saved_modifiers;
+	hid->usages[key.usage] = saved_usage;
+	if (!send_keyboard(hid))
+		return false;
+	return true;
+}
+
+static bool type_ascii_sequence(HidState* hid, const char* sequence)
+{
+	for (; *sequence != '\0'; sequence++)
+	{
+		HidTextKey key = { 0 };
+		if (!ascii_to_hid((uint8_t)*sequence, &key) || !tap_text_key(hid, key))
+			return false;
+	}
+	return true;
+}
+
+static bool type_codepoint(HidState* hid, uint32_t codepoint)
+{
+	HidTextKey key = { 0 };
+	if (codepoint <= 0x7fU && ascii_to_hid((uint8_t)codepoint, &key))
+		return tap_text_key(hid, key);
+
+	const char* lead = NULL;
+	const char* vowel = NULL;
+	const char* trail = NULL;
+	if (codepoint_to_hangul_sequences(codepoint, &lead, &vowel, &trail))
+		return type_ascii_sequence(hid, lead) && type_ascii_sequence(hid, vowel) &&
+		       type_ascii_sequence(hid, trail);
+
+	const char* sequence = hangul_jamo_sequence(codepoint);
+	return sequence && type_ascii_sequence(hid, sequence);
+}
+
+static bool utf8_encode(uint32_t codepoint, uint8_t out[4], size_t* length)
+{
+	if (codepoint > 0x10ffffU || (codepoint >= 0xd800U && codepoint <= 0xdfffU))
+		return false;
+	if (codepoint <= 0x7fU)
+	{
+		out[0] = (uint8_t)codepoint;
+		*length = 1;
+	}
+	else if (codepoint <= 0x7ffU)
+	{
+		out[0] = (uint8_t)(0xc0U | (codepoint >> 6U));
+		out[1] = (uint8_t)(0x80U | (codepoint & 0x3fU));
+		*length = 2;
+	}
+	else if (codepoint <= 0xffffU)
+	{
+		out[0] = (uint8_t)(0xe0U | (codepoint >> 12U));
+		out[1] = (uint8_t)(0x80U | ((codepoint >> 6U) & 0x3fU));
+		out[2] = (uint8_t)(0x80U | (codepoint & 0x3fU));
+		*length = 3;
+	}
+	else
+	{
+		out[0] = (uint8_t)(0xf0U | (codepoint >> 18U));
+		out[1] = (uint8_t)(0x80U | ((codepoint >> 12U) & 0x3fU));
+		out[2] = (uint8_t)(0x80U | ((codepoint >> 6U) & 0x3fU));
+		out[3] = (uint8_t)(0x80U | (codepoint & 0x3fU));
+		*length = 4;
+	}
+	return true;
+}
+
+/* 두벌식으로 칠 수 없는 문자는 대상 macOS 클립보드에 넣고 Command+V로 붙인다.
+ * 페이로드는 osascript가 UTF-8로 읽는 quoted form이다. */
+static bool write_paste_codepoint(HidState* hid, uint32_t codepoint)
+{
+	uint8_t encoded[4] = { 0 };
+	size_t encoded_length = 0;
+	if (hid->paste_fd < 0 || !utf8_encode(codepoint, encoded, &encoded_length))
+		return false;
+	uint8_t payload[32] = { 0 };
+	size_t length = 0;
+	payload[length++] = '\'';
+	for (size_t index = 0; index < encoded_length; index++)
+	{
+		const uint8_t byte = encoded[index];
+		if (byte == '\'' || byte == '\\')
+		{
+			if (length + 2U >= sizeof(payload))
+				return false;
+			payload[length++] = '\\';
+		}
+		else if (length + 1U >= sizeof(payload))
+			return false;
+		payload[length++] = byte;
+	}
+	if (length + 2U > sizeof(payload))
+		return false;
+	payload[length++] = '\'';
+	payload[length++] = '\n';
+	return write_hid_report(hid, hid->paste_path, payload, length);
+}
+
+static bool paste_codepoint(HidState* hid, uint32_t codepoint)
+{
+	if (hid->paste_fd < 0)
+		return false;
+	const uint8_t saved = hid->modifiers;
+	memset(hid->usages, 0, sizeof(hid->usages));
+	hid->modifiers = 0x08;
+	hid->usages[0x19] = true;
+	hid->keyboard_paste_codepoint = codepoint;
+	const bool queued = send_keyboard(hid);
+	hid->keyboard_paste_codepoint = 0;
+	if (!queued)
+		return false;
+	hid->usages[0x19] = false;
+	hid->modifiers = saved;
+	return send_keyboard(hid);
+}
+
+bool hid_type_utf8(HidState* hid, const uint8_t* text, size_t length)
+{
+	if (!hid || !text || length == 0)
+		return false;
+	/* Pacing belongs to the output queue; never sleep in the control receiver. */
+	hid->keyboard_delay_ms = 20;
+	/* Mobile clients mix scancode modifiers with Unicode shortcut keys.
+	 * A single ASCII key must retain the held modifiers until their own key-up. */
+	HidTextKey shortcut = { 0 };
+	if (length == 1 && hid->modifiers != 0 && ascii_to_hid(text[0], &shortcut))
+	{
+		const bool ok = tap_text_key(hid, shortcut);
+		hid->keyboard_delay_ms = 0;
+		if (!ok) hid_release_all(hid);
+		return ok;
+	}
+	reset_keyboard_state(hid, false);
+	bool ok = send_keyboard(hid);
+	for (size_t offset = 0; ok && offset < length;)
+	{
+		uint32_t codepoint = 0;
+		ok = utf8_decode(text, length, &offset, &codepoint);
+		if (ok)
+			ok = codepoint <= 0x7fU || (codepoint >= 0xac00 && codepoint <= 0xd7a3) ||
+			     hangul_jamo_sequence(codepoint)
+			         ? type_codepoint(hid, codepoint) : paste_codepoint(hid, codepoint);
+	}
+	hid->keyboard_delay_ms = 0;
+	if (!ok)
+		hid_release_all(hid);
+	return ok;
+}
+
+static uint8_t touch_buttons(uint8_t buttons)
+{
+	return (uint8_t)(buttons & 0x18U); /* Additional buttons exist only on hidg2. */
+}
+
+static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)
+{
+	report[1] = (uint8_t)(x & 0xffU);
+	report[2] = (uint8_t)(x >> 8U);
+	report[3] = (uint8_t)(y & 0xffU);
+	report[4] = (uint8_t)(y >> 8U);
+}
+
+static bool send_absolute(HidState* hid, bool motion)
+{
+	uint8_t report[7] = { touch_buttons(hid->buttons), 0, 0, 0, 0, 0, 0 };
+	const size_t length = hid->absolute_report_length;
+	write_touch_position(report, hid->last_x, hid->last_y);
+	report[5] = (uint8_t)hid->wheel;
+	if (length == 7)
+		report[6] = (uint8_t)hid->pan;
+	const bool ok = queue_report(hid, &hid->pointer_queue, hid->touch_path, report, length,
+	                             motion && hid->wheel == 0 && hid->pan == 0, 0);
+	/* Wheel and relative axes are deltas, not persistent state. */
+	hid->wheel = 0;
+	hid->pan = 0;
+	return ok;
+}
+
+/* Standard buttons live on the relative endpoint, where changing a button
+ * never restores an old absolute position. Both mouse endpoints share a FIFO. */
+static bool send_relative(HidState* hid, int8_t dx, int8_t dy, int8_t wheel)
+{
+	const uint8_t report[4] = { hid->buttons & HID_MOUSE_BUTTONS_MASK,
+	                           (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel };
+	return queue_report(hid, &hid->pointer_queue, hid->mouse_path, report, sizeof(report), false, 0);
+}
+
+bool hid_keepalive(HidState* hid, uint64_t now_ms)
+{
+	if (now_ms < hid->keepalive_at || hid_pending(hid) || hid->buttons || hid->modifiers)
+		return true;
+	for (unsigned usage = 0; usage < 256; usage++)
+	{
+		if (hid->usages[usage])
+			return true;
+	}
+	/* Schedule from this attempt: no catch-up bursts after a delayed loop or
+	 * hot retry loop when the USB host is unavailable. */
+	hid->keepalive_at = now_ms + HID_KEEPALIVE_INTERVAL_MS;
+	const bool ok = send_relative(hid, hid->keepalive_dx, 0, 0);
+	if (ok)
+		hid->keepalive_dx = (int8_t)-hid->keepalive_dx;
+	return ok;
+}
+
+bool hid_absolute(HidState* hid, uint16_t x, uint16_t y, uint32_t width, uint32_t height,
+                  uint16_t flags)
+{
+	const uint8_t previous = hid->buttons;
+	hid->buttons = hid_pointer_buttons(hid->buttons, flags);
+	hid->mouse_buttons = hid->buttons;
+	hid->last_x = hid_scale_absolute(x, width);
+	hid->last_y = hid_scale_absolute(y, height);
+	const bool motion = (flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3 |
+	                              PTR_XFLAGS_BUTTON1 | PTR_XFLAGS_BUTTON2)) == 0;
+	if (!send_absolute(hid, motion)) return false;
+	return ((previous ^ hid->buttons) & HID_MOUSE_BUTTONS_MASK) == 0 || send_relative(hid, 0, 0, 0);
+}
+
+bool hid_relative(HidState* hid, int16_t x, int16_t y, uint8_t buttons)
+{
+	const uint8_t next = buttons & HID_TOUCH_BUTTONS_MASK;
+	const uint8_t changed = hid->buttons ^ next;
+	hid->buttons = next;
+	hid->mouse_buttons = next;
+	if ((changed & 0x18U) && !send_absolute(hid, false)) return false;
+	if (x == 0 && y == 0)
+		return !(changed & HID_MOUSE_BUTTONS_MASK) || send_relative(hid, 0, 0, 0);
+	while (x != 0 || y != 0)
+	{
+		const int8_t dx = x > 127 ? 127 : x < -127 ? -127 : (int8_t)x;
+		const int8_t dy = y > 127 ? 127 : y < -127 ? -127 : (int8_t)y;
+		if (!send_relative(hid, dx, dy, 0)) return false;
+		x -= dx; y -= dy;
+	}
+	return true;
+}
+
+static int wheel_detents(uint16_t flags)
+{
+	int delta = (int)(flags & WHEEL_ROTATION_MASK);
+	if (delta & PTR_FLAGS_WHEEL_NEGATIVE)
+		delta -= 0x200; /* signed 9-bit RDP rotation */
+	int detents = delta / 120;
+	if (detents == 0 && delta != 0)
+		detents = delta > 0 ? 1 : -1;
+	return detents;
+}
+
+bool hid_wheel(HidState* hid, uint16_t flags)
+{
+	const bool vertical = (flags & PTR_FLAGS_WHEEL) != 0;
+	const bool horizontal = (flags & PTR_FLAGS_HWHEEL) != 0;
+	if (!vertical && !horizontal)
+		return true;
+	const int detents = wheel_detents(flags);
+	if (horizontal && !vertical)
+	{
+		if (hid->absolute_report_length != 7)
+			return true;
+		hid->pan = (int8_t)detents;
+	}
+	else
+		return send_relative(hid, 0, 0, (int8_t)detents);
+	return send_absolute(hid, false);
+}
+
+bool hid_synchronize(HidState* hid)
+{
+	hid->keyboard_delay_ms = 0;
+	hid->keyboard_paste_codepoint = 0;
+	reset_keyboard_state(hid, false);
+	hid->buttons = 0;
+	hid->mouse_buttons = 0;
+	hid->wheel = 0;
+	hid->pan = 0;
+	const bool keyboard_ok = send_keyboard(hid);
+	const uint8_t mouse[4] = { 0 };
+	const bool mouse_ok = queue_report(hid, &hid->pointer_queue, hid->mouse_path,
+	                                   mouse, sizeof(mouse), false, 0);
+	const bool absolute_ok = send_absolute(hid, false);
+	return keyboard_ok && mouse_ok && absolute_ok;
+}
+
+void hid_release_all(HidState* hid)
+{
+	/* Emergency cancellation, unlike an ordered RDP Synchronize event. */
+	hid->keyboard_queue = (HidReportQueue){ 0 };
+	hid->pointer_queue = (HidReportQueue){ 0 };
+	(void)hid_synchronize(hid);
+}

@@ -12,7 +12,7 @@
 `nanokvm-rdp` separates capture and RDP serving into two processes:
 
 - **`nanokvm-agent`** runs on the NanoKVM device. It reads H.264 Annex-B frames from `libkvm.so`, packetizes them as RTP/H.264, and forwards RDP input as USB HID reports.
-- **`nanokvm-rdp-gateway`** runs on a separate host. It receives the stream, decodes it with FFmpeg, and serves the resulting desktop through an RDP listener backed by FreeRDP.
+- **`nanokvm-rdp-gateway`** runs on a separate host. The Go process owns the agent control connection, RTP reception, and FFmpeg decode orchestration. FreeRDP remains in-process behind cgo and serves the RDP listener.
 
 The project supports one NanoKVM device and one connected RDP client at a time.
 
@@ -70,12 +70,11 @@ cmake -S . -B build/agent -G 'Unix Makefiles' \
 cmake --build build/agent --target nanokvm-agent --parallel 4
 ```
 
-Build the gateway. `NANOKVM_RDP_FREERDP_DIR` must point to a FreeRDP source tree; it is deliberately not hard-coded in this repository.
+Build the gateway. FreeRDP stays behind the cgo bridge, so `pkg-config` must find `freerdp3` and `freerdp-server3`.
 
 ```sh
-cmake -S . -B build/gateway -G 'Unix Makefiles' \
-  -DNANOKVM_RDP_FREERDP_DIR=/path/to/FreeRDP
-cmake --build build/gateway --target nanokvm-rdp-gateway --parallel 4
+CGO_ENABLED=1 go build -o build/gateway/nanokvm-rdp-gateway ./go/cmd/nanokvm-rdp-gateway
+go test ./go/...
 ```
 
 For a cross-compiled gateway, also set `-DNANOKVM_RDP_OPENSSL_ROOT=/path/to/openssl-prefix` when needed by the toolchain.
@@ -121,6 +120,8 @@ Deployment scripts are provided in [`deploy/`](deploy/):
 
 - [`S100nanokvm-agent`](deploy/S100nanokvm-agent) installs and manages the NanoKVM agent.
 - [`S100nanokvm-rdp`](deploy/S100nanokvm-rdp) manages the legacy on-device RDP service.
+
+The gateway container listens on TCP `3389` for RDP, TCP `3390` for agent control, and UDP `5004` for video. Mount a certificate and key at `/run/tls/tls.crt` and `/run/tls/tls.key`, or let the container create a self-signed pair there on startup. The agent defaults in `deploy/S100nanokvm-agent` match the gateway defaults: 1920×1080 and 8000 kbps.
 
 Before starting the agent, update `GATEWAY`, `CONTROL_PORT`, `VIDEO_PORT`, `WIDTH`, `HEIGHT`, and `BITRATE` in `deploy/S100nanokvm-agent` for the target environment. Permit outbound traffic from NanoKVM to the gateway on TCP `3390` and UDP `5004`, and permit RDP clients to reach gateway TCP `3389`.
 

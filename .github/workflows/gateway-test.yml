@@ -1,0 +1,24 @@
+name: Gateway tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install FreeRDP development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends freerdp3-dev pkg-config ffmpeg
+
+      - name: Test Go gateway
+        run: CGO_ENABLED=1 go test ./go/...

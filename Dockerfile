@@ -6,11 +6,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
+        curl \
         cmake \
         git \
         libavcodec-dev \
         libavutil-dev \
         libssl-dev \
+        patchelf \
         pkg-config \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -22,7 +24,7 @@ RUN git clone --branch "${FREERDP_VERSION}" --depth 1 https://github.com/FreeRDP
 RUN cmake -S freerdp -B build/freerdp \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/freerdp \
-        -DBUILD_SHARED_LIBS=OFF \
+        -DBUILD_SHARED_LIBS=ON \
         -DWITH_SERVER=ON \
         -DWITH_CLIENT=OFF \
         -DWITH_SAMPLE=OFF \
@@ -64,12 +66,13 @@ WORKDIR /src/nanokvm-rdp
 
 COPY . .
 
-RUN cmake -S . -B build/gateway \
-        -DCMAKE_PREFIX_PATH=/opt/freerdp \
-        -DNANOKVM_RDP_BUILD_AGENT=OFF \
-        -DNANOKVM_RDP_BUILD_TESTS=OFF \
-        -DNANOKVM_RDP_USE_INSTALLED_FREERDP=ON \
-    && cmake --build build/gateway --target nanokvm-rdp-gateway --parallel
+ARG GO_VERSION=1.26.4
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -C /usr/local -xz
+ENV PATH=/usr/local/go/bin:${PATH}
+ENV PKG_CONFIG_PATH=/opt/freerdp/lib/pkgconfig
+ENV LD_LIBRARY_PATH=/opt/freerdp/lib
+RUN CGO_ENABLED=1 go build -o /usr/local/bin/nanokvm-rdp-gateway ./go/cmd/nanokvm-rdp-gateway && \
+    patchelf --set-rpath /usr/local/lib /usr/local/bin/nanokvm-rdp-gateway
 
 FROM debian:bookworm-slim
 
@@ -77,11 +80,17 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         ffmpeg \
+        libssl3 \
+        openssl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /src/nanokvm-rdp/build/gateway/nanokvm-rdp-gateway /usr/local/bin/nanokvm-rdp-gateway
+COPY --from=builder /usr/local/bin/nanokvm-rdp-gateway /usr/local/bin/nanokvm-rdp-gateway
+COPY --from=builder /opt/freerdp/lib/ /usr/local/lib/
+RUN ldconfig
 
 EXPOSE 3389/tcp 3390/tcp 5004/udp
 
-ENTRYPOINT ["/usr/local/bin/nanokvm-rdp-gateway"]
+COPY docker/entrypoint.sh /usr/local/bin/nanokvm-rdp-entrypoint
+RUN chmod 755 /usr/local/bin/nanokvm-rdp-entrypoint
+ENTRYPOINT ["/usr/local/bin/nanokvm-rdp-entrypoint"]
 CMD ["-listen", "0.0.0.0:3389", "-cert", "/run/tls/tls.crt", "-key", "/run/tls/tls.key"]

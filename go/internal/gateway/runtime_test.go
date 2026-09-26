@@ -1,0 +1,168 @@
+package gateway
+
+import (
+	"net"
+	"testing"
+	"time"
+
+	"github.com/yangs1202/nanokvm-rdp/go/go/internal/control"
+	"github.com/yangs1202/nanokvm-rdp/go/go/internal/rdp"
+	"github.com/yangs1202/nanokvm-rdp/go/go/internal/session"
+	"github.com/yangs1202/nanokvm-rdp/go/go/internal/video"
+)
+
+func TestRuntimeForwardsControlInputAndVideo(t *testing.T) {
+	controlListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	video, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := NewRuntime(RuntimeConfig{Control: controlListener, Video: video})
+	defer rt.Close()
+
+	agent, err := net.Dial("tcp", controlListener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	if err := control.Write(agent, control.TypeHello, make([]byte, control.HelloBaseSize)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := rt.agent.Send(control.TypePing, nil); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	rt.bus.Input(session.Event{Kind: session.EventKey, Payload: []byte{0x1e, 0, 0}})
+	_ = agent.SetReadDeadline(deadline)
+	for {
+		msg, err := control.Read(agent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg.Type == control.TypePing {
+			continue
+		}
+		if msg.Type != control.TypeKey || msg.Payload[0] != 0x1e {
+			t.Fatalf("input = %+v", msg)
+		}
+		return
+	}
+}
+
+type recordingSession struct {
+	frames []rdp.Frame
+	inputs chan rdp.Input
+}
+
+func (s *recordingSession) Submit(frame rdp.Frame) error {
+	s.frames = append(s.frames, frame)
+	return nil
+}
+
+func (s *recordingSession) Controls() <-chan rdp.Control { return nil }
+func (s *recordingSession) Close() error                 { return nil }
+
+type controlSession struct {
+	controls chan rdp.Control
+}
+
+func (s *controlSession) Submit(rdp.Frame) error       { return nil }
+func (s *controlSession) Close() error                 { return nil }
+func (s *controlSession) Controls() <-chan rdp.Control { return s.controls }
+
+func TestRuntimeForwardsSessionControlToAgent(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controls := make(chan rdp.Control, 1)
+	rt := NewRuntime(RuntimeConfig{Control: listener, RDP: &controlSession{controls: controls}})
+	defer rt.Close()
+	agent, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer agent.Close()
+	if err := control.Write(agent, control.TypeHello, make([]byte, control.HelloBaseSize)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := rt.agent.Send(control.TypePing, nil); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	controls <- rdp.Control{Type: byte(control.TypeKey), Payload: []byte{0x1e, 0, 1}}
+	_ = agent.SetReadDeadline(deadline)
+	for {
+		msg, err := control.Read(agent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg.Type == control.TypePing {
+			continue
+		}
+		if msg.Type != control.TypeKey || msg.Payload[2] != 1 {
+			t.Fatalf("control = %+v", msg)
+		}
+		return
+	}
+}
+
+func TestRuntimeSubmitsPublishedFrameToRDP(t *testing.T) {
+	session := &recordingSession{inputs: make(chan rdp.Input, 1)}
+	rt := NewRuntime(RuntimeConfig{RDP: session})
+	defer rt.Close()
+	rt.bus.Publish(sessionFrame(t))
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(session.frames) == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("frames = %d", len(session.frames))
+}
+
+func sessionFrame(t *testing.T) session.Frame {
+	t.Helper()
+	return session.Frame{Kind: session.FrameH264, Data: []byte{0, 0, 0, 1, 0x65}}
+}
+
+func TestRuntimePublishesRTPAccessUnit(t *testing.T) {
+	videoConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := NewRuntime(RuntimeConfig{Video: videoConn})
+	defer rt.Close()
+	sub := rt.bus.Subscribe(rt.ctx)
+	sender, err := net.Dial("udp", videoConn.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	packetizer := video.Packetizer{Sequence: 1, SSRC: 7, MTU: video.DefaultMTU}
+	nal := []byte{0x65, 0x01, 0x02}
+	if err := packetizer.Packetize(nal, 1000, true, func(packet []byte) error {
+		_, err := sender.Write(packet)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case frame := <-sub:
+		if len(frame.Data) < 5 || frame.Data[4] != 0x65 {
+			t.Fatalf("frame = %x", frame.Data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no video frame")
+	}
+}
