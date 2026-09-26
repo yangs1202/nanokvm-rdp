@@ -27,7 +27,7 @@ import (
 
 type cgoSession struct {
 	session  *C.NanokvmRdpSession
-	handle   cgo.Handle
+	handle   *C.uintptr_t
 	inputs   chan Input
 	controls chan controlEvent
 	frames   chan []byte
@@ -44,7 +44,13 @@ func Start(config Config, inputs chan Input) (Session, error) {
 		return nil, errors.New("rdp listen address is incomplete")
 	}
 	session := &cgoSession{inputs: inputs, controls: make(chan controlEvent, 32), frames: make(chan []byte, 2)}
-	session.handle = cgo.NewHandle(session)
+	handle := cgo.NewHandle(session)
+	session.handle = (*C.uintptr_t)(C.malloc(C.size_t(unsafe.Sizeof(C.uintptr_t(0)))))
+	if session.handle == nil {
+		handle.Delete()
+		return nil, errors.New("allocate freerdp bridge context")
+	}
+	*session.handle = C.uintptr_t(handle)
 	address := C.CString(config.BindAddress)
 	defer C.free(unsafe.Pointer(address))
 	var cert, key *C.char
@@ -67,7 +73,7 @@ func Start(config Config, inputs chan Input) (Session, error) {
 		swap_alt_command: C.bool(config.SwapAltCommand),
 	}
 	hooks := C.NanokvmSessionHooks{
-		context:      unsafe.Pointer(&session.handle),
+		context:      unsafe.Pointer(session.handle),
 		send_control: (*[0]byte)(C.nanokvmSendControl),
 		read_h264:    (*[0]byte)(C.nanokvmReadH264),
 		decode_start: (*[0]byte)(C.nanokvmDecodeStart),
@@ -76,7 +82,8 @@ func Start(config Config, inputs chan Input) (Session, error) {
 	}
 	session.session = C.nanokvm_session_start(&cconfig, &hooks)
 	if session.session == nil {
-		session.handle.Delete()
+		cgo.Handle(*session.handle).Delete()
+		C.free(unsafe.Pointer(session.handle))
 		return nil, fmt.Errorf("start freerdp bridge on %s:%d", config.BindAddress, config.Port)
 	}
 	go session.pump()
@@ -116,7 +123,11 @@ func (s *cgoSession) Close() error {
 		C.nanokvm_session_stop(s.session)
 		s.session = nil
 	}
-	s.handle.Delete()
+	if s.handle != nil {
+		cgo.Handle(*s.handle).Delete()
+		C.free(unsafe.Pointer(s.handle))
+		s.handle = nil
+	}
 	return nil
 }
 
@@ -133,7 +144,7 @@ func (s *cgoSession) Controls() <-chan Control {
 
 //export nanokvmSendControl
 func nanokvmSendControl(context unsafe.Pointer, kind C.uint8_t, payload unsafe.Pointer, length C.uint16_t) C.bool {
-	handle := *(*cgo.Handle)(context)
+	handle := cgo.Handle(*(*C.uintptr_t)(context))
 	session := handle.Value().(*cgoSession)
 	event := controlEvent{kind: byte(kind)}
 	if length > 0 && payload != nil {
@@ -149,7 +160,7 @@ func nanokvmSendControl(context unsafe.Pointer, kind C.uint8_t, payload unsafe.P
 
 //export nanokvmReadH264
 func nanokvmReadH264(context unsafe.Pointer, data **C.uint8_t, length *C.size_t, losses *C.uint32_t) C.bool {
-	handle := *(*cgo.Handle)(context)
+	handle := cgo.Handle(*(*C.uintptr_t)(context))
 	session := handle.Value().(*cgoSession)
 	select {
 	case frame := <-session.frames:
@@ -168,7 +179,7 @@ func nanokvmReadH264(context unsafe.Pointer, data **C.uint8_t, length *C.size_t,
 
 //export nanokvmDecodeStart
 func nanokvmDecodeStart(context unsafe.Pointer, width C.uint16_t, height C.uint16_t) C.bool {
-	handle := *(*cgo.Handle)(context)
+	handle := cgo.Handle(*(*C.uintptr_t)(context))
 	session := handle.Value().(*cgoSession)
 	decoder, err := video.StartDecoder(uint16(width), uint16(height), func(frame []byte) {
 		if session.session == nil {
@@ -185,7 +196,7 @@ func nanokvmDecodeStart(context unsafe.Pointer, width C.uint16_t, height C.uint1
 
 //export nanokvmDecodePush
 func nanokvmDecodePush(context unsafe.Pointer, data *C.uint8_t, length C.size_t) C.bool {
-	handle := *(*cgo.Handle)(context)
+	handle := cgo.Handle(*(*C.uintptr_t)(context))
 	session := handle.Value().(*cgoSession)
 	if session.decoder == nil || length == 0 {
 		return C.bool(false)
@@ -198,7 +209,7 @@ func nanokvmDecodePush(context unsafe.Pointer, data *C.uint8_t, length C.size_t)
 
 //export nanokvmDecodeStop
 func nanokvmDecodeStop(context unsafe.Pointer) {
-	handle := *(*cgo.Handle)(context)
+	handle := cgo.Handle(*(*C.uintptr_t)(context))
 	session := handle.Value().(*cgoSession)
 	if session.decoder != nil {
 		session.decoder.Stop()
