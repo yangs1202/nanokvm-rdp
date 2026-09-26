@@ -7,26 +7,25 @@
 
 > A single-client remote desktop gateway for NanoKVM devices.
 
-**Tags:** `nanokvm` · `rdp` · `remote-desktop` · `h264` · `rtp` · `udp` · `hid` · `ffmpeg` · `freerdp` · `c11` · `cmake`
+**Tags:** `nanokvm` · `rdp` · `remote-desktop` · `h264` · `rtp` · `udp` · `hid` · `ffmpeg` · `freerdp` · `go` · `c11` · `cmake`
 
 `nanokvm-rdp` separates capture and RDP serving into two processes:
 
 - **`nanokvm-agent`** runs on the NanoKVM device. It reads H.264 Annex-B frames from `libkvm.so`, packetizes them as RTP/H.264, and forwards RDP input as USB HID reports.
-- **`nanokvm-rdp-gateway`** runs on a separate host. It receives the stream, decodes it with FFmpeg, and serves the resulting desktop through an RDP listener backed by FreeRDP.
+- **`nanokvm-rdp-gateway`** runs on a separate host. Its Go runtime owns TCP control, RTP/H.264 reassembly, FFmpeg, lifecycle, and input forwarding. A thin C/FreeRDP shim owns only the RDP listener, FreeRDP callbacks, codecs, and wire PDUs.
 
 The project supports one NanoKVM device and one connected RDP client at a time.
 
 ## Architecture
 
 ```text
-RDP client
-    │ TCP 3389 (TLS)
-    ▼
-nanokvm-rdp-gateway ───── TCP 3390 control ─────▶ nanokvm-agent
-    │                                                    │
-    │ ◀──────── UDP 5004 RTP/H.264 ──────────────────────┘
-    ▼
-RDP bitmap updates                                  NanoKVM capture + USB HID
+RDP client ── TCP 3389/TLS ──▶ Go gateway + C/FreeRDP shim
+                                  │
+                 TCP 3390 control│       UDP 5004 RTP/H.264
+                                  │◀──────────────────────── nanokvm-agent
+                                  │                         │
+                                  ▼                         ▼
+                         RDP bitmap/H.264          NanoKVM capture + USB HID
 ```
 
 ## Transport and recovery
@@ -45,8 +44,9 @@ The binary control protocol includes `HELLO`, `START_STREAM`, `STOP_STREAM`, `ID
 
 - CMake 3.24 or later
 - A C11 compiler and POSIX threads
-- A FreeRDP source tree when building the gateway
-- FFmpeg runtime libraries available to the gateway
+- Go 1.23 or later with cgo enabled
+- An installed FreeRDP 3 development package exporting `freerdp3`, `freerdp-server3`, and `winpr3` through pkg-config
+- FFmpeg available to the gateway at runtime
 - NanoKVM runtime libraries, including `libkvm.so`, available to the agent at runtime
 
 ## Build and test
@@ -70,15 +70,16 @@ cmake -S . -B build/agent -G 'Unix Makefiles' \
 cmake --build build/agent --target nanokvm-agent --parallel 4
 ```
 
-Build the gateway. `NANOKVM_RDP_FREERDP_DIR` must point to a FreeRDP source tree; it is deliberately not hard-coded in this repository.
+Build the gateway against an installed FreeRDP development package. The package must be discoverable by CMake and pkg-config; the latter is used by cgo.
 
 ```sh
 cmake -S . -B build/gateway -G 'Unix Makefiles' \
-  -DNANOKVM_RDP_FREERDP_DIR=/path/to/FreeRDP
+  -DCMAKE_PREFIX_PATH=/path/to/freerdp \
+  -DNANOKVM_RDP_USE_INSTALLED_FREERDP=ON
 cmake --build build/gateway --target nanokvm-rdp-gateway --parallel 4
 ```
 
-For a cross-compiled gateway, also set `-DNANOKVM_RDP_OPENSSL_ROOT=/path/to/openssl-prefix` when needed by the toolchain.
+The CMake target deliberately passes `go build -a` for a clean release-style binary. The shim and its shared C headers live beside the Go package, so ordinary Go builds also track their changes through cgo.
 
 ## Run
 
@@ -113,7 +114,7 @@ While running, the agent sends one unit of relative HID mouse motion every five 
   -width 1920 -height 1080 -bitrate 3000
 ```
 
-The gateway's default render size is 1920×1080 and its default bitrate is 3000. Use the same control and video port values on both sides.
+The gateway's default render size is 1920×1080. `-bitrate` remains a CLI compatibility option; the agent controls the encoder bitrate. Use the same control and video port values on both sides.
 
 ## Deployment
 
@@ -129,7 +130,8 @@ Do not run this agent simultaneously with the device's existing FoldVNC or stock
 ## Project layout
 
 ```text
-src/       Gateway, agent, RTP/H.264, HID, and protocol implementation
+src/       Agent, RTP/H.264, HID, and protocol implementation
+cmd/       Go gateway, FreeRDP C shim, and gateway-local shared C headers
 tests/     Local unit and RTP loopback tests
 deploy/    NanoKVM init scripts
 cmake/     Toolchain configuration
