@@ -23,7 +23,7 @@ RUN git clone --branch "${FREERDP_VERSION}" --depth 1 https://github.com/FreeRDP
 RUN cmake -S freerdp -B build/freerdp \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/freerdp \
-        -DBUILD_SHARED_LIBS=OFF \
+        -DBUILD_SHARED_LIBS=ON \
         -DWITH_SERVER=ON \
         -DWITH_CLIENT=OFF \
         -DWITH_SAMPLE=OFF \
@@ -69,7 +69,7 @@ ARG GO_VERSION=1.26.4
 RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz | tar -C /usr/local -xz
 ENV PATH=/usr/local/go/bin:${PATH}
 ENV PKG_CONFIG_PATH=/opt/freerdp/lib/pkgconfig
-ENV CGO_LDFLAGS="/opt/freerdp/lib/freerdp3/objects-Release/rdpgfx-server/rdpgfx_main.c.o /opt/freerdp/lib/freerdp3/objects-Release/rdpgfx-server/__/rdpgfx_common.c.o /usr/lib/x86_64-linux-gnu/libssl.a /usr/lib/x86_64-linux-gnu/libcrypto.a"
+ENV LD_LIBRARY_PATH=/opt/freerdp/lib
 RUN CGO_ENABLED=1 go build -o /usr/local/bin/nanokvm-rdp-gateway ./go/cmd/nanokvm-rdp-gateway
 
 FROM debian:bookworm-slim
@@ -82,6 +82,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/nanokvm-rdp-gateway /usr/local/bin/nanokvm-rdp-gateway
+COPY --from=builder /opt/freerdp/lib/libfreerdp*.so* /opt/freerdp/lib/libwinpr*.so* /usr/local/lib/
+ENV LD_LIBRARY_PATH=/usr/local/lib
 
 EXPOSE 3389/tcp 3390/tcp 5004/udp
 
