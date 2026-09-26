@@ -32,6 +32,7 @@ type fakeSession struct {
 }
 
 func (f *fakeSession) Submit(frame Frame) error { return f.submit(frame) }
+func (f *fakeSession) Controls() <-chan Control { return nil }
 func (f *fakeSession) emit(input Input) {
 	if f.onInput != nil {
 		f.onInput(input)

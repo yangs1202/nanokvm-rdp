@@ -5,6 +5,12 @@ package rdp
 type Session interface {
 	Submit(Frame) error
 	Close() error
+	Controls() <-chan Control
+}
+
+type Control struct {
+	Type    byte
+	Payload []byte
 }
 
 type FrameKind byte

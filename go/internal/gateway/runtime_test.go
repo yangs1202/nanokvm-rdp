@@ -65,7 +65,8 @@ func (s *recordingSession) Submit(frame rdp.Frame) error {
 	return nil
 }
 
-func (s *recordingSession) Close() error { return nil }
+func (s *recordingSession) Controls() <-chan rdp.Control { return nil }
+func (s *recordingSession) Close() error                 { return nil }
 
 func TestRuntimeSubmitsPublishedFrameToRDP(t *testing.T) {
 	session := &recordingSession{inputs: make(chan rdp.Input, 1)}
