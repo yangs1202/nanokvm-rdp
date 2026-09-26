@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"net"
 
 	"github.com/yangs1202/nanokvm-rdp/go/go/internal/control"
@@ -86,4 +87,20 @@ func (rt *Runtime) Close() {
 	if rt.video != nil {
 		_ = rt.video.Close()
 	}
+}
+
+func Run(ctx context.Context, cfg Config) error {
+	controlListener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", cfg.BindAddress, cfg.ControlPort))
+	if err != nil {
+		return fmt.Errorf("listen control: %w", err)
+	}
+	video, err := net.ListenPacket("udp", fmt.Sprintf(":%d", cfg.VideoPort))
+	if err != nil {
+		_ = controlListener.Close()
+		return fmt.Errorf("listen video: %w", err)
+	}
+	rt := NewRuntime(RuntimeConfig{Control: controlListener, Video: video})
+	defer rt.Close()
+	<-ctx.Done()
+	return nil
 }
