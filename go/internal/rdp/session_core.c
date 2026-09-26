@@ -1865,10 +1865,10 @@ NanokvmRdpSession* nanokvm_session_start(const NanokvmRdpConfig* config, const N
 	NanokvmRdpSession* session = calloc(1, sizeof(*session));
 	if (!session)
 		return NULL;
-	session->server.config.bind_address = config->bind_address;
+	session->server.config.bind_address = config->bind_address ? strdup(config->bind_address) : NULL;
 	session->server.config.port = config->port;
-	session->server.config.certificate = config->certificate;
-	session->server.config.private_key = config->private_key;
+	session->server.config.certificate = config->certificate ? strdup(config->certificate) : NULL;
+	session->server.config.private_key = config->private_key ? strdup(config->private_key) : NULL;
 	session->server.config.width = config->width;
 	session->server.config.height = config->height;
 	session->server.config.direct_gfx = config->direct_gfx;
@@ -1876,6 +1876,10 @@ NanokvmRdpSession* nanokvm_session_start(const NanokvmRdpConfig* config, const N
 	session->server.hooks = *hooks;
 	session->server.control_fd = -1;
 	session->server.control_listener = -1;
+	if ((config->bind_address && !session->server.config.bind_address) ||
+	    (config->certificate && !session->server.config.certificate) ||
+	    (config->private_key && !session->server.config.private_key))
+		goto fail;
 	if (!InitializeCriticalSectionAndSpinCount(&session->server.lock, 4000) ||
 	    !InitializeCriticalSectionAndSpinCount(&session->server.control_lock, 4000) ||
 	    !InitializeCriticalSectionAndSpinCount(&session->server.key_ack_lock, 4000) ||
@@ -1937,5 +1941,8 @@ void nanokvm_session_stop(NanokvmRdpSession* session)
 	DeleteCriticalSection(&session->server.key_ack_lock);
 	DeleteCriticalSection(&session->server.control_lock);
 	DeleteCriticalSection(&session->server.lock);
+	free((void*)session->server.config.bind_address);
+	free((void*)session->server.config.certificate);
+	free((void*)session->server.config.private_key);
 	free(session);
 }

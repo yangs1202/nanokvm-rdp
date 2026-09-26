@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"time"
 	"testing"
 )
 
@@ -44,6 +46,41 @@ func TestBridgeStartsWithCertificate(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestBridgeKeepsCertificateAfterCallerReleasesPaths(t *testing.T) {
+	dir := t.TempDir()
+	cert := filepath.Join(dir, "tls.crt")
+	key := filepath.Join(dir, "tls.key")
+	cmd := exec.Command("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-sha256", "-days", "1",
+		"-subj", "/CN=nanokvm-rdp-gateway-test", "-keyout", key, "-out", cert)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create test certificate: %v\n%s", err, output)
+	}
+
+	config := Config{
+		BindAddress: "127.0.0.1",
+		Port:        freePort(t),
+		Certificate: cert,
+		PrivateKey:  key,
+		Width:       64,
+		Height:      64,
+		DirectGFX:   true,
+	}
+	session, err := Start(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	config.Certificate = ""
+	config.PrivateKey = ""
+
+	client, err := net.Dial("tcp", net.JoinHostPort(config.BindAddress, strconv.Itoa(int(config.Port))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	time.Sleep(300 * time.Millisecond)
 }
 
 func freePort(t *testing.T) uint16 {
