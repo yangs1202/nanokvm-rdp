@@ -127,6 +127,7 @@ struct Client
 	HANDLE vcm;
 	RdpgfxServerContext* gfx;
 	HANDLE video_thread;
+	HANDLE bitmap_thread;
 	HANDLE bitmap_ready_event;
 	RFX_CONTEXT* rfx;
 	NSC_CONTEXT* nsc;
@@ -134,6 +135,7 @@ struct Client
 	BITMAP_INTERLEAVED_CONTEXT* interleaved;
 	wStream* bitmap_stream;
 	CRITICAL_SECTION lock;
+	CRITICAL_SECTION transport_lock;
 	uint8_t* pending_bitmap;
 	size_t pending_bitmap_length;
 	uint8_t* bitmap_queue[BITMAP_QUEUE_CAPACITY];
@@ -936,18 +938,23 @@ static bool client_flush_pending_bitmap(Client* client)
 	                                       : BITMAP_FRAME_INTERVAL_MS;
 	if (client->bitmap_ready_event)
 		(void)ResetEvent(client->bitmap_ready_event);
+	EnterCriticalSection(&client->transport_lock);
 	if (client->peer && client->peer->IsWriteBlocked && client->peer->DrainOutputBuffer &&
 	    client->peer->IsWriteBlocked(client->peer))
 	{
 		(void)client->peer->DrainOutputBuffer(client->peer);
 		if (client->peer->IsWriteBlocked(client->peer))
+		{
+			LeaveCriticalSection(&client->transport_lock);
 			return true;
+		}
 	}
 	EnterCriticalSection(&client->lock);
 	client->bitmap_flushes++;
 	if (client->gfx_uses_progressive && frame_flow_blocked(&client->frame_flow))
 	{
 		LeaveCriticalSection(&client->lock);
+		LeaveCriticalSection(&client->transport_lock);
 		return true;
 	}
 	/* Retain the latest frame even if capture stops while the client is decoding. */
@@ -972,6 +979,7 @@ static bool client_flush_pending_bitmap(Client* client)
 		LeaveCriticalSection(&client->lock);
 		for (size_t index = 0; index < stale_count; index++)
 			free(stale[index]);
+		LeaveCriticalSection(&client->transport_lock);
 		return true;
 	}
 	if (client->bitmap_last_send_started_at != 0 &&
@@ -980,6 +988,7 @@ static bool client_flush_pending_bitmap(Client* client)
 		LeaveCriticalSection(&client->lock);
 		for (size_t index = 0; index < stale_count; index++)
 			free(stale[index]);
+		LeaveCriticalSection(&client->transport_lock);
 		return true;
 	}
 	const uint8_t newest_slot = (uint8_t)((client->bitmap_queue_head +
@@ -1014,6 +1023,7 @@ static bool client_flush_pending_bitmap(Client* client)
 	{
 		log_message("ERROR", "RDP bitmap queue가 비어 있지 않은데 frame buffer가 없습니다");
 		client_stop(client);
+		LeaveCriticalSection(&client->transport_lock);
 		return false;
 	}
 
@@ -1046,9 +1056,47 @@ static bool client_flush_pending_bitmap(Client* client)
 		log_message("ERROR", "RDP bitmap frame 전송 실패");
 		client_stop(client);
 	}
+	LeaveCriticalSection(&client->transport_lock);
 	return sent;
 }
 
+
+static DWORD WINAPI bitmap_send_thread(LPVOID argument)
+{
+	Client* client = (Client*)argument;
+	while (!client_should_stop(client))
+	{
+		if (!client->bitmap_fallback_active)
+		{
+			(void)Sleep(5);
+			continue;
+		}
+		if (!client_flush_pending_bitmap(client))
+		{
+			client_stop(client);
+			break;
+		}
+		EnterCriticalSection(&client->lock);
+		const bool pending = client->bitmap_queue_count > 0;
+		const bool waiting = client->gfx_uses_progressive && frame_flow_blocked(&client->frame_flow);
+		const uint64_t last = client->bitmap_last_send_started_at;
+		LeaveCriticalSection(&client->lock);
+		DWORD wait_ms = 20;
+		if (pending && !waiting)
+		{
+			const uint64_t interval = client->gfx_uses_progressive
+			                              ? PROGRESSIVE_MIN_SEND_INTERVAL_MS
+			                              : BITMAP_FRAME_INTERVAL_MS;
+			const uint64_t now = monotonic_milliseconds();
+			wait_ms = last == 0 || now - last >= interval
+			              ? 0
+			              : WINPR_ASSERTING_INT_CAST(DWORD, interval - (now - last));
+		}
+		if (wait_ms > 0 && client->bitmap_ready_event)
+			(void)WaitForSingleObject(client->bitmap_ready_event, wait_ms);
+	}
+	return 0;
+}
 
 static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 {
@@ -1314,7 +1362,8 @@ static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 {
 	Client* client = (Client*)context;
 	Server* server = (Server*)peer->ContextExtra;
-	if (!server || !InitializeCriticalSectionAndSpinCount(&client->lock, 4000))
+	if (!server || !InitializeCriticalSectionAndSpinCount(&client->lock, 4000) ||
+	    !InitializeCriticalSectionAndSpinCount(&client->transport_lock, 4000))
 		return FALSE;
 	client->server = server;
 	client->peer = peer;
@@ -1364,6 +1413,13 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 		(void)WaitForSingleObject(client->video_thread, 3000);
 		(void)CloseHandle(client->video_thread);
 	}
+	if (client->bitmap_thread)
+	{
+		if (client->bitmap_ready_event)
+			(void)SetEvent(client->bitmap_ready_event);
+		(void)WaitForSingleObject(client->bitmap_thread, 3000);
+		(void)CloseHandle(client->bitmap_thread);
+	}
 	if (client->bitmap_ready_event)
 		(void)CloseHandle(client->bitmap_ready_event);
 	if (client->gfx)
@@ -1395,6 +1451,7 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 			client->server->active = NULL;
 		LeaveCriticalSection(&client->server->lock);
 	}
+	DeleteCriticalSection(&client->transport_lock);
 	DeleteCriticalSection(&client->lock);
 	log_message("INFO", "RDP client 연결 종료 및 USB HID release 완료");
 }
@@ -1428,6 +1485,12 @@ static bool client_prepare_bitmap(Client* client)
 			return false;
 	}
 	client->bitmap_fallback_active = true;
+	if (!client->bitmap_thread)
+	{
+		client->bitmap_thread = CreateThread(NULL, 0, bitmap_send_thread, client, 0, NULL);
+		if (!client->bitmap_thread)
+			return false;
+	}
 	client->bitmap_uses_rfx = bitmap_stream_rfx_supported(settings);
 	if (client->bitmap_uses_rfx)
 	{
@@ -1634,40 +1697,13 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 			break;
 		if (client->direct_gfx_active)
 			handles[count++] = WTSVirtualChannelManagerGetEventHandle(client->vcm);
-		if (client->bitmap_fallback_active && client->bitmap_ready_event)
-			handles[count++] = client->bitmap_ready_event;
-		DWORD timeout = 20;
-		if (client->bitmap_fallback_active)
-		{
-			EnterCriticalSection(&client->lock);
-			const bool bitmap_pending = client->bitmap_queue_count > 0;
-			const bool waiting_for_ack = client->gfx_uses_progressive &&
-			                             frame_flow_blocked(&client->frame_flow);
-			const uint64_t last_send_started_at = client->bitmap_last_send_started_at;
-			LeaveCriticalSection(&client->lock);
-			const uint64_t interval = client->gfx_uses_progressive
-			                              ? PROGRESSIVE_MIN_SEND_INTERVAL_MS : BITMAP_FRAME_INTERVAL_MS;
-			if (bitmap_pending && !waiting_for_ack)
-			{
-				const uint64_t now = monotonic_milliseconds();
-				if (last_send_started_at == 0 ||
-				    now - last_send_started_at >= interval)
-					timeout = 0;
-				else
-					timeout = WINPR_ASSERTING_INT_CAST(
-					    DWORD, interval - (now - last_send_started_at));
-			}
-		}
-		/* A blocked transport must wait for socket readiness, never spin on a due frame. */
-		if (timeout == 0 && peer->IsWriteBlocked && peer->IsWriteBlocked(peer))
-			timeout = 20;
-		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, timeout);
+		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, 20);
 		if (status == WAIT_FAILED)
 			break;
-		/* Read key/button releases before spending time encoding the next frame. */
-		if (!peer->CheckFileDescriptor(peer))
-			break;
-		if (client->bitmap_fallback_active && !client_flush_pending_bitmap(client))
+		EnterCriticalSection(&client->transport_lock);
+		const BOOL input_ok = peer->CheckFileDescriptor(peer);
+		LeaveCriticalSection(&client->transport_lock);
+		if (!input_ok)
 			break;
 		if (client->direct_gfx_active &&
 		    (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client)))
