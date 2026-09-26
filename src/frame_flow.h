@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define FRAME_FLOW_LIMIT 3U
+#define FRAME_FLOW_LIMIT 1U
 
 typedef struct
 {
