@@ -2,6 +2,14 @@ package rdp
 
 import "testing"
 
+func TestBridgeBindsWithoutCertificate(t *testing.T) {
+	session, err := Start(Config{BindAddress: "127.0.0.1", Port: 0, Width: 64, Height: 64}, nil)
+	if err == nil {
+		_ = session.Close()
+		t.Fatal("port 0 should not start a listener")
+	}
+}
+
 func TestFakeSessionSubmitsBitmapAndInput(t *testing.T) {
 	var frames int
 	var keys int

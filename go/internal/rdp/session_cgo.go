@@ -2,7 +2,7 @@ package rdp
 
 /*
 #cgo pkg-config: freerdp3 freerdp-server3
-#cgo CFLAGS: -Wall -Wextra
+#cgo CFLAGS: -Wall -Wextra -Wno-deprecated-declarations
 #include "bridge.h"
 #include <stdlib.h>
 
