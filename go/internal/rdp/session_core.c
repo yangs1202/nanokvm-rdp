@@ -127,6 +127,7 @@ struct Client
 	HANDLE vcm;
 	RdpgfxServerContext* gfx;
 	HANDLE video_thread;
+	HANDLE bitmap_thread;
 	HANDLE bitmap_ready_event;
 	RFX_CONTEXT* rfx;
 	NSC_CONTEXT* nsc;
@@ -1052,6 +1053,43 @@ static bool client_flush_pending_bitmap(Client* client)
 }
 
 
+static DWORD WINAPI bitmap_send_thread(LPVOID argument)
+{
+	Client* client = (Client*)argument;
+	while (!client_should_stop(client))
+	{
+		if (!client->bitmap_fallback_active)
+		{
+			(void)Sleep(5);
+			continue;
+		}
+		if (!client_flush_pending_bitmap(client))
+		{
+			client_stop(client);
+			break;
+		}
+		EnterCriticalSection(&client->lock);
+		const bool pending = client->bitmap_queue_count > 0;
+		const bool waiting = client->gfx_uses_progressive && frame_flow_blocked(&client->frame_flow);
+		const uint64_t last = client->bitmap_last_send_started_at;
+		LeaveCriticalSection(&client->lock);
+		DWORD wait_ms = 20;
+		if (pending && !waiting)
+		{
+			const uint64_t interval = client->gfx_uses_progressive
+			                              ? PROGRESSIVE_MIN_SEND_INTERVAL_MS
+			                              : BITMAP_FRAME_INTERVAL_MS;
+			const uint64_t now = monotonic_milliseconds();
+			wait_ms = last == 0 || now - last >= interval
+			              ? 0
+			              : WINPR_ASSERTING_INT_CAST(DWORD, interval - (now - last));
+		}
+		if (wait_ms > 0 && client->bitmap_ready_event)
+			(void)WaitForSingleObject(client->bitmap_ready_event, wait_ms);
+	}
+	return 0;
+}
+
 static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 {
 	Client* client = (Client*)input->context;
@@ -1366,6 +1404,13 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 		(void)WaitForSingleObject(client->video_thread, 3000);
 		(void)CloseHandle(client->video_thread);
 	}
+	if (client->bitmap_thread)
+	{
+		if (client->bitmap_ready_event)
+			(void)SetEvent(client->bitmap_ready_event);
+		(void)WaitForSingleObject(client->bitmap_thread, 3000);
+		(void)CloseHandle(client->bitmap_thread);
+	}
 	if (client->bitmap_ready_event)
 		(void)CloseHandle(client->bitmap_ready_event);
 	if (client->gfx)
@@ -1430,6 +1475,12 @@ static bool client_prepare_bitmap(Client* client)
 			return false;
 	}
 	client->bitmap_fallback_active = true;
+	if (!client->bitmap_thread)
+	{
+		client->bitmap_thread = CreateThread(NULL, 0, bitmap_send_thread, client, 0, NULL);
+		if (!client->bitmap_thread)
+			return false;
+	}
 	client->bitmap_uses_rfx = bitmap_stream_rfx_supported(settings);
 	if (client->bitmap_uses_rfx)
 	{
