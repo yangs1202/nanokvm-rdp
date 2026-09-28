@@ -724,14 +724,6 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 
 	const uint64_t send_started = monotonic_milliseconds();
 	EnterCriticalSection(&client->lock);
-	/* Register before submission: the ACK callback can run during the send. */
-	const bool tracked = frame_flow_sent(&client->frame_flow, start.frameId, send_started);
-	if (!tracked)
-	{
-		client->need_idr = true;
-		LeaveCriticalSection(&client->lock);
-		return true;
-	}
 	frame_trace_sent(&client->frame_trace, start.frameId, ssrc, rtp_timestamp, received_at, send_started);
 	LeaveCriticalSection(&client->lock);
 	if (!client->gfx || !client->gfx->SurfaceFrameCommand)
@@ -785,8 +777,6 @@ static DWORD WINAPI video_thread(LPVOID argument)
 	(void)snprintf(buffer_message, sizeof(buffer_message), "RTP receive buffer bytes=%d", rtp.receive_buffer_bytes);
 	log_message("INFO", buffer_message);
 	uint32_t observed_losses = 0;
-	bool draining = false;
-	uint64_t recovery_requested_at = 0;
 	while (!client_should_stop(client))
 	{
 		uint8_t* data = NULL;
@@ -831,46 +821,6 @@ static DWORD WINAPI video_thread(LPVOID argument)
 			client->rtp_idr_units++;
 		if (p_frame)
 			client->rtp_p_units++;
-		/* Keep consuming RTP while congested; dropping a reference frame means
-		 * all subsequent P frames must be discarded until a fresh IDR. */
-		EnterCriticalSection(&client->lock);
-		const bool congested = frame_flow_avc_blocked(&client->frame_flow);
-		const unsigned pending = client->frame_flow.count;
-		const uint32_t queue_bytes = client->frame_flow.queue_bytes;
-		if (congested) client->need_idr = true;
-		LeaveCriticalSection(&client->lock);
-		if (congested && !draining)
-		{
-			draining = true;
-			recovery_requested_at = 0;
-			char detail[160];
-			(void)snprintf(detail, sizeof(detail),
-			               "AVC420 congestion: pending=%u queue_bytes=%u; draining before IDR", pending, queue_bytes);
-			log_message("INFO", detail);
-		}
-		if (draining)
-		{
-			if (pending != 0)
-			{
-				free(data);
-				continue;
-			}
-			if (recovery_requested_at == 0 || received_at - recovery_requested_at >= 1000U)
-			{
-				(void)server_send_control(client->server, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
-				recovery_requested_at = received_at;
-				/* This frame predates the request, even if it is an IDR. */
-				free(data);
-				continue;
-			}
-			if (!idr)
-			{
-				free(data);
-				continue;
-			}
-			draining = false;
-			log_message("INFO", "AVC420 congestion recovery: resuming from IDR");
-		}
 		bool need_idr = true;
 		EnterCriticalSection(&client->lock);
 		need_idr = client->need_idr;
