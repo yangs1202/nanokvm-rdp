@@ -85,6 +85,27 @@ int main(void)
 	assert(frame_flow_interval(&flow) > 20);
 	assert(!frame_flow_ack(&flow, 100, 1000000, 28000, &elapsed));
 	assert(!flow.suspended && frame_flow_interval(&flow) >= 40);
+	/* AVC420 limits in-flight frames and queued bytes independently. */
+	flow = (FrameFlow){ 0 };
+	assert(!frame_flow_avc_blocked(&flow));
+	assert(frame_flow_sent(&flow, 1, 100));
+	assert(frame_flow_sent(&flow, 2, 116));
+	assert(frame_flow_sent(&flow, 3, 132));
+	assert(frame_flow_avc_blocked(&flow));
+	assert(frame_flow_ack(&flow, 1, 20U * 1024U - 1U, 140, &elapsed));
+	assert(!frame_flow_avc_blocked(&flow));
+	assert(frame_flow_ack(&flow, 2, 20U * 1024U, 150, &elapsed));
+	assert(frame_flow_avc_blocked(&flow));
+	/* Duplicate/stale ACK cannot clear valid congestion feedback. */
+	assert(!frame_flow_ack(&flow, 2, 0, 151, &elapsed));
+	assert(frame_flow_avc_blocked(&flow));
+	/* Final ACK need not contain zero bytes to allow IDR recovery. */
+	assert(frame_flow_ack(&flow, 3, 40000, 160, &elapsed));
+	assert(!frame_flow_avc_blocked(&flow));
+	assert(frame_flow_sent(&flow, 4, 170));
+	assert(!frame_flow_avc_blocked(&flow));
+	assert(!frame_flow_ack(&flow, 4, UINT32_MAX, 180, &elapsed));
+	assert(!frame_flow_avc_blocked(&flow) && flow.queue_bytes == 0);
 	puts("Frame flow: slow client, duplicate/out-of-order ACK, suspend/resume and wrap passed");
 	return 0;
 }

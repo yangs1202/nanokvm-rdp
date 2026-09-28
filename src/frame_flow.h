@@ -18,6 +18,7 @@ typedef struct
 	unsigned fast_acks;
 	unsigned fast_sends;
 	uint64_t last_slow_at;
+	uint32_t queue_bytes;
 	unsigned count;
 	uint32_t ids[FRAME_FLOW_LIMIT];
 	uint64_t sent_at[FRAME_FLOW_LIMIT];
@@ -68,6 +69,14 @@ static inline bool frame_flow_blocked(const FrameFlow* flow)
 	return !flow->suspended && flow->count == FRAME_FLOW_LIMIT;
 }
 
+/* A final ACK can report stale queue bytes: with no tracked frames left,
+ * waiting for another queue report would deadlock the stream. */
+static inline bool frame_flow_avc_blocked(const FrameFlow* flow)
+{
+	return !flow->suspended && (frame_flow_blocked(flow) ||
+	       (flow->count > 0 && flow->queue_bytes >= 20U * 1024U));
+}
+
 static inline bool frame_flow_sent(FrameFlow* flow, uint32_t id, uint64_t now)
 {
 	if (flow->suspended) return true;
@@ -93,6 +102,7 @@ static inline bool frame_flow_ack(FrameFlow* flow, uint32_t id, uint32_t depth,
 		flow->fast_sends = 0;
 		flow->last_slow_at = 0;
 		flow->count = 0;
+		flow->queue_bytes = 0;
 		return false;
 	}
 	flow->suspended = false;
@@ -103,6 +113,7 @@ static inline bool frame_flow_ack(FrameFlow* flow, uint32_t id, uint32_t depth,
 		if (flow->ids[i] != id) continue;
 		*elapsed = now - flow->sent_at[i];
 		flow->have_ack = true;
+		flow->queue_bytes = depth;
 		if (*elapsed > 120U) frame_flow_slow(flow, now);
 		else if (depth == 0 && *elapsed <= 60U)
 		{
@@ -116,6 +127,7 @@ static inline bool frame_flow_ack(FrameFlow* flow, uint32_t id, uint32_t depth,
 		}
 		else flow->fast_acks = 0;
 		flow->count--;
+		if (flow->count == 0) flow->queue_bytes = 0;
 		for (unsigned j = i; j < flow->count; j++)
 		{
 			flow->ids[j] = flow->ids[j + 1];
