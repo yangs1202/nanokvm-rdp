@@ -1,0 +1,124 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>NanoKVM video latency pattern</title>
+<style>
+body{margin:0;background:#111;color:#fff;font:24px monospace}header{padding:20px}button{font:inherit}canvas{display:block;width:100%;height:auto}#status{font-size:18px}
+</style>
+<header>NanoKVM latency — source pattern <button id="start">Start / resync</button><div id="status">Click Start. Keep this tab visible.</div></header>
+<canvas width="1600" height="760" id="pattern"></canvas>
+<script>
+'use strict';
+const canvas=document.querySelector('canvas'), ctx=canvas.getContext('2d');
+const status=document.querySelector('#status');
+const runId=new URLSearchParams(location.search).get('run_id');
+let calibration=null, sequence=0, running=false, last=0, startReported=false, endReported=false, runOperation=false, runInvalidated=false;
+async function sync(phase){
+  const samples=[];
+  for(let i=0;i<20;i++){
+    const t0=performance.now(), url='/1/clock?n='+i;
+    const response=await fetch(url,{cache:'no-store'});
+    const raw=await response.text();
+    const t3=performance.now(), s=JSON.parse(raw);
+    const lower=s.sent-t3, upper=s.received-t0;
+    if(upper<lower) continue;
+    samples.push({sample_index:i,
+      request:{url,local_before_ms:t0},
+      response:{status:response.status,body:raw,server_received_ms:s.received,server_sent_ms:s.sent},
+      local_after_ms:t3,
+      offset_interval_server_minus_source_ms:[lower,upper],
+      offset_server_minus_source_ms:(lower+upper)/2,
+      sync_error_ms:(upper-lower)/2,round_trip_ms:t3-t0});
+  }
+  if(!samples.length) throw Error('No valid calibration');
+  const best=samples.reduce((a,b)=>a.sync_error_ms<=b.sync_error_ms?a:b);
+  calibration={offset:best.offset_server_minus_source_ms,error:best.sync_error_ms,at:best.local_after_ms};
+  if(!phase) {
+    status.textContent=`Clock uncertainty ±${best.sync_error_ms.toFixed(2)} ms; RTT ${best.round_trip_ms.toFixed(2)} ms. Pattern 30 Hz; resync after run.`;
+    return;
+  }
+  return {schema_version:1,run_id:runId,phase,source_clock:'browser performance.now() milliseconds',
+    calibration_started_source_ms:samples[0].request.local_before_ms,
+    calibration_completed_source_ms:samples[samples.length-1].local_after_ms,
+    calibration_started_server_ms:samples[0].request.local_before_ms+best.offset_server_minus_source_ms,
+    calibration_completed_server_ms:samples[samples.length-1].local_after_ms+best.offset_server_minus_source_ms,
+    selected_sample_index:best.sample_index,
+    offset_server_minus_source_ms:best.offset_server_minus_source_ms,
+    sync_error_ms:best.sync_error_ms,
+    offset_interval_server_minus_source_ms:best.offset_interval_server_minus_source_ms,
+    samples};
+}
+async function reportCalibration(report){
+  const response=await fetch(`/1/runs/${encodeURIComponent(runId)}/calibrations`,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify(report)});
+  if(!response.ok) throw Error(`calibration report rejected (${response.status})`);
+}
+async function invalidateRun(reason){
+  if(!runId||runInvalidated) return;
+  runInvalidated=true; running=false;
+  try {
+    await fetch(`/1/runs/${encodeURIComponent(runId)}/invalidate`,{method:'POST',cache:'no-store',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason})});
+  } catch(_) { /* The visible status still records that this source must not continue. */ }
+}
+async function observeRun(){
+  if(!runId||endReported||runInvalidated||runOperation) return;
+  runOperation=true;
+  try {
+    const response=await fetch(`/1/runs/${encodeURIComponent(runId)}`,{cache:'no-store'});
+    if(response.status===404) return;
+    if(!response.ok) throw Error(`run state unavailable (${response.status})`);
+    const run=await response.json();
+    if(run.status==='invalidated'){ running=false; runInvalidated=true; status.textContent=`Run ${runId} invalidated: ${run.invalidation?.reason||'unknown reason'}.`; return; }
+    if(run.status==='start_requested'&&!startReported){
+      running=false; status.textContent=`Run ${runId}: calibrating source clock at start…`;
+      await reportCalibration(await sync('start'));
+      startReported=true; running=true; requestAnimationFrame(draw);
+      status.textContent=`Run ${runId}: source clock start calibrated; collecting.`;
+    } else if(run.status==='end_requested'&&startReported&&!endReported){
+      running=false; status.textContent=`Run ${runId}: calibrating source clock at end…`;
+      await reportCalibration(await sync('end'));
+      endReported=true; status.textContent=`Run ${runId}: source clock start/end calibration recorded.`;
+    }
+  } catch(error) { status.textContent=`Run calibration failed: ${error.message}`; await invalidateRun('source_calibration_failure'); }
+  finally { runOperation=false; }
+}
+function draw(t){
+  if(!running)return;
+  if(t-last>=1000/30){
+    last=t;
+    const now=performance.now();
+    const stamp=Math.round(now+calibration.offset);
+    sequence++;
+    ctx.fillStyle='#111';ctx.fillRect(0,0,1600,760);
+    ctx.fillStyle='#fff';ctx.font='bold 105px monospace';
+    ctx.fillText(String(stamp),35,155);
+    ctx.font='52px monospace';ctx.fillText('FRAME '+sequence,35,255);
+    ctx.fillText('SYNC +/- '+calibration.error.toFixed(2)+' ms',35,335);
+    ctx.fillText('AGE '+((now-calibration.at)/1000).toFixed(1)+' s',35,410);
+    for(let bit=0;bit<32;bit++){
+      const on=(sequence>>>bit)&1;
+      ctx.fillStyle=on?'#fff':'#000';ctx.fillRect(32+bit*48,470,44,90);
+      ctx.fillStyle=on?'#000':'#fff';ctx.fillRect(32+bit*48,565,44,90);
+    }
+    ctx.fillStyle=sequence%2?'#008cff':'#ffa000';ctx.fillRect(32,680,1536,50);
+  }
+  requestAnimationFrame(draw);
+}
+document.querySelector('#start').onclick=async()=>{
+  if(runId){
+    await invalidateRun('manual_resync_during_formal_run');
+    status.textContent=`Run ${runId} invalidated: manual resync is not allowed during formal collection.`;
+    return;
+  }
+  running=false;
+  try{await sync();running=true;requestAnimationFrame(draw)}
+  catch(e){status.textContent='Clock sync failed: '+e.message}
+};
+document.addEventListener('visibilitychange',()=>{if(document.hidden){
+  running=false;
+  if(runId){ invalidateRun('source_tab_hidden_during_formal_run'); status.textContent=`Run ${runId} invalidated: source tab was hidden.`; }
+  else status.textContent='Paused: tab hidden. Click Start again.';
+}});
+if(runId){
+  status.textContent=`Run ${runId}: waiting for collector start request. Keep this tab visible.`;
+  setInterval(observeRun,250); observeRun();
+}
+</script>

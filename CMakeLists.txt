@@ -19,6 +19,16 @@ set(CMAKE_C_EXTENSIONS ON)
 
 if(NANOKVM_RDP_BUILD_TESTS)
   enable_testing()
+  add_executable(nanokvm-input-router-test tests/input_router_test.c src/input_router.c src/hid.c src/protocol.c)
+  target_include_directories(nanokvm-input-router-test PRIVATE src)
+  target_compile_options(nanokvm-input-router-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  add_test(NAME nanokvm-input-router-test COMMAND nanokvm-input-router-test)
+  add_executable(nanokvm-agent-transport-test tests/agent_transport_test.c src/agent_transport.c src/protocol.c)
+  target_include_directories(nanokvm-agent-transport-test PRIVATE src)
+  target_compile_options(nanokvm-agent-transport-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  target_link_libraries(nanokvm-agent-transport-test PRIVATE Threads::Threads)
+  add_test(NAME nanokvm-agent-transport-test COMMAND nanokvm-agent-transport-test)
+  set_tests_properties(nanokvm-agent-transport-test PROPERTIES TIMEOUT 10)
   add_executable(nanokvm-agent-send-test tests/agent_send_test.c src/hid.c src/h264.c src/protocol.c src/rtp_h264.c src/musl_compat.c)
   target_include_directories(nanokvm-agent-send-test PRIVATE src)
   target_compile_options(nanokvm-agent-send-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
@@ -78,6 +88,32 @@ if(NANOKVM_RDP_BUILD_TESTS)
   target_compile_options(nanokvm-rtp-client-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
   add_test(NAME nanokvm-rtp-client-test COMMAND nanokvm-rtp-client-test)
   set_tests_properties(nanokvm-rtp-client-test PROPERTIES TIMEOUT 10)
+
+  add_executable(nanokvm-video-source-test
+    tests/video_source_test.c
+    src/h264.c
+    src/video_source.c
+    src/rtp_client.c
+    src/rtp_h264.c
+  )
+  target_include_directories(nanokvm-video-source-test PRIVATE src)
+  target_compile_options(nanokvm-video-source-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  add_test(NAME nanokvm-video-source-test COMMAND nanokvm-video-source-test)
+  set_tests_properties(nanokvm-video-source-test PROPERTIES TIMEOUT 10)
+
+  add_executable(nanokvm-device-session-test
+    tests/device_session_test.c
+    src/h264.c
+    src/device_session.c
+    src/video_source.c
+    src/rtp_client.c
+    src/rtp_h264.c
+  )
+  target_include_directories(nanokvm-device-session-test PRIVATE src)
+  target_compile_options(nanokvm-device-session-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  target_link_libraries(nanokvm-device-session-test PRIVATE Threads::Threads)
+  add_test(NAME nanokvm-device-session-test COMMAND nanokvm-device-session-test)
+  set_tests_properties(nanokvm-device-session-test PROPERTIES TIMEOUT 10)
 
   add_executable(nanokvm-bitmap-diff-test tests/bitmap_diff_test.c)
   target_include_directories(nanokvm-bitmap-diff-test PRIVATE src)
@@ -157,6 +193,9 @@ if(NANOKVM_RDP_BUILD_SERVER)
   endif()
 
   add_executable(nanokvm-rdp-gateway
+    src/agent_transport.c
+    src/device_session.c
+    src/input_router.c
     src/main.c
     src/ffmpeg_decoder.c
     src/hid.c
@@ -164,6 +203,7 @@ if(NANOKVM_RDP_BUILD_SERVER)
     src/protocol.c
     src/rtp_h264.c
     src/rtp_client.c
+    src/video_source.c
   )
   target_include_directories(nanokvm-rdp-gateway PRIVATE src)
   if(NANOKVM_RDP_USE_INSTALLED_FREERDP)
@@ -177,7 +217,7 @@ if(NANOKVM_RDP_BUILD_SERVER)
     )
   endif()
   target_compile_options(nanokvm-rdp-gateway PRIVATE -Wall -Wextra -Werror -Wno-deprecated-declarations)
-  target_link_libraries(nanokvm-rdp-gateway PRIVATE freerdp-server freerdp winpr dl PkgConfig::FFMPEG)
+  target_link_libraries(nanokvm-rdp-gateway PRIVATE freerdp-server freerdp winpr dl Threads::Threads PkgConfig::FFMPEG)
 
   add_executable(nanokvm-rdp-vdec-probe
     tools/vdec_probe.c
