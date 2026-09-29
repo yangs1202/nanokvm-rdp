@@ -31,7 +31,13 @@ static bool send_for_epoch(AgentTransport* transport, int fd, uint64_t epoch, ui
 	if (is_current_locked(transport, fd, epoch))
 		send_fd = dup(fd);
 	(void)pthread_mutex_unlock(&transport->lock);
-	const bool sent = send_fd >= 0 && protocol_send(send_fd, type, payload, length);
+	bool sent = false;
+	if (send_fd >= 0)
+	{
+		if (transport->callbacks.send_started)
+			transport->callbacks.send_started(transport->callbacks.context, send_fd, epoch);
+		sent = protocol_send(send_fd, type, payload, length);
+	}
 	if (send_fd >= 0)
 		(void)close(send_fd);
 	(void)pthread_mutex_unlock(&transport->send_lock);

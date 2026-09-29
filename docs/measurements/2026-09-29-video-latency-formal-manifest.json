@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "id": "<run-id>",
+  "date": "<YYYY-MM-DD>",
+  "timezone": "Asia/Seoul",
+  "status": "template",
+  "kind": "formal_video_latency_ab_collection",
+  "eligible_for_regression_approval": false,
+  "comparison_role": "A or B; do not compare directly to 2026-09-29-video-latency preliminary data",
+  "source": {
+    "resolution": null,
+    "refresh_hz": null,
+    "device": null,
+    "browser": null
+  },
+  "video": {
+    "codec": null,
+    "bitrate_kbps": null,
+    "gop": null,
+    "fps": null
+  },
+  "client": {
+    "application": null,
+    "version": null,
+    "platform": null,
+    "window": null,
+    "capture_api": null
+  },
+  "network": {
+    "path": null,
+    "transport": null,
+    "rtt_ms": null,
+    "loss_percent": null,
+    "contention": null
+  },
+  "code_and_runtime": {
+    "repository_revision": null,
+    "working_tree_description": null,
+    "gateway_image_digest": null,
+    "gateway_binary_sha256": null,
+    "agent_binary_sha256": null
+  },
+  "capture_producer": {
+    "command": null,
+    "host": null,
+    "permission_status": null,
+    "timestamp_semantics_verified": null,
+    "known_limitations": null
+  },
+  "artifacts": {
+    "collector_json": null,
+    "capture_artifacts_location": null,
+    "analysis_json": null
+  }
+}

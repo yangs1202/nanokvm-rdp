@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "id": "2026-09-29-video-latency",
+  "date": "2026-09-29",
+  "timezone": "Asia/Seoul",
+  "status": "preliminary",
+  "eligible_for_regression_approval": false,
+  "requirement": "Post-refactoring performance must be equal or better at equal quality and matched conditions.",
+  "metric": "age of source draw timestamp visible in Windows App screenshot",
+  "method": "Computer Use screenshot; manually transcribed timestamp; capture call bracketed by Date.now()",
+  "source": "Windows PC connected to NanoKVM HDMI",
+  "client": "Windows App on macOS",
+  "gateway": "nanokvm-gw.yangs.sh",
+  "repository_revision_at_archival": "f374eabdc842105dfba1952324baadaad1f4a1c3",
+  "working_tree_dirty": true,
+  "preexisting_modified_files": [
+    "README.md",
+    "deploy/S100nanokvm-agent",
+    "src/agent.c"
+  ],
+  "deployed_gateway_revision": null,
+  "deployed_gateway_digest": null,
+  "deployed_agent_sha256": null,
+  "negotiated_codec": null,
+  "source_resolution": null,
+  "agent_bitrate_kbps": null,
+  "agent_gop": null,
+  "windows_app_version": null,
+  "network_path": null,
+  "sample_count": 20,
+  "source_sync_error_ms": 3.7,
+  "capture_window_median_ms": 68.5,
+  "capture_window_max_ms": 216,
+  "source_clock_drift_after_run_measured": false,
+  "server_minus_mac_wall_interval_ms_after_run": [
+    0.37744140625,
+    0.932861328125
+  ],
+  "ntp_reference": "ntp.yangs.sh",
+  "ntp_used_in_latency_calculation": false,
+  "screenshots": "Chat Computer Use outputs only; not exported to repository",
+  "artifacts": [
+    {
+      "path": "docs/measurements/2026-09-29-video-latency.csv",
+      "sha256": "b5f5c8dfc8f81f5a3f6fbdba3275e7ee09b15a7bbc57058f1dae63b67111e5a0"
+    },
+    {
+      "path": "docs/measurements/2026-09-29-video-latency.json",
+      "sha256": "7369f59211851a636a8b5696c98c976a98db033d8eb44af961dff33c8ac96d0b"
+    },
+    {
+      "path": "docs/measurements/2026-09-29-video-latency.md",
+      "sha256": "97c8fc47f02020482ee8f9fa4f67b48baf8a64672e9f00e50a0a9818765d4294"
+    },
+    {
+      "path": "tools/video-latency/server.py",
+      "sha256": "a91aba7a341b19d9dc1e880605557449ea64523ba3c772d7846a06e3b4ad4ce4"
+    },
+    {
+      "path": "tools/video-latency/pattern.html",
+      "sha256": "cd8a26f489309d1647385bd636387fbeff6da45ac68bf637ab818b0da42fb16b"
+    },
+    {
+      "path": "tools/video-latency/analyze.py",
+      "sha256": "fa73b27ee7ccafe6341f93f4c60f0cf79f155d920954128bd5dd7fde2ba2116c"
+    }
+  ],
+  "acceptance_procedure": "docs/measurements/README.md"
+}

@@ -20,12 +20,15 @@ typedef enum
 typedef void (*AgentTransportEventCallback)(void* context, AgentTransportEvent event,
 	                                         uint64_t epoch);
 typedef uint64_t (*AgentTransportClock)(void* context);
+typedef void (*AgentTransportSendStartedCallback)(void* context, int fd, uint64_t epoch);
 
 typedef struct
 {
 	AgentTransportEventCallback event;
 	AgentTransportClock clock;
 	void* context;
+	/* Optional observability hook called with the captured fd before sending. */
+	AgentTransportSendStartedCallback send_started;
 } AgentTransportCallbacks;
 
 typedef struct

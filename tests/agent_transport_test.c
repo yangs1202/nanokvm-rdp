@@ -1,6 +1,8 @@
 #include "agent_transport.h"
 
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <string.h>
@@ -13,6 +15,11 @@ typedef struct
 	atomic_uint disconnects;
 	atomic_uint timeouts;
 	atomic_uint_fast64_t last_epoch;
+	atomic_uint_fast64_t send_started_epoch;
+	atomic_int send_started_fd;
+	atomic_bool send_started;
+	pthread_mutex_t* send_started_lock;
+	pthread_cond_t* send_started_condition;
 } TestContext;
 
 typedef struct
@@ -34,6 +41,8 @@ typedef struct
 	AgentTransport* transport;
 	atomic_bool entered;
 	atomic_bool finished;
+	atomic_bool sent;
+	atomic_int error;
 } SendArgument;
 
 static uint64_t test_clock(void* context)
@@ -49,6 +58,17 @@ static void test_event(void* context, AgentTransportEvent event, uint64_t epoch)
 		(void)atomic_fetch_add(&test->disconnects, 1);
 	else if (event == AGENT_TRANSPORT_EVENT_HEARTBEAT_TIMEOUT)
 		(void)atomic_fetch_add(&test->timeouts, 1);
+}
+
+static void test_send_started(void* context, int fd, uint64_t epoch)
+{
+	TestContext* test = (TestContext*)context;
+	assert(pthread_mutex_lock(test->send_started_lock) == 0);
+	atomic_store(&test->send_started_fd, fd);
+	atomic_store(&test->send_started_epoch, epoch);
+	atomic_store(&test->send_started, true);
+	assert(pthread_cond_signal(test->send_started_condition) == 0);
+	assert(pthread_mutex_unlock(test->send_started_lock) == 0);
 }
 
 static void init_transport(AgentTransport* transport, TestContext* context)
@@ -101,9 +121,51 @@ static void* send_connection(void* opaque)
 	SendArgument* argument = (SendArgument*)opaque;
 	const uint8_t payload[NANOKVM_CONTROL_MAX_PAYLOAD] = { 0 };
 	atomic_store(&argument->entered, true);
-	(void)agent_transport_send(argument->transport, NANOKVM_CONTROL_KEY, payload, sizeof(payload));
+	errno = 0;
+	atomic_store(&argument->sent, agent_transport_send(argument->transport, NANOKVM_CONTROL_KEY,
+	                                                     payload, sizeof(payload)));
+	atomic_store(&argument->error, errno);
 	atomic_store(&argument->finished, true);
 	return NULL;
+}
+
+static size_t fill_socket_send_buffer(int fd, int* actual_buffer)
+{
+	const uint8_t filler[4096] = { 0 };
+	const int flags = fcntl(fd, F_GETFL);
+	socklen_t actual_buffer_size = sizeof(*actual_buffer);
+	size_t filled = 0;
+
+	assert(flags >= 0);
+	assert((flags & O_NONBLOCK) == 0);
+	assert(getsockopt(fd, SOL_SOCKET, SO_SNDBUF, actual_buffer, &actual_buffer_size) == 0);
+	assert(actual_buffer_size == sizeof(*actual_buffer));
+	assert(*actual_buffer > 0);
+	assert(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0);
+	for (;;)
+	{
+		const ssize_t written = write(fd, filler, sizeof(filler));
+		if (written > 0)
+		{
+			filled += (size_t)written;
+			continue;
+		}
+		assert(written < 0);
+		assert(errno == EAGAIN || errno == EWOULDBLOCK);
+		break;
+	}
+	assert(filled > 0);
+	assert(fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) == 0);
+	assert((fcntl(fd, F_GETFL) & O_NONBLOCK) == 0);
+	return filled;
+}
+
+static void wait_for_send_started(TestContext* context)
+{
+	assert(pthread_mutex_lock(context->send_started_lock) == 0);
+	while (!atomic_load(&context->send_started))
+		assert(pthread_cond_wait(context->send_started_condition, context->send_started_lock) == 0);
+	assert(pthread_mutex_unlock(context->send_started_lock) == 0);
 }
 
 static void wait_for_ack(AgentTransport* transport, uint32_t sequence, bool expected_success)
@@ -317,26 +379,44 @@ static void test_reconnect_unblocks_stalled_send(void)
 	int first[2];
 	int second[2];
 	int send_buffer = 1024;
+	int actual_buffer = 0;
+	pthread_mutex_t send_started_lock;
+	pthread_cond_t send_started_condition;
 
 	init_transport(&transport, &context);
+	assert(pthread_mutex_init(&send_started_lock, NULL) == 0);
+	assert(pthread_cond_init(&send_started_condition, NULL) == 0);
+	context.send_started_lock = &send_started_lock;
+	context.send_started_condition = &send_started_condition;
+	transport.callbacks.send_started = test_send_started;
 	const uint64_t first_epoch = accept_pair(&transport, first, false);
 	assert(setsockopt(first[0], SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) == 0);
+	const size_t bytes_filled = fill_socket_send_buffer(first[0], &actual_buffer);
+	assert(bytes_filled > 0 && actual_buffer > 0);
 	RunArgument reader = { .transport = &transport, .fd = first[0], .epoch = first_epoch };
 	pthread_t reader_thread;
 	assert(pthread_create(&reader_thread, NULL, run_connection, &reader) == 0);
 	SendArgument sender = { .transport = &transport };
 	pthread_t sender_thread;
 	assert(pthread_create(&sender_thread, NULL, send_connection, &sender) == 0);
-	for (unsigned attempt = 0; attempt < 1000 && !atomic_load(&sender.entered); attempt++)
-		(void)usleep(1000);
+	wait_for_send_started(&context);
 	assert(atomic_load(&sender.entered));
-	(void)usleep(10000);
+	assert(atomic_load(&context.send_started));
+	assert(atomic_load(&context.send_started_epoch) == first_epoch);
+	const int captured_fd = atomic_load(&context.send_started_fd);
+	assert(captured_fd >= 0 && captured_fd != first[0]);
+	assert(fcntl(captured_fd, F_GETFD) >= 0);
+	/* The first socket reached EAGAIN with bytes_filled queued, so this send cannot finish. */
 	assert(!atomic_load(&sender.finished));
 
 	const uint64_t second_epoch = accept_pair(&transport, second, false);
 	assert(second_epoch == first_epoch + 1);
 	assert(pthread_join(sender_thread, NULL) == 0);
 	assert(atomic_load(&sender.finished));
+	assert(!atomic_load(&sender.sent));
+	const int send_error = atomic_load(&sender.error);
+	assert(send_error == EPIPE || send_error == ECONNRESET || send_error == ENOTCONN ||
+	       send_error == ESHUTDOWN);
 	assert(pthread_join(reader_thread, NULL) == 0);
 	assert(!agent_transport_is_current_epoch(&transport, first_epoch));
 	assert(agent_transport_is_current_epoch(&transport, second_epoch));
@@ -344,6 +424,8 @@ static void test_reconnect_unblocks_stalled_send(void)
 	agent_transport_shutdown(&transport);
 	assert(close(second[1]) == 0);
 	agent_transport_destroy(&transport);
+	assert(pthread_cond_destroy(&send_started_condition) == 0);
+	assert(pthread_mutex_destroy(&send_started_lock) == 0);
 }
 
 static void test_shutdown_unblocks_reader_before_lock_destroy(void)
