@@ -1289,11 +1289,24 @@ static bool client_send_input_message(Client* client, const InputRouterMessage* 
 	       server_send_control(client->server, message->type, message->payload, message->length);
 }
 
+static bool input_trace_enabled(void)
+{
+	const char* value = getenv("NANOKVM_INPUT_TRACE");
+	return value && (strcmp(value, "1") == 0 || strcmp(value, "shift") == 0);
+}
+
+static bool input_trace_scancode(uint8_t code, bool extended)
+{
+	/* Keep the opt-in trace limited to the Shift+a/Shift+1 diagnostic. */
+	return !extended && (code == 0x02 || code == 0x1e || code == 0x2a || code == 0x36);
+}
+
 static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 {
 	Client* client = (Client*)input->context;
 	const bool raw_extended = (flags & KBD_FLAGS_EXTENDED) != 0;
 	const bool release = (flags & KBD_FLAGS_RELEASE) != 0;
+	const uint8_t modifiers_before = client->input_router.keyboard_modifiers;
 	InputRouterMessage message;
 	input_router_keyboard(&client->input_router, code, raw_extended, release, &message);
 	if (client->input_router.keyboard_modifiers != 0 || code == 0x3a)
@@ -1315,7 +1328,20 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 		               (unsigned)release, client->input_router.keyboard_modifiers);
 		log_message("INFO", diagnostic);
 	}
+	const uint64_t input_trace_epoch =
+		agent_transport_current_epoch(&client->server->transport);
 	const bool sent = client_send_input_message(client, &message);
+	if (input_trace_enabled() && input_trace_scancode(code, raw_extended))
+	{
+		char diagnostic[256];
+		(void)snprintf(diagnostic, sizeof(diagnostic),
+		               "INPUT TRACE raw=0x%02X extended=%u release=%u modifiers_before=0x%02X modifiers_after=0x%02X payload=0x%02X/%u/%u epoch=%llu sent=%u",
+		               code, (unsigned)raw_extended, (unsigned)release, modifiers_before,
+		               client->input_router.keyboard_modifiers, message.payload[0],
+		               (unsigned)message.payload[1], (unsigned)message.payload[2],
+		               (unsigned long long)input_trace_epoch, (unsigned)sent);
+		log_message("INFO", diagnostic);
+	}
 	if (sent && !client->keyboard_input_logged)
 	{
 		log_message("INFO", "RDP keyboard scancode → NanoKVM agent HID 전달 확인");

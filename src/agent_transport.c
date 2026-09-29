@@ -327,6 +327,16 @@ bool agent_transport_is_current_epoch(AgentTransport* transport, uint64_t epoch)
 	return current;
 }
 
+uint64_t agent_transport_current_epoch(AgentTransport* transport)
+{
+	if (!transport)
+		return 0;
+	(void)pthread_mutex_lock(&transport->lock);
+	const uint64_t epoch = !transport->stopping && transport->fd >= 0 ? transport->epoch : 0;
+	(void)pthread_mutex_unlock(&transport->lock);
+	return epoch;
+}
+
 void agent_transport_get_stats(AgentTransport* transport, AgentTransportStats* stats)
 {
 	if (!transport || !stats)

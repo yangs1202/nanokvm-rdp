@@ -74,6 +74,8 @@ bool agent_transport_set_stream_requested(AgentTransport* transport, bool reques
 void agent_transport_heartbeat(AgentTransport* transport, uint64_t now);
 void agent_transport_get_stats(AgentTransport* transport, AgentTransportStats* stats);
 bool agent_transport_is_current_epoch(AgentTransport* transport, uint64_t epoch);
+/* Returns the active connection epoch, or 0 when no agent is connected. */
+uint64_t agent_transport_current_epoch(AgentTransport* transport);
 
 bool agent_transport_supports_key_ack(AgentTransport* transport);
 bool agent_transport_begin_key_ack(AgentTransport* transport, uint32_t sequence);
