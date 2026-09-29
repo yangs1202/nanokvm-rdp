@@ -214,8 +214,9 @@ static void on_signal(int signal_number)
 	stop_requested = 1;
 }
 
-/* The peer thread exclusively performs FreeRDP teardown.  Keep its handle until
- * shutdown so Server-owned locks and AgentTransport outlive that teardown. */
+/* The peer thread exclusively performs FreeRDP teardown. Keep a running handle
+ * until shutdown join; completed handles are reaped by listener admission so a
+ * new peer can be accepted without outliving Server-owned state. */
 static bool server_join_peer_thread(Server* server)
 {
 	HANDLE thread = NULL;
@@ -240,6 +241,25 @@ static bool server_join_peer_thread(Server* server)
 	LeaveCriticalSection(&server->lock);
 	(void)CloseHandle(thread);
 	return true;
+}
+
+/* Listener callbacks run on the main thread. Reap a completed peer handle before
+ * admission, while leaving a running handle as an explicit single-client gate. */
+static void server_reap_finished_peer_thread(Server* server)
+{
+	HANDLE thread = NULL;
+	EnterCriticalSection(&server->lock);
+	if (server->peer_thread && WaitForSingleObject(server->peer_thread, 0) == WAIT_OBJECT_0)
+	{
+		thread = server->peer_thread;
+		server->peer_thread = NULL;
+	}
+	LeaveCriticalSection(&server->lock);
+	if (thread)
+	{
+		(void)CloseHandle(thread);
+		log_message("INFO", "종료된 RDP peer thread handle을 재사용 가능 상태로 회수했습니다");
+	}
 }
 
 static DWORD WINAPI control_thread(LPVOID argument)
@@ -1328,10 +1348,12 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 		               (unsigned)release, client->input_router.keyboard_modifiers);
 		log_message("INFO", diagnostic);
 	}
-	const uint64_t input_trace_epoch =
-		agent_transport_current_epoch(&client->server->transport);
+	const bool input_trace = input_trace_enabled() && input_trace_scancode(code, raw_extended);
+	uint64_t input_trace_epoch = 0;
+	if (input_trace)
+		input_trace_epoch = agent_transport_current_epoch(&client->server->transport);
 	const bool sent = client_send_input_message(client, &message);
-	if (input_trace_enabled() && input_trace_scancode(code, raw_extended))
+	if (input_trace)
 	{
 		char diagnostic[256];
 		(void)snprintf(diagnostic, sizeof(diagnostic),
@@ -1924,13 +1946,21 @@ out:
 static BOOL peer_accepted(freerdp_listener* listener, freerdp_peer* peer)
 {
 	Server* server = (Server*)listener->info;
+	server_reap_finished_peer_thread(server);
 	EnterCriticalSection(&server->lock);
-	const bool busy = stop_requested || server->peer_thread != NULL || server->active != NULL ||
-	                  server->active_closing;
+	const bool thread_busy = server->peer_thread != NULL;
+	const bool active = server->active != NULL;
+	const bool closing = server->active_closing;
+	const bool busy = stop_requested || thread_busy || active || closing;
 	if (busy)
 	{
 		LeaveCriticalSection(&server->lock);
-		log_message("WARN", "single-client 제한으로 새 RDP 연결을 listener에서 거부합니다");
+		char diagnostic[160];
+		(void)snprintf(diagnostic, sizeof(diagnostic),
+		               "single-client 제한으로 새 RDP 연결을 listener에서 거부합니다 peer_thread=%u active=%u closing=%u stop=%u",
+		               (unsigned)thread_busy, (unsigned)active, (unsigned)closing,
+		               (unsigned)stop_requested);
+		log_message("WARN", diagnostic);
 		return FALSE;
 	}
 	peer->ContextExtra = server;
