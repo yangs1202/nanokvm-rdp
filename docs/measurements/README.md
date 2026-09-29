@@ -91,16 +91,46 @@
 관측, capture 전후 시각, first-seen frame ID, source drift/bracketing 상태를 단일
 collector JSON에 남긴다. Mac capture-host `sync_error_ms`, source-window clock
 uncertainty, end drift는 서로 다른 값이며 합치거나 대체하지 않는다. 실행별
-메타데이터는 [formal manifest 템플릿](2026-09-29-video-latency-formal-manifest.json)에서
-복사한다.
+`--metadata` 입력은 [formal manifest 템플릿](2026-09-29-video-latency-formal-manifest.json)에서
+복사한다. 이 입력의 `source`, `video`, `client`, `network`, `formal_measurement`는 모두
+top-level fields이며, `collector.py`가 변경 없이 결과 collector artifact의 `metadata` 아래에
+보존한다. 따라서 analyzer가 읽는 경로는 `artifact.metadata.formal_measurement`다.
 
-collector는 실제 화면 캡처 API를 제공하거나 가정하지 않는다. 현재 저장소에 권한을 가진
-Computer Use/ScreenCaptureKit/Windows App 캡처 producer가 없으므로, receiving Windows
-App 창을 캡처하고 검증된 local monotonic before/after 시각을 JSONL로 출력하는 producer가
-준비되기 전에는 live formal A/B 수집이 **blocked**다. wall-clock, 도구 응답 도착 시각,
-캐시 가능성이 있는 screenshot의 미문서 timestamp는 이 조건을 충족하지 않는다. producer의
-권한·API 버전·timestamp 의미와 capture artifact 위치를 manifest에 기록하고, 불명확하면
-`null`/blocked로 남긴다.
+정식 수집에는 저장소의 [ScreenCaptureKit capture producer](../../tools/video-latency/capture-producer/README.md)를
+사용한다. 이 macOS 14+ 도구는 receiving Windows App 창 하나를 `--window-id`로 선택하고,
+각 PNG에서 Vision OCR로 source timestamp/FRAME을 읽어 `collector.py` JSONL 계약에 맞춰
+출력한다. `--output-dir`에는 PNG·OCR sidecar와 `session.json`을 보존한다. 먼저
+`swift run capture-producer --preflight`, 이어 `--list-windows`를 실행하고, Screen Recording
+권한을 얻은 실행 host에서 정확한 window ID를 사용한다. wall-clock, 도구 응답 도착 시각,
+캐시 가능성이 있는 screenshot의 미문서 timestamp는 formal 입력이 아니다.
+
+```sh
+swift run capture-producer \
+  --window-id <receiving-windows-app-window-id> \
+  --output-dir /absolute/path/to/<run-id>-captures \
+  --count 1000 --interval-ms 33 | \
+python3 tools/video-latency/collector.py \
+  --server-url http://<capture-host-LAN-IP>:8765/1 \
+  --metadata docs/measurements/<run-id>-metadata.json \
+  --run-id <run-id> --output docs/measurements/<run-id>-collector.json
+
+python3 tools/video-latency/analyze.py \
+  --collector-artifact docs/measurements/<run-id>-collector.json \
+  --producer-session /absolute/path/to/<run-id>-captures/session.json \
+  > docs/measurements/<run-id>-analysis.json
+```
+
+`--count 1000 --interval-ms 33`은 약 33초라는 **명목값**일 뿐이다. 분석기는 capture
+before/after의 실제 관측 elapsed wall-clock가 60초 이상인지 별도로 검사하므로, 이 명령만으로
+정식 run이 되지 않는다. source/receiver를 최소 30초 워밍업한 뒤 실제 관측 기간이 60초 이상이
+되도록 count/interval을 늘리고, metadata의 `formal_measurement.warmup_elapsed_ms`에 실제 값을
+기록한다. metadata에는 모든 source/video/client/network 조건과 `condition_id`, `pattern_version`,
+`workload`, `capture_timestamp_semantics_verified: true`, source/receiver/capture geometry,
+concrete `capture_settings`, `video_quality_verified: true`, 실제 GOP(`actual_gop`)도 채운다.
+`network.contention: false`처럼 확인된 false/zero 값은 unknown으로 바꾸지 않는다.
+`session.json`의 reconciled attempt count, Vision OCR 실패 수와 artifact 경로도 분석 결과에 남는다.
+OCR failure가 하나라도 있으면 missing observation을 보정하거나 추측하지 않으며 해당 formal run은
+ineligible이다.
 
 20장 preliminary CSV/JSON/MD/manifest는 historical baseline으로만 보존한다. 새 collector
 JSON은 그것을 덮어쓰거나 합산하지 않으며, formal A/B 판정 전에 같은 collector·동일 품질
@@ -113,11 +143,11 @@ JSON은 그것을 덮어쓰거나 합산하지 않으며, formal A/B 판정 전�
   시계든 시작/종료 보정 누락, 불명확한 uncertainty/drift, drift 검출 후 미보정,
   source clock이 capture window를 bracket하지 못한 실행을 **non-eligible**로
   표시한다. 이것은 지연 또는 A/B 통과 판정이 아니다.
-- 연속 수집기는 OS가 제공하는 실제 capture timestamp와 프레임 식별값을 저장한다.
-  `collector.py`는 이 JSONL 기록과 first-seen 계산을 구현하지만, timestamp의 시계 기준 및
-  API 버퍼링이 검증된 실제 capture producer는 별도로 필요하다. 그 producer가 없으면 formal
-  수집/판정은 blocked다.
-- 초기 워밍업 30초 후 60초 이상 수집, 한 조건당 유효 표본 1,000개 이상을 목표로 한다.
+- 연속 수집기는 저장소의 ScreenCaptureKit producer가 제공하는 실제 capture timestamp와
+  프레임 식별값을 저장한다. `collector.py`는 이 JSONL 기록과 first-seen 계산을 구현하며,
+  producer의 권한·window ID·sidecar/session 보존 규칙은 위 명령과 producer 문서를 따른다.
+- 초기 워밍업 30초 후 실제 elapsed wall-clock 60초 이상 수집하고, 한 조건당 유효 표본
+  1,000개 이상을 **필수**로 한다. nominal count/interval은 이를 대체하지 않는다.
   동일 프레임 반복은 age 계산에 유지하고, FPS 계산은 별도로 첫 관측을 사용한다.
 - 최소 세 쌍의 A/B 실행을 수행한다. A는 변경 전, B는 변경 후이며 순서를 교대한다.
   이 횟수는 시작 기준일 뿐이다. 변동이 크거나 판정이 겹치면 추가 측정한다.
@@ -156,6 +186,11 @@ JSON은 그것을 덮어쓰거나 합산하지 않으며, formal A/B 판정 전�
   더 정확한 수집/추가 A/B로 해결하며, 해결 전에는 성능 요구 충족을 선언하지 않는다.
 - **회귀:** 반복 측정에서 오차를 넘어선 악화가 확인되면 수정하거나 해당 변경을 되돌린다.
 
-CSV/JSON의 계산상 구간은 관측 시간 구간일 뿐 통계적 신뢰구간이 아니다. 정식 A/B에서
-표본의 시간 상관과 실행별 변동을 반영한 분석을 추가해야 하며, 현재 analyze.py는
-자동 합격 판정기가 아니다.
+기존 20-sample CSV/JSON은 preliminary historical baseline 및 fixture arithmetic validation일
+뿐이며 formal analysis 또는 PASS에 사용할 수 없다. Eligible collector artifact에 대해서만
+`analyze.py`는 p50/p95/p99의 capture/source-clock·capture-window error bounds, observed
+first-seen FPS(관측 전체 시작/끝 경계의 정지도 포함하지만 전달/표시 FPS가 아니라는 제한 포함),
+drop/stall/resource/error fields를 계산한다.
+실제 session/metadata/조건/quality가 하나라도 모호하면 `inconclusive`/`not_computed`가 된다.
+A/B는 `--ab-pair A.json B.json`을 최소 세 번 주고, 모든 pair의 완전하고 일치하는 조건 metadata가
+있을 때만 계산하며 자동 PASS/FAIL 판정은 하지 않는다.

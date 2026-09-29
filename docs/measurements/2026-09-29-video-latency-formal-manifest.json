@@ -33,6 +33,19 @@
     "loss_percent": null,
     "contention": null
   },
+  "formal_measurement": {
+    "warmup_elapsed_ms": null,
+    "condition_id": null,
+    "pattern_version": null,
+    "workload": null,
+    "capture_timestamp_semantics_verified": null,
+    "source_geometry": null,
+    "receiver_geometry": null,
+    "capture_geometry": null,
+    "capture_settings": null,
+    "video_quality_verified": null,
+    "actual_gop": null
+  },
   "code_and_runtime": {
     "repository_revision": null,
     "working_tree_description": null,
