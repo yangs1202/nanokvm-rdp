@@ -59,7 +59,7 @@ RUN cmake -S freerdp -B build/freerdp \
         -DWITH_SWSCALE=OFF \
         -DWITH_GFX_H264=ON \
         -DWITH_OPENSSL=ON \
-    && cmake --build build/freerdp --parallel \
+    && cmake --build build/freerdp --parallel 2 \
     && cmake --install build/freerdp
 
 WORKDIR /src/nanokvm-rdp
@@ -73,7 +73,7 @@ RUN cmake -S . -B build/gateway \
         -DNANOKVM_RDP_BUILD_TESTS=ON \
         -DNANOKVM_RDP_TEST_FFMPEG=ON \
         -DNANOKVM_RDP_USE_INSTALLED_FREERDP=ON \
-    && cmake --build build/gateway --parallel \
+    && cmake --build build/gateway --parallel 2 \
     && ctest --test-dir build/gateway --output-on-failure
 
 FROM debian:bookworm-slim

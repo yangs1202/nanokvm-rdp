@@ -1,11 +1,14 @@
 #include "bitmap_diff.h"
+#include "agent_transport.h"
+#include "device_session.h"
 #include "ffmpeg_decoder.h"
 #include "frame_flow.h"
 #include "frame_trace.h"
 #include "h264.h"
 #include "hid.h"
+#include "input_router.h"
 #include "protocol.h"
-#include "rtp_client.h"
+#include "video_source.h"
 
 #include <freerdp/channels/channels.h>
 #include <freerdp/channels/drdynvc.h>
@@ -64,10 +67,8 @@
 #define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
 #define CLASSIC_BITMAP_BATCH 1U
 #define CLASSIC_MAX_UPDATE_SIZE (32U * 1024U)
-#define HEARTBEAT_INTERVAL_MS 1000U
-#define HEARTBEAT_TIMEOUT_MS 5000U
 #define STATS_LOG_INTERVAL_MS 5000U
-#define KEY_ACK_TIMEOUT_MS 1000U
+#define PEER_SHUTDOWN_JOIN_TIMEOUT_MS 5000U
 #define WHEEL_ROTATION_MASK 0x01FFU
 
 typedef struct
@@ -95,25 +96,14 @@ struct Server
 {
 	ServerConfig config;
 	CRITICAL_SECTION lock;
-	CRITICAL_SECTION control_lock;
-	CRITICAL_SECTION key_ack_lock;
-	HANDLE key_ack_event;
 	int control_listener;
-	int control_fd;
-	bool stream_requested;
-	bool agent_supports_key_ack;
-	uint32_t next_key_sequence;
-	uint32_t waiting_key_sequence;
-	bool key_ack_received;
-	bool key_ack_success;
-	uint64_t last_agent_activity_at;
-	uint64_t last_ping_at;
+	HANDLE control_thread;
+	HANDLE peer_thread;
+	AgentTransport transport;
+	DeviceSession* device_session;
 	uint64_t last_stats_log_at;
-	uint32_t agent_sent_packets;
-	uint32_t agent_dropped_packets;
-	uint32_t agent_capture_frames;
-	uint32_t agent_dropped_frames;
 	Client* active;
+	bool active_closing;
 };
 
 struct Client
@@ -139,6 +129,7 @@ struct Client
 	uint8_t* classic_encoded;
 	bool previous_bitmap_valid;
 	HidState hid;
+	HANDLE shutdown_event;
 	bool stopping;
 	bool owns_active_client;
 	bool direct_gfx_active;
@@ -176,9 +167,7 @@ struct Client
 	bool keyboard_input_logged;
 	bool pointer_input_logged;
 	bool wheel_input_logged;
-	uint8_t pointer_buttons;
-	uint8_t keyboard_modifiers;
-	bool control_space_down;
+	InputRouter input_router;
 	uint64_t last_rtp_received_at;
 	uint64_t last_decode_latency_ms;
 	uint64_t last_rdp_send_ms;
@@ -198,43 +187,59 @@ static void log_message(const char* level, const char* message)
 
 static bool server_send_control(Server* server, uint8_t type, const void* payload, uint16_t length)
 {
-	bool sent = false;
-	EnterCriticalSection(&server->control_lock);
-	if (server->control_fd >= 0)
-		sent = protocol_send(server->control_fd, type, payload, length);
-	LeaveCriticalSection(&server->control_lock);
-	return sent;
-}
-
-static void server_cancel_key_ack(Server* server)
-{
-	EnterCriticalSection(&server->key_ack_lock);
-	server->waiting_key_sequence = 0;
-	server->key_ack_received = false;
-	server->key_ack_success = false;
-	(void)SetEvent(server->key_ack_event);
-	LeaveCriticalSection(&server->key_ack_lock);
+	return agent_transport_send(&server->transport, type, payload, length);
 }
 
 static bool server_set_stream_requested(Server* server, bool requested)
 {
-	bool sent = false;
-	EnterCriticalSection(&server->control_lock);
-	server->stream_requested = requested;
-	if (server->control_fd >= 0)
-		sent = protocol_send(server->control_fd,
-		                     requested ? NANOKVM_CONTROL_START_STREAM : NANOKVM_CONTROL_STOP_STREAM,
-		                     NULL, 0);
-	LeaveCriticalSection(&server->control_lock);
+	const bool sent = agent_transport_set_stream_requested(&server->transport, requested);
 	log_message(sent ? "INFO" : "ERROR", requested ? "NanoKVM agent에 START_STREAM 전송"
 	                                                : "NanoKVM agent에 STOP_STREAM 전송");
 	return sent;
+}
+
+static bool request_video_idr(void* context, uint64_t video_source_epoch)
+{
+	/* This epoch identifies the successful RTP open that produced the access
+	 * unit. It is intentionally independent of AgentTransport's control
+	 * connection epoch; server_send_control preserves the existing current-
+	 * transport-epoch validation when it sends IDR_REQUEST. */
+	(void)video_source_epoch;
+	return server_send_control((Server*)context, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
 }
 
 static void on_signal(int signal_number)
 {
 	(void)signal_number;
 	stop_requested = 1;
+}
+
+/* The peer thread exclusively performs FreeRDP teardown.  Keep its handle until
+ * shutdown so Server-owned locks and AgentTransport outlive that teardown. */
+static bool server_join_peer_thread(Server* server)
+{
+	HANDLE thread = NULL;
+	EnterCriticalSection(&server->lock);
+	if (server->active && server->active->shutdown_event)
+		(void)SetEvent(server->active->shutdown_event);
+	thread = server->peer_thread;
+	LeaveCriticalSection(&server->lock);
+	if (!thread)
+		return true;
+
+	const DWORD status = WaitForSingleObject(thread, PEER_SHUTDOWN_JOIN_TIMEOUT_MS);
+	if (status != WAIT_OBJECT_0)
+	{
+		log_message("ERROR", "RDP peer thread가 종료 시간 제한 내에 정리되지 않았습니다");
+		return false;
+	}
+
+	EnterCriticalSection(&server->lock);
+	if (server->peer_thread == thread)
+		server->peer_thread = NULL;
+	LeaveCriticalSection(&server->lock);
+	(void)CloseHandle(thread);
+	return true;
 }
 
 static DWORD WINAPI control_thread(LPVOID argument)
@@ -251,72 +256,11 @@ static DWORD WINAPI control_thread(LPVOID argument)
 		(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
 		const struct timeval send_timeout = { .tv_usec = 100000 };
 		(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
-		NanokvmControlMessage hello = { 0 };
-		if (!protocol_receive(fd, &hello) || hello.type != NANOKVM_CONTROL_HELLO ||
-		    (hello.length != NANOKVM_HELLO_BASE_PAYLOAD_SIZE &&
-		     hello.length != NANOKVM_HELLO_CAPABILITIES_PAYLOAD_SIZE))
-		{
-			(void)close(fd);
+		uint64_t epoch = 0;
+		if (!agent_transport_accept(&server->transport, fd, &epoch))
 			continue;
-		}
-		EnterCriticalSection(&server->control_lock);
-		if (server->control_fd >= 0)
-			(void)close(server->control_fd);
-		server->control_fd = fd;
-		server->agent_supports_key_ack = hello.length == NANOKVM_HELLO_CAPABILITIES_PAYLOAD_SIZE &&
-		                                 (hello.payload[8] & NANOKVM_AGENT_CAPABILITY_KEY_ACK) != 0;
-		server->last_agent_activity_at = monotonic_milliseconds();
-		server->last_ping_at = server->last_agent_activity_at;
-		const bool start = server->stream_requested;
-		LeaveCriticalSection(&server->control_lock);
-	if (start && !server_send_control(server, NANOKVM_CONTROL_START_STREAM, NULL, 0))
-	{
-		log_message("ERROR", "재연결 NanoKVM agent에 START_STREAM을 보낼 수 없습니다");
-	}
 		log_message("INFO", "NanoKVM agent control 연결 수락");
-		for (;;)
-		{
-			NanokvmControlMessage message = { 0 };
-			if (!protocol_receive(fd, &message))
-				break;
-			if (message.type == NANOKVM_CONTROL_KEY_ACK &&
-			    message.length == NANOKVM_KEY_ACK_PAYLOAD_SIZE)
-			{
-				const uint32_t sequence = protocol_read_u32(message.payload);
-				EnterCriticalSection(&server->key_ack_lock);
-				if (server->waiting_key_sequence == sequence)
-				{
-					server->key_ack_received = true;
-					server->key_ack_success = message.payload[4] != 0;
-					(void)SetEvent(server->key_ack_event);
-				}
-				LeaveCriticalSection(&server->key_ack_lock);
-				continue;
-			}
-			EnterCriticalSection(&server->control_lock);
-			server->last_agent_activity_at = monotonic_milliseconds();
-			if (message.type == NANOKVM_CONTROL_STATS &&
-			    message.length == NANOKVM_STATS_PAYLOAD_SIZE)
-			{
-				server->agent_sent_packets = protocol_read_u32(message.payload);
-				server->agent_dropped_packets = protocol_read_u32(message.payload + 4);
-				server->agent_capture_frames = protocol_read_u32(message.payload + 8);
-				server->agent_dropped_frames = protocol_read_u32(message.payload + 12);
-			}
-			LeaveCriticalSection(&server->control_lock);
-			if (message.type == NANOKVM_CONTROL_PING)
-				(void)server_send_control(server, NANOKVM_CONTROL_PONG, NULL, 0);
-		}
-		server_cancel_key_ack(server);
-		EnterCriticalSection(&server->control_lock);
-		if (server->control_fd == fd)
-		{
-			server->control_fd = -1;
-			server->agent_supports_key_ack = false;
-		}
-		LeaveCriticalSection(&server->control_lock);
-		(void)close(fd);
-		log_message("WARN", "NanoKVM agent control 연결 종료");
+		agent_transport_run(&server->transport, fd, epoch);
 	}
 	return 0;
 }
@@ -343,53 +287,50 @@ static uint64_t monotonic_milliseconds(void)
 	return (uint64_t)GetTickCount64();
 }
 
+static uint64_t transport_clock(void* context)
+{
+	(void)context;
+	return monotonic_milliseconds();
+}
+
+static void on_transport_event(void* context, AgentTransportEvent event, uint64_t epoch)
+{
+	Server* server = (Server*)context;
+	if (event == AGENT_TRANSPORT_EVENT_DISCONNECTED)
+	{
+		log_message("WARN", "NanoKVM agent control 연결 종료");
+		return;
+	}
+	if (!agent_transport_is_current_epoch(&server->transport, epoch))
+		return;
+
+	bool requested = false;
+	/* The peer thread owns FreeRDP teardown and observes this request before Disconnect. */
+	EnterCriticalSection(&server->lock);
+	if (server->active && server->active->shutdown_event)
+	{
+		(void)SetEvent(server->active->shutdown_event);
+		requested = true;
+	}
+	LeaveCriticalSection(&server->lock);
+	if (requested)
+		log_message("WARN", "NanoKVM agent heartbeat timeout; active RDP client 연결을 종료합니다");
+	else
+		log_message("WARN", "NanoKVM agent heartbeat timeout; control 연결을 종료합니다");
+}
+
 static void server_heartbeat(Server* server)
 {
 	const uint64_t now = monotonic_milliseconds();
-	bool send_ping = false;
-	bool timeout = false;
-	freerdp_peer* stale_peer = NULL;
-	EnterCriticalSection(&server->control_lock);
-	if (server->control_fd >= 0)
-	{
-		timeout = now - server->last_agent_activity_at > HEARTBEAT_TIMEOUT_MS;
-		send_ping = now - server->last_ping_at >= HEARTBEAT_INTERVAL_MS;
-		if (send_ping)
-			server->last_ping_at = now;
-		if (timeout)
-			(void)shutdown(server->control_fd, SHUT_RDWR);
-	}
-	LeaveCriticalSection(&server->control_lock);
-	if (timeout)
-	{
-		/* agent가 멈추면 비디오도 멈추므로 기존 RDP client 세션도 의미가 없다.
-		 * active client를 강제 종료하지 않으면 single-client 슬롯이 점유된 채
-		 * 남아 이후 재접속이 모두 listener에서 거부된다. */
-		EnterCriticalSection(&server->lock);
-		if (server->active && server->active->peer)
-		{
-			stale_peer = server->active->peer;
-			/* 중복 disconnect 방지: active는 client_context_free가 정리한다. */
-			server->active = NULL;
-		}
-		LeaveCriticalSection(&server->lock);
-		if (stale_peer && stale_peer->Disconnect)
-		{
-			stale_peer->Disconnect(stale_peer);
-			log_message("WARN", "NanoKVM agent heartbeat timeout; active RDP client 연결을 종료합니다");
-		}
-		else
-			log_message("WARN", "NanoKVM agent heartbeat timeout; control 연결을 종료합니다");
-		(void)server_set_stream_requested(server, false);
-	}
-	if (send_ping && !timeout)
-		(void)server_send_control(server, NANOKVM_CONTROL_PING, NULL, 0);
+	agent_transport_heartbeat(&server->transport, now);
 	if (now - server->last_stats_log_at < STATS_LOG_INTERVAL_MS)
 		return;
 	server->last_stats_log_at = now;
 	struct rusage usage = { 0 };
 	if (getrusage(RUSAGE_SELF, &usage) == 0)
 	{
+		AgentTransportStats agent_stats = { 0 };
+		agent_transport_get_stats(&server->transport, &agent_stats);
 		uint32_t bitmap_frames = 0;
 		uint32_t decoded_frames = 0;
 		uint32_t converted_frames = 0;
@@ -437,8 +378,8 @@ static void server_heartbeat(Server* server)
 		char message[512] = { 0 };
 		(void)snprintf(message, sizeof(message),
 			               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u converted=%u interval_ms=%u queued=%u queue_drop=%u stale_drop=%u flush=%u empty_flush=%u rdp_frames=%u classic_tiles=%llu classic_bytes=%llu queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
-			               server->agent_sent_packets, server->agent_dropped_packets,
-			               server->agent_capture_frames, server->agent_dropped_frames,
+			               agent_stats.sent_packets, agent_stats.dropped_packets,
+			               agent_stats.capture_frames, agent_stats.dropped_frames,
 			               rtp_nals, rtp_access_units, rtp_idr_units, rtp_p_units, decoded_frames, converted_frames, interval_ms,
 			               bitmap_queued_frames, bitmap_queue_drops, bitmap_stale_drops, bitmap_flushes,
 			               bitmap_empty_flushes,
@@ -765,8 +706,9 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 static DWORD WINAPI video_thread(LPVOID argument)
 {
 	Client* client = (Client*)argument;
-	RtpClient rtp = { .fd = -1 };
-	if (!rtp_client_open(&rtp, client->server->config.video_port))
+	DeviceSessionLease lease = { 0 };
+	if (!device_session_acquire(client->server->device_session,
+	                            DEVICE_SESSION_CONSUMER_DIRECT_GFX, &lease))
 	{
 		log_message("ERROR", "RDPGFX RTP/H.264 receiver를 시작할 수 없습니다");
 		client_stop(client);
@@ -774,14 +716,13 @@ static DWORD WINAPI video_thread(LPVOID argument)
 	}
 	log_message("INFO", "RDPGFX RTP/H.264 passthrough 시작");
 	char buffer_message[128];
-	(void)snprintf(buffer_message, sizeof(buffer_message), "RTP receive buffer bytes=%d", rtp.receive_buffer_bytes);
+	(void)snprintf(buffer_message, sizeof(buffer_message), "RTP receive buffer bytes=%d",
+	               device_session_receive_buffer_bytes(&lease));
 	log_message("INFO", buffer_message);
-	uint32_t observed_losses = 0;
 	while (!client_should_stop(client))
 	{
-		uint8_t* data = NULL;
-		size_t length = 0;
-		if (!rtp_client_read_h264(&rtp, &data, &length))
+		VideoSourceAccessUnit access_unit = { 0 };
+		if (!device_session_read(&lease, &access_unit))
 		{
 			const int error = errno;
 			if (client_should_stop(client))
@@ -792,20 +733,20 @@ static DWORD WINAPI video_thread(LPVOID argument)
 			client_stop(client);
 			break;
 		}
+		uint8_t* data = access_unit.data;
+		const size_t length = access_unit.length;
 		if (!data || length == 0)
 		{
-			free(data);
+			video_source_release_access_unit(&access_unit);
 			continue;
 		}
 		const uint64_t received_at = monotonic_milliseconds();
 		const uint64_t receive_wall = frame_trace_wall_ms();
-		if (rtp.losses != observed_losses)
+		if (access_unit.packet_loss)
 		{
-			observed_losses = rtp.losses;
 			EnterCriticalSection(&client->lock);
 			client->need_idr = true;
 			LeaveCriticalSection(&client->lock);
-			(void)server_send_control(client->server, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
 			log_message("WARN", "RDPGFX RTP frame loss 감지; NanoKVM agent에 IDR 재동기화를 요청합니다");
 		}
 		client->last_rtp_received_at = monotonic_milliseconds();
@@ -841,14 +782,14 @@ static DWORD WINAPI video_thread(LPVOID argument)
 			if (idr)
 				payload_ok = make_idr_payload(client, data, length, &owned, &payload, &payload_length);
 			if (!payload_ok || !send_avc420_frame(client, payload, payload_length,
-			                                          rtp.access_unit_ssrc, rtp.access_unit_timestamp,
+			                                          access_unit.ssrc, access_unit.timestamp,
 			                                          received_at, receive_wall))
 				client_stop(client);
 			free(owned);
 		}
-		free(data);
+		video_source_release_access_unit(&access_unit);
 	}
-	rtp_client_close(&rtp);
+	device_session_release(&lease);
 	return 0;
 }
 
@@ -1259,20 +1200,21 @@ static bool client_flush_pending_bitmap(Client* client)
 static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 {
 	Client* client = (Client*)argument;
-	RtpClient rtp = { .fd = -1 };
+	DeviceSessionLease lease = { 0 };
 	FfmpegDecoder decoder = { 0 };
 	bool backend_ready = false;
 
 	for (unsigned attempt = 0; attempt < 10 && !client_should_stop(client); attempt++)
 	{
-		if (rtp_client_open(&rtp, client->server->config.video_port) &&
+		if (device_session_acquire(client->server->device_session,
+		                           DEVICE_SESSION_CONSUMER_BITMAP, &lease) &&
 		    ffmpeg_decoder_start_raw(&decoder, on_decoded_frame, client))
 		{
 			backend_ready = true;
 			break;
 		}
 		ffmpeg_decoder_stop(&decoder);
-		rtp_client_close(&rtp);
+		device_session_release(&lease);
 		Sleep(1000);
 	}
 	if (!backend_ready)
@@ -1282,12 +1224,10 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 		goto out;
 	}
 	log_message("INFO", "RTP/H.264 receiver와 FFmpeg BGRA decoder 시작 완료");
-	uint32_t observed_losses = 0;
 	while (!client_should_stop(client))
 	{
-		uint8_t* data = NULL;
-		size_t length = 0;
-		if (!rtp_client_read_h264(&rtp, &data, &length))
+		VideoSourceAccessUnit access_unit = { 0 };
+		if (!device_session_read(&lease, &access_unit))
 		{
 			const int error = errno;
 			if (client_should_stop(client))
@@ -1298,9 +1238,11 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 			client_stop(client);
 			break;
 		}
+		uint8_t* data = access_unit.data;
+		const size_t length = access_unit.length;
 		if (!data || length == 0)
 		{
-			free(data);
+			video_source_release_access_unit(&access_unit);
 			continue;
 		}
 		client->last_rtp_received_at = monotonic_milliseconds();
@@ -1314,72 +1256,66 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 		uint8_t* annexb = malloc(annexb_length);
 		if (!annexb)
 		{
-			free(data);
+			video_source_release_access_unit(&access_unit);
 			client_stop(client);
 			break;
 		}
 		(void)h264_copy_annexb(annexb, data, length);
+		const bool packet_loss = access_unit.packet_loss;
 		const bool pushed = ffmpeg_decoder_push(&decoder, annexb, annexb_length);
 		free(annexb);
-		free(data);
+		video_source_release_access_unit(&access_unit);
 		if (!pushed)
 		{
 			log_message("ERROR", "FFmpeg H.264 decoder 입력 실패");
 			client_stop(client);
 			break;
 		}
-		if (rtp.losses != observed_losses)
+		if (packet_loss)
 		{
-			observed_losses = rtp.losses;
-			(void)server_send_control(client->server, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
 			log_message("WARN", "RTP frame loss 감지; NanoKVM agent에 IDR 재동기화를 요청합니다");
 		}
 	}
 
 out:
 	ffmpeg_decoder_stop(&decoder);
-	rtp_client_close(&rtp);
+	device_session_release(&lease);
 	return 0;
+}
+
+static bool client_send_input_message(Client* client, const InputRouterMessage* message)
+{
+	return message->type == 0 ||
+	       server_send_control(client->server, message->type, message->payload, message->length);
 }
 
 static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 {
 	Client* client = (Client*)input->context;
 	const bool raw_extended = (flags & KBD_FLAGS_EXTENDED) != 0;
-	uint8_t mapped_code = code;
-	bool mapped_extended = raw_extended;
-	hid_map_scancode(code, mapped_extended, client->server->config.swap_alt_command,
-	                 &mapped_code, &mapped_extended);
 	const bool release = (flags & KBD_FLAGS_RELEASE) != 0;
-	uint8_t usage = 0;
-	uint8_t modifier = 0;
-	(void)hid_translate_scancode(mapped_code, mapped_extended, &usage, &modifier);
-	if (release)
-		client->keyboard_modifiers &= (uint8_t)~modifier;
-	else
-		client->keyboard_modifiers |= modifier;
-	if (modifier != 0 || code == 0x3a)
+	InputRouterMessage message;
+	input_router_keyboard(&client->input_router, code, raw_extended, release, &message);
+	if (client->input_router.keyboard_modifiers != 0 || code == 0x3a)
 	{
-		char message[192];
-		(void)snprintf(message, sizeof(message),
+		char diagnostic[192];
+		(void)snprintf(diagnostic, sizeof(diagnostic),
 		               "RDP modifier diagnostic raw=0x%02X extended=%u release=%u mapped=0x%02X extended=%u modifiers=0x%02X",
 		               code, (unsigned)raw_extended, (unsigned)release,
-		               mapped_code, (unsigned)mapped_extended, client->keyboard_modifiers);
-		log_message("INFO", message);
+		               message.payload[0], (unsigned)message.payload[1],
+		               client->input_router.keyboard_modifiers);
+		log_message("INFO", diagnostic);
 	}
 	if (code == 0x39 && !raw_extended &&
-	    ((client->keyboard_modifiers & 0x11U) || client->control_space_down))
+	    ((client->input_router.keyboard_modifiers & 0x11U) || client->input_router.control_space_down))
 	{
-		char message[128];
-		(void)snprintf(message, sizeof(message),
+		char diagnostic[128];
+		(void)snprintf(diagnostic, sizeof(diagnostic),
 		               "RDP Control+Space diagnostic release=%u modifiers=0x%02X",
-		               (unsigned)release, client->keyboard_modifiers);
-		log_message("INFO", message);
-		client->control_space_down = !release;
+		               (unsigned)release, client->input_router.keyboard_modifiers);
+		log_message("INFO", diagnostic);
 	}
-	const uint8_t payload[3] = { mapped_code, mapped_extended,
-		(flags & KBD_FLAGS_RELEASE) != 0 };
-	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_KEY, payload, sizeof(payload));
+	const bool sent = client_send_input_message(client, &message);
 	if (sent && !client->keyboard_input_logged)
 	{
 		log_message("INFO", "RDP keyboard scancode → NanoKVM agent HID 전달 확인");
@@ -1391,44 +1327,23 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 static BOOL on_unicode_keyboard(rdpInput* input, UINT16 flags, UINT16 code)
 {
 	Client* client = (Client*)input->context;
-	if ((flags & KBD_FLAGS_RELEASE) != 0)
-		return TRUE;
 	const uint64_t received_at = monotonic_milliseconds();
-	if (code == 0 || (code >= 0xd800U && code <= 0xdfffU))
+	InputRouterMessage message;
+	if (!input_router_unicode(&client->input_router, code, (flags & KBD_FLAGS_RELEASE) != 0, &message))
 	{
-		char message[128];
-		(void)snprintf(message, sizeof(message),
+		char diagnostic[128];
+		(void)snprintf(diagnostic, sizeof(diagnostic),
 		               "지원하지 않는 RDP Unicode keyboard code unit U+%04X", code);
-		log_message("WARN", message);
+		log_message("WARN", diagnostic);
 		return FALSE;
 	}
-
-	uint8_t payload[3] = { 0 };
-	uint16_t length = 0;
-	if (code <= 0x007fU)
-	{
-		payload[0] = (uint8_t)code;
-		length = 1;
-	}
-	else if (code <= 0x07ffU)
-	{
-		payload[0] = (uint8_t)(0xc0U | (code >> 6U));
-		payload[1] = (uint8_t)(0x80U | (code & 0x3fU));
-		length = 2;
-	}
-	else
-	{
-		payload[0] = (uint8_t)(0xe0U | (code >> 12U));
-		payload[1] = (uint8_t)(0x80U | ((code >> 6U) & 0x3fU));
-		payload[2] = (uint8_t)(0x80U | (code & 0x3fU));
-		length = 3;
-	}
-
-	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_TEXT_UTF8, payload, length);
+	if (message.type == 0)
+		return TRUE;
+	const bool sent = client_send_input_message(client, &message);
 	char diagnostic[160];
 	(void)snprintf(diagnostic, sizeof(diagnostic),
 	               "RDP Unicode input received_ms=%llu ascii=%u bytes=%u forward_ms=%llu ok=%u",
-	               (unsigned long long)received_at, (unsigned)(code <= 0x7fU), length,
+	               (unsigned long long)received_at, (unsigned)(code <= 0x7fU), message.length,
 	               (unsigned long long)(monotonic_milliseconds() - received_at), (unsigned)sent);
 	log_message("INFO", diagnostic);
 	if (!sent)
@@ -1475,10 +1390,9 @@ static bool client_set_render_size(Client* client)
 
 static BOOL client_release_all_inputs(Client* client, const char* reason)
 {
-	client->pointer_buttons = 0;
-	client->keyboard_modifiers = 0;
-	client->control_space_down = false;
-	const bool sent = server_send_control(client->server, NANOKVM_CONTROL_RELEASE_ALL, NULL, 0);
+	InputRouterMessage message;
+	input_router_release_all(&client->input_router, &message);
+	const bool sent = client_send_input_message(client, &message);
 	if (sent && reason)
 	{
 		char message[128];
@@ -1495,57 +1409,45 @@ static BOOL on_synchronize(rdpInput* input, UINT32 toggle_states)
 	char message[160];
 	(void)snprintf(message, sizeof(message),
 	               "RDP Synchronize toggles=0x%08X previous_modifiers=0x%02X previous_buttons=0x%02X",
-	               toggle_states, client->keyboard_modifiers, client->pointer_buttons);
+	               toggle_states, client->input_router.keyboard_modifiers,
+	               client->input_router.pointer_buttons);
 	log_message("INFO", message);
-	client->pointer_buttons = 0;
-	client->keyboard_modifiers = 0;
-	client->control_space_down = false;
 	/* TS_SYNC_EVENT resets held keys. Subsequent down events restore held keys;
 	 * do not cancel preceding input that is still waiting for USB delivery. */
-	return server_send_control(client->server, NANOKVM_CONTROL_SYNCHRONIZE, NULL, 0);
+	InputRouterMessage output;
+	input_router_synchronize(&client->input_router, &output);
+	return client_send_input_message(client, &output);
 }
 
 static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 {
 	Client* client = (Client*)input->context;
-	const uint16_t width = client->server->config.width;
-	const uint16_t height = client->server->config.height;
-	if (!(flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)))
-		client->pointer_buttons = hid_pointer_buttons(client->pointer_buttons, flags);
+	const bool has_wheel = (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) != 0U;
+	InputRouterMessage message;
+	input_router_absolute_pointer(&client->input_router, x, y, flags, has_wheel, &message);
 	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) != 0)
 	{
 		char message[160];
 		(void)snprintf(message, sizeof(message),
 		               "RDP absolute button flags=0x%04X x=%u y=%u down=%u mask=0x%02X modifiers=0x%02X",
 		               flags, x, y, (unsigned)((flags & PTR_FLAGS_DOWN) != 0),
-		               client->pointer_buttons, client->keyboard_modifiers);
+		               client->input_router.pointer_buttons, client->input_router.keyboard_modifiers);
 		log_message("INFO", message);
 	}
-	uint8_t payload[12] = { 0 };
-	protocol_write_u16(payload, hid_clamp_absolute(x, width));
-	protocol_write_u16(payload + 2, hid_clamp_absolute(y, height));
-	protocol_write_u16(payload + 4, width);
-	protocol_write_u16(payload + 6, height);
-	protocol_write_u16(payload + 8, flags);
 	/* 휠 비트만 있는 이벤트는 좌표가 0이다. 위치 보고와 분리해 커서가 원점으로 튀지 않게 한다. */
-	const bool has_wheel = (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) != 0U;
-	const bool position_ok = has_wheel ||
-	                         server_send_control(client->server, NANOKVM_CONTROL_POINTER_ABS,
-	                                              payload, sizeof(payload));
-	const bool wheel_ok = !has_wheel ||
-	                      server_send_control(client->server, NANOKVM_CONTROL_WHEEL, payload + 8, 2);
-	if (position_ok && !client->pointer_input_logged)
+	const bool sent = client_send_input_message(client, &message);
+	if (sent && !has_wheel && !client->pointer_input_logged)
 	{
 		log_message("INFO", "RDP absolute pointer → NanoKVM agent HID 전달 확인");
 		client->pointer_input_logged = true;
 	}
-	if (wheel_ok && (flags & 0x0600U) != 0 &&
+	if (sent && has_wheel &&
 	    !client->wheel_input_logged)
 	{
 		log_message("INFO", "RDP wheel → NanoKVM agent HID 전달 확인");
 		client->wheel_input_logged = true;
 	}
-	return position_ok && wheel_ok;
+	return sent;
 }
 
 static BOOL on_extended_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
@@ -1570,36 +1472,26 @@ static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT1
 			flags = (uint16_t)(flags & (uint16_t)~PTR_FLAGS_WHEEL_NEGATIVE);
 		horizontal_wheel = true;
 	}
-	if (!(flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)))
-		client->pointer_buttons = hid_pointer_buttons(client->pointer_buttons, flags);
+	const bool has_wheel = (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) != 0;
+	InputRouterMessage message;
+	input_router_relative_pointer(&client->input_router, x_delta, y_delta, flags, has_wheel, &message);
 	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) != 0)
 	{
 		char message[192];
 		(void)snprintf(message, sizeof(message),
 		               "RDP relative button flags=0x%04X dx=%d dy=%d mask=0x%02X down=%u modifiers=0x%02X",
-		               flags, x_delta, y_delta, client->pointer_buttons,
-		               (unsigned)((flags & PTR_FLAGS_DOWN) != 0), client->keyboard_modifiers);
+		               flags, x_delta, y_delta, client->input_router.pointer_buttons,
+		               (unsigned)((flags & PTR_FLAGS_DOWN) != 0), client->input_router.keyboard_modifiers);
 		log_message("INFO", message);
 	}
-	uint8_t payload[5] = { 0 };
-	protocol_write_u16(payload, (uint16_t)x_delta);
-	protocol_write_u16(payload + 2, (uint16_t)y_delta);
-	payload[4] = client->pointer_buttons;
-	const bool position_ok = (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) != 0 ||
-	                         server_send_control(client->server, NANOKVM_CONTROL_POINTER_REL,
-	                                              payload, sizeof(payload));
-	uint8_t wheel_payload[2] = { 0 };
-	protocol_write_u16(wheel_payload, flags);
-	const bool wheel_ok = (flags & 0x0600U) == 0 ||
-	                      server_send_control(client->server, NANOKVM_CONTROL_WHEEL,
-	                                           wheel_payload, sizeof(wheel_payload));
-	if (wheel_ok && (flags & 0x0600U) != 0 &&
+	const bool sent = client_send_input_message(client, &message);
+	if (sent && has_wheel &&
 	    !client->wheel_input_logged)
 	{
 		log_message("INFO", "RDP relative wheel → NanoKVM agent HID 전달 확인");
 		client->wheel_input_logged = true;
 	}
-	return position_ok && wheel_ok;
+	return sent;
 }
 
 static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
@@ -1610,7 +1502,12 @@ static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 		return FALSE;
 	client->server = server;
 	client->peer = peer;
+	client->shutdown_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (!client->shutdown_event)
+		goto fail;
 	client->need_idr = true;
+	input_router_init(&client->input_router, server->config.width, server->config.height,
+	                  server->config.swap_alt_command);
 	hid_init(&client->hid, server->config.keyboard, server->config.mouse, server->config.touch);
 	if (server->config.direct_gfx)
 	{
@@ -1629,7 +1526,7 @@ static bool client_claim_active(Client* client)
 {
 	Server* server = client->server;
 	EnterCriticalSection(&server->lock);
-	if (server->active)
+	if (server->active || server->active_closing)
 	{
 		LeaveCriticalSection(&server->lock);
 		log_message("WARN", "single-client 제한으로 새 RDP 연결을 거부합니다");
@@ -1650,6 +1547,20 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	{
 		(void)client_release_all_inputs(client, NULL);
 		(void)server_set_stream_requested(client->server, false);
+	}
+	if (client->server)
+	{
+		EnterCriticalSection(&client->server->lock);
+		if (client->owns_active_client && client->server->active == client)
+		{
+			client->server->active = NULL;
+			client->server->active_closing = true;
+		}
+		HANDLE shutdown_event = client->shutdown_event;
+		client->shutdown_event = NULL;
+		LeaveCriticalSection(&client->server->lock);
+		if (shutdown_event)
+			(void)CloseHandle(shutdown_event);
 	}
 	if (client->video_thread)
 	{
@@ -1682,8 +1593,7 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	if (client->server && client->owns_active_client)
 	{
 		EnterCriticalSection(&client->server->lock);
-		if (client->server->active == client)
-			client->server->active = NULL;
+		client->server->active_closing = false;
 		LeaveCriticalSection(&client->server->lock);
 	}
 	DeleteCriticalSection(&client->lock);
@@ -1921,12 +1831,23 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 	{
 		HANDLE handles[MAX_EVENT_HANDLES] = WINPR_C_ARRAY_INIT;
 		DWORD count = peer->GetEventHandles(peer, handles, ARRAYSIZE(handles));
-		if (count == 0 || count >= ARRAYSIZE(handles))
+		if (count == 0)
 			break;
 		if (client->direct_gfx_active)
+		{
+			if (count >= ARRAYSIZE(handles))
+				break;
 			handles[count++] = WTSVirtualChannelManagerGetEventHandle(client->vcm);
+		}
 		if (client->bitmap_fallback_active && client->bitmap_ready_event)
+		{
+			if (count >= ARRAYSIZE(handles))
+				break;
 			handles[count++] = client->bitmap_ready_event;
+		}
+		if (count >= ARRAYSIZE(handles))
+			break;
+		handles[count++] = client->shutdown_event;
 		DWORD timeout = 20;
 		if (client->bitmap_fallback_active)
 		{
@@ -1955,6 +1876,8 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		const DWORD status = WaitForMultipleObjects(count, handles, FALSE, timeout);
 		if (status == WAIT_FAILED)
 			break;
+		if (WaitForSingleObject(client->shutdown_event, 0) == WAIT_OBJECT_0)
+			break;
 		/* Read key/button releases before spending time encoding the next frame. */
 		if (!peer->CheckFileDescriptor(peer))
 			break;
@@ -1976,18 +1899,20 @@ static BOOL peer_accepted(freerdp_listener* listener, freerdp_peer* peer)
 {
 	Server* server = (Server*)listener->info;
 	EnterCriticalSection(&server->lock);
-	const bool busy = server->active != NULL;
-	LeaveCriticalSection(&server->lock);
+	const bool busy = stop_requested || server->peer_thread != NULL || server->active != NULL ||
+	                  server->active_closing;
 	if (busy)
 	{
+		LeaveCriticalSection(&server->lock);
 		log_message("WARN", "single-client 제한으로 새 RDP 연결을 listener에서 거부합니다");
 		return FALSE;
 	}
 	peer->ContextExtra = server;
-	HANDLE thread = CreateThread(NULL, 0, peer_thread, peer, 0, NULL);
+	server->peer_thread = CreateThread(NULL, 0, peer_thread, peer, 0, NULL);
+	HANDLE thread = server->peer_thread;
+	LeaveCriticalSection(&server->lock);
 	if (!thread)
 		return FALSE;
-	(void)CloseHandle(thread);
 	return TRUE;
 }
 
@@ -2032,7 +1957,6 @@ int main(int argc, char* argv[])
 	server.config.bitrate = DEFAULT_BITRATE;
 	server.config.control_port = 3390;
 	server.config.video_port = 5004;
-	server.control_fd = -1;
 	server.control_listener = -1;
 	for (int index = 1; index < argc; index++)
 	{
@@ -2068,46 +1992,86 @@ int main(int argc, char* argv[])
 	if (server.config.width == 0 || server.config.height == 0 || server.config.bitrate == 0 ||
 	    server.config.control_port == 0 || server.config.video_port == 0)
 		return 2;
-	if (!InitializeCriticalSectionAndSpinCount(&server.lock, 4000) ||
-	    !InitializeCriticalSectionAndSpinCount(&server.control_lock, 4000) ||
-	    !InitializeCriticalSectionAndSpinCount(&server.key_ack_lock, 4000))
+	if (!InitializeCriticalSectionAndSpinCount(&server.lock, 4000))
 		return 1;
+	const AgentTransportCallbacks transport_callbacks = {
+		.event = on_transport_event,
+		.clock = transport_clock,
+		.context = &server,
+	};
+	if (!agent_transport_init(&server.transport, &transport_callbacks))
+	{
+		DeleteCriticalSection(&server.lock);
+		return 1;
+	}
+	server.device_session = device_session_create(&(DeviceSessionConfig){
+		.video_port = server.config.video_port,
+		.video_source = {
+			.request_idr = request_video_idr,
+			.request_idr_context = &server,
+		},
+	});
+	if (!server.device_session)
+	{
+		agent_transport_destroy(&server.transport);
+		DeleteCriticalSection(&server.lock);
+		return 1;
+	}
 	if (!WTSRegisterWtsApiFunctionTable(FreeRDP_InitWtsApi()) ||
 	    !winpr_InitializeSSL(WINPR_SSL_INIT_DEFAULT))
+	{
+		device_session_destroy(server.device_session);
+		agent_transport_destroy(&server.transport);
+		DeleteCriticalSection(&server.lock);
 		return 1;
+	}
 
 	freerdp_listener* listener = freerdp_listener_new();
 	if (!listener)
+	{
+		device_session_destroy(server.device_session);
+		agent_transport_destroy(&server.transport);
+		DeleteCriticalSection(&server.lock);
 		return 1;
+	}
 	server.control_listener = open_control_listener(server.config.bind_address, server.config.control_port);
 	if (server.control_listener < 0)
 	{
 		freerdp_listener_free(listener);
+		device_session_destroy(server.device_session);
+		agent_transport_destroy(&server.transport);
+		DeleteCriticalSection(&server.lock);
 		return 1;
 	}
-	server.key_ack_event = CreateEvent(NULL, TRUE, FALSE, NULL);
-	if (!server.key_ack_event)
+	server.control_thread = CreateThread(NULL, 0, control_thread, &server, 0, NULL);
+	if (!server.control_thread)
 	{
 		(void)close(server.control_listener);
 		freerdp_listener_free(listener);
+		device_session_destroy(server.device_session);
+		agent_transport_destroy(&server.transport);
+		DeleteCriticalSection(&server.lock);
 		return 1;
 	}
-	HANDLE control = CreateThread(NULL, 0, control_thread, &server, 0, NULL);
-	if (!control)
-	{
-		(void)CloseHandle(server.key_ack_event);
-		(void)close(server.control_listener);
-		freerdp_listener_free(listener);
-		return 1;
-	}
-	(void)CloseHandle(control);
 	listener->info = &server;
 	listener->PeerAccepted = peer_accepted;
 	WSADATA wsa = WINPR_C_ARRAY_INIT;
-	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0 ||
-	    !listener->Open(listener, server.config.bind_address, server.config.port))
+	const bool wsa_started = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+	if (!wsa_started || !listener->Open(listener, server.config.bind_address, server.config.port))
 	{
+		stop_requested = 1;
+		(void)shutdown(server.control_listener, SHUT_RDWR);
+		(void)close(server.control_listener);
+		server.control_listener = -1;
+		agent_transport_shutdown(&server.transport);
+		(void)WaitForSingleObject(server.control_thread, INFINITE);
+		(void)CloseHandle(server.control_thread);
 		freerdp_listener_free(listener);
+		device_session_destroy(server.device_session);
+		agent_transport_destroy(&server.transport);
+		if (wsa_started)
+			WSACleanup();
+		DeleteCriticalSection(&server.lock);
 		return 1;
 	}
 	(void)signal(SIGINT, on_signal);
@@ -2126,16 +2090,23 @@ int main(int argc, char* argv[])
 		if (!listener->CheckFileDescriptor(listener))
 			break;
 	}
+	stop_requested = 1;
 	listener->Close(listener);
 	freerdp_listener_free(listener);
-	if (server.control_fd >= 0)
-		(void)close(server.control_fd);
+	if (!server_join_peer_thread(&server))
+		return 1;
 	if (server.control_listener >= 0)
+	{
+		(void)shutdown(server.control_listener, SHUT_RDWR);
 		(void)close(server.control_listener);
-	(void)CloseHandle(server.key_ack_event);
+		server.control_listener = -1;
+	}
+	agent_transport_shutdown(&server.transport);
+	(void)WaitForSingleObject(server.control_thread, INFINITE);
+	(void)CloseHandle(server.control_thread);
+	agent_transport_destroy(&server.transport);
+	device_session_destroy(server.device_session);
 	WSACleanup();
-	DeleteCriticalSection(&server.key_ack_lock);
-	DeleteCriticalSection(&server.control_lock);
 	DeleteCriticalSection(&server.lock);
 	return 0;
 }
