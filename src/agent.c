@@ -30,7 +30,7 @@
 #define DEFAULT_VIDEO_PORT 5004U
 #define DEFAULT_WIDTH 1920U
 #define DEFAULT_HEIGHT 1080U
-#define DEFAULT_BITRATE 8000U
+#define DEFAULT_BITRATE 4000U
 #define HEARTBEAT_INTERVAL_MS 1000U
 #define HEARTBEAT_TIMEOUT_MS 5000U
 #define CAPTURE_RETRY_SLEEP_NS 10000000L
@@ -260,8 +260,8 @@ static void handle_control(Agent* agent, const NanokvmControlMessage* message)
 		case NANOKVM_CONTROL_START_STREAM:
 			atomic_store(&agent->streaming, true);
 			atomic_store(&agent->wait_for_idr, true);
-			(void)fprintf(stderr, "%s: START_STREAM 수신 (%ux%u 원본 H.264 전송 시작)\n", TAG,
-			              agent->width, agent->height);
+			(void)fprintf(stderr, "%s: START_STREAM 수신 (%ux%u 원본 H.264 전송 시작, bitrate=%u kbps)\n", TAG,
+			              agent->width, agent->height, agent->bitrate);
 			break;
 		case NANOKVM_CONTROL_STOP_STREAM:
 			atomic_store(&agent->streaming, false);

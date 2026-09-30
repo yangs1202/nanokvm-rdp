@@ -136,10 +136,10 @@ While running, the agent sends one unit of relative HID mouse motion every five 
 ```sh
 ./build/agent/nanokvm-agent -gateway nanokvm-gw.yangs.sh \
   -control-port 3390 -video-port 5004 \
-  -width 1920 -height 1080 -bitrate 3000
+  -width 1920 -height 1080 -bitrate 4000
 ```
 
-The gateway's default render size is 1920×1080 and its default bitrate is 3000. Use the same control and video port values on both sides.
+The agent and its service script default to 4000 kbps to reduce encoded frame size and IDR burst pressure. This may reduce image quality during motion; the actual IDR size depends on the encoder and scene. GOP and capture cadence are unchanged. `IDR_REQUEST` waits for the next encoder-generated IDR; it does not force an immediate keyframe. The gateway's default render size is 1920×1080 and its bitrate option defaults to 3000, but AVC420 passthrough uses the agent's bitrate setting. Use the same control and video port values on both sides.
 
 ## Deployment
 

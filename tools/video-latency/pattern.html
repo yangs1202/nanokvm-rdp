@@ -9,9 +9,19 @@ body{margin:0;background:#111;color:#fff;font:24px monospace}header{padding:20px
 <script>
 'use strict';
 const canvas=document.querySelector('canvas'), ctx=canvas.getContext('2d');
+// Render into a complete back buffer, then publish it with one drawImage call.
+// This reduces intra-canvas mixed-frame exposure; it cannot prove that the
+// browser/Windows App/compositor/ScreenCaptureKit path presents atomically.
+const backBuffer=document.createElement('canvas');
+backBuffer.width=canvas.width;backBuffer.height=canvas.height;
+const backCtx=backBuffer.getContext('2d');
+const patternVersion='canvas-backbuffer-cadence-v2';
 const status=document.querySelector('#status');
 const runId=new URLSearchParams(location.search).get('run_id');
-let calibration=null, sequence=0, running=false, last=0, startReported=false, endReported=false, runOperation=false, runInvalidated=false;
+const framePeriod=1000/30;
+let calibration=null, sequence=0, running=false, nextFrameAt=null, startReported=false, endReported=false, runOperation=false, runInvalidated=false;
+let renderWindowStart=null, renderWindowFrames=0, renderWindowMissed=0, measuredRenderHz=null;
+let renderCount=0, renderMissedDeadlines=0, renderTelemetryStart=null;
 async function sync(phase){
   const samples=[];
   for(let i=0;i<20;i++){
@@ -36,7 +46,8 @@ async function sync(phase){
     status.textContent=`Clock uncertainty ±${best.sync_error_ms.toFixed(2)} ms; RTT ${best.round_trip_ms.toFixed(2)} ms. Pattern 30 Hz; resync after run.`;
     return;
   }
-  return {schema_version:1,run_id:runId,phase,source_clock:'browser performance.now() milliseconds',
+  return {schema_version:1,run_id:runId,phase,pattern_version:patternVersion,
+    source_clock:'browser performance.now() milliseconds',
     calibration_started_source_ms:samples[0].request.local_before_ms,
     calibration_completed_source_ms:samples[samples.length-1].local_after_ms,
     calibration_started_server_ms:samples[0].request.local_before_ms+best.offset_server_minus_source_ms,
@@ -45,6 +56,10 @@ async function sync(phase){
     offset_server_minus_source_ms:best.offset_server_minus_source_ms,
     sync_error_ms:best.sync_error_ms,
     offset_interval_server_minus_source_ms:best.offset_interval_server_minus_source_ms,
+    render_telemetry:{count:renderCount,missed_deadlines:renderMissedDeadlines,
+      started_source_ms:renderTelemetryStart,ended_source_ms:performance.now(),
+      measured_hz:renderTelemetryStart===null?null:
+        renderCount*1000/(performance.now()-renderTelemetryStart)},
     samples};
 }
 async function reportCalibration(report){
@@ -70,7 +85,7 @@ async function observeRun(){
     if(run.status==='start_requested'&&!startReported){
       running=false; status.textContent=`Run ${runId}: calibrating source clock at start…`;
       await reportCalibration(await sync('start'));
-      startReported=true; running=true; requestAnimationFrame(draw);
+      startReported=true; running=true; nextFrameAt=null; renderWindowStart=performance.now(); renderWindowFrames=0; renderWindowMissed=0; renderCount=0; renderMissedDeadlines=0; renderTelemetryStart=performance.now(); requestAnimationFrame(draw);
       status.textContent=`Run ${runId}: source clock start calibrated; collecting.`;
     } else if(run.status==='end_requested'&&startReported&&!endReported){
       running=false; status.textContent=`Run ${runId}: calibrating source clock at end…`;
@@ -80,26 +95,45 @@ async function observeRun(){
   } catch(error) { status.textContent=`Run calibration failed: ${error.message}`; await invalidateRun('source_calibration_failure'); }
   finally { runOperation=false; }
 }
+function updateRenderStatus(){
+  if(renderWindowStart===null)return;
+  const now=performance.now(), elapsed=now-renderWindowStart;
+  if(elapsed<1000)return;
+  measuredRenderHz=renderWindowFrames*1000/elapsed;
+  const missed=renderWindowMissed;
+  renderWindowStart=now;renderWindowFrames=0;renderWindowMissed=0;
+  const suffix=` Source draw ${measuredRenderHz.toFixed(1)} Hz; missed deadlines ${missed}.`;
+  if(runId&&startReported&&!endReported&&!runInvalidated)
+    status.textContent=`Run ${runId}: source clock start calibrated; collecting.${suffix}`;
+  else if(!runId&&running)
+    status.textContent=`Clock uncertainty ±${calibration.error.toFixed(2)} ms; measured source draw ${measuredRenderHz.toFixed(1)} Hz.${suffix}`;
+}
 function draw(t){
   if(!running)return;
-  if(t-last>=1000/30){
-    last=t;
+  if(nextFrameAt===null)nextFrameAt=t;
+  if(t>=nextFrameAt){
+    const missed=Math.max(0,Math.floor((t-nextFrameAt)/framePeriod));
+    renderWindowMissed+=missed;renderMissedDeadlines+=missed;
+    nextFrameAt+=(missed+1)*framePeriod;
     const now=performance.now();
     const stamp=Math.round(now+calibration.offset);
     sequence++;
-    ctx.fillStyle='#111';ctx.fillRect(0,0,1600,760);
-    ctx.fillStyle='#fff';ctx.font='bold 105px monospace';
-    ctx.fillText(String(stamp),35,155);
-    ctx.font='52px monospace';ctx.fillText('FRAME '+sequence,35,255);
-    ctx.fillText('SYNC +/- '+calibration.error.toFixed(2)+' ms',35,335);
-    ctx.fillText('AGE '+((now-calibration.at)/1000).toFixed(1)+' s',35,410);
+    backCtx.fillStyle='#111';backCtx.fillRect(0,0,1600,760);
+    backCtx.fillStyle='#fff';backCtx.font='bold 105px monospace';
+    backCtx.fillText(String(stamp),35,155);
+    backCtx.font='52px monospace';backCtx.fillText('FRAME '+sequence,35,255);
+    backCtx.fillText('SYNC +/- '+calibration.error.toFixed(2)+' ms',35,335);
+    backCtx.fillText('AGE '+((now-calibration.at)/1000).toFixed(1)+' s',35,410);
     for(let bit=0;bit<32;bit++){
       const on=(sequence>>>bit)&1;
-      ctx.fillStyle=on?'#fff':'#000';ctx.fillRect(32+bit*48,470,44,90);
-      ctx.fillStyle=on?'#000':'#fff';ctx.fillRect(32+bit*48,565,44,90);
+      backCtx.fillStyle=on?'#fff':'#000';backCtx.fillRect(32+bit*48,470,44,90);
+      backCtx.fillStyle=on?'#000':'#fff';backCtx.fillRect(32+bit*48,565,44,90);
     }
-    ctx.fillStyle=sequence%2?'#008cff':'#ffa000';ctx.fillRect(32,680,1536,50);
+    backCtx.fillStyle=sequence%2?'#008cff':'#ffa000';backCtx.fillRect(32,680,1536,50);
+    ctx.drawImage(backBuffer,0,0);
+    renderWindowFrames++;renderCount++;
   }
+  updateRenderStatus();
   requestAnimationFrame(draw);
 }
 document.querySelector('#start').onclick=async()=>{
@@ -108,7 +142,7 @@ document.querySelector('#start').onclick=async()=>{
     status.textContent=`Run ${runId} invalidated: manual resync is not allowed during formal collection.`;
     return;
   }
-  running=false;
+  running=false;nextFrameAt=null;renderWindowStart=performance.now();renderWindowFrames=0;renderWindowMissed=0;renderCount=0;renderMissedDeadlines=0;renderTelemetryStart=null;
   try{await sync();running=true;requestAnimationFrame(draw)}
   catch(e){status.textContent='Clock sync failed: '+e.message}
 };

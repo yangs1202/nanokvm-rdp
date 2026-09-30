@@ -13,8 +13,11 @@ python3 tools/video-latency/server.py --bind <Mac-LAN-IP>
 For exploratory use, open the printed `/1` URL in the source Windows browser. Click **Start /
 resync** and keep the page visible. For a formal collector run, instead open
 `/1?run_id=<run-id>` and let the collector request start/end calibration; manual
-resync or hiding that source tab invalidates the run. The server exposes only this page and its clock,
-not repository files. Use a trusted LAN; stop the process after the measurement.
+resync or hiding that source tab invalidates the run. A short, URL-safe run ID may use the
+equivalent alias `/1/<run-id>` (for example `/1/d1`); the server validates the ID and redirects
+to `/1?run_id=<run-id>`. Invalid or nested path segments are rejected. The server exposes only
+this page and its clock, not repository files. Use a trusted LAN; stop the process after the
+measurement.
 No Windows software installation or system clock change is required.
 
 The page makes 20 clock exchanges and chooses the narrowest offset interval. For
@@ -37,8 +40,17 @@ clock drift is not included in the displayed bound.
 ## Collect observations
 
 The canvas shows a large server-timeline millisecond timestamp, frame sequence,
-clock uncertainty, calibration age, and sequence/complement binary rows. Frames
-are generated at approximately 30 Hz while requestAnimationFrame is active.
+clock uncertainty, calibration age, and sequence/complement binary rows. The
+source now renders each pattern into a complete back buffer and publishes it with
+one canvas `drawImage`; this reduces intra-canvas mixed-frame exposure but does
+not prove atomic presentation through the browser, Windows App, compositor, or
+ScreenCaptureKit. The page also displays measured source draw Hz and missed
+deadlines. This is source-render telemetry, not negotiated video FPS.
+
+The old `t-last >= 1000/30` cadence was replaced with a fixed deadline schedule.
+This avoids accumulating a full-frame period of drift after a delayed
+`requestAnimationFrame`, while still reporting missed deadlines. It does not
+make a 30 Hz guarantee when the browser or compositor cannot deliver callbacks.
 Actual rate may be lower because of refresh cadence and scheduling.
 
 Capture the **receiving** Windows App window, not the original source page.
@@ -80,6 +92,46 @@ encoder, video transport, gateway processing, RDP delivery, client composition,
 and any age due to source refresh timing. It excludes physical pixel emission.
 The changing test pattern can itself change codec workload. Record window size,
 source resolution, video mode, bitrate, client and network conditions with results.
+
+## Collector-first execution and timeout policy
+
+Use `run_capture.py` for a live run. It starts `collector.py` first, retries the
+initial run-state `404` while the page registers the run, waits for source-start
+calibration, applies the warmup, and tees producer JSONL to a preserved local
+file and the collector. The default producer wall timeout is 900 seconds; the
+60-second no-progress timeout is independent. `timing.json` records both the
+requested `warmup_seconds` and the measured `warmup_elapsed_seconds` from
+source-start confirmation to producer start. A timeout never converts a partial
+run into a verdict, and an existing run directory is never overwritten.
+
+```sh
+python3 tools/video-latency/run_capture.py \
+  --run-id <run-id> \
+  --run-dir .omo/evidence/ab-runbook-2026-09-29/formal-runs/<run-id> \
+  --server-url http://<capture-host-LAN-IP>:8765/1 \
+  --metadata docs/measurements/2026-09-29-video-latency-formal-manifest.json \
+  --pattern-version canvas-backbuffer-cadence-v2 \
+  --pattern-sha256 ef96e5e313d9c4b7d9eb52384ce358dd5389ea7eb2a30978bbe0e1180fbf2e0f \
+  --producer tools/video-latency/capture-producer/.build/debug/capture-producer \
+  --collector tools/video-latency/collector.py \
+  --python /opt/homebrew/bin/python3 --window-id 10111 \
+  --count 1000 --interval-ms 33 \
+  --warmup-seconds 30 --wall-timeout-seconds 900 \
+  --no-progress-timeout-seconds 60
+```
+
+The producer still performs Vision OCR inline, so the capture attempt rate is
+not a video-FPS measurement. If OCR throughput materially perturbs capture, the
+next method is a two-pass producer: first preserve PNGs, capture intervals,
+ScreenCaptureKit presentation timestamps, and immutable sidecars without OCR;
+then run Vision OCR over those exact PNGs into a separate derived JSONL artifact.
+The derived artifact must retain the original attempt index and may exclude only
+explicit OCR failures; it must never repair or substitute timestamp digits.
+
+The analyzer reports `capture_sampling_hz`, `observation_gap_count`, and
+`video_stall_status=not_measurable_from_sampled_captures`. Sparse OCR/capture
+observations must not be used as a negotiated video FPS, encoder FPS, or stall
+performance pass.
 
 ## Validation
 
