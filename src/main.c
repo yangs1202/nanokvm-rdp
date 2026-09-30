@@ -62,6 +62,7 @@
 #define DEFAULT_BITRATE 8000U
 #define MAX_EVENT_HANDLES 32U
 #define BITMAP_FRAME_INTERVAL_MS 10U
+#define GATEWAY_KEEPALIVE_INTERVAL_MS 10000U
 #define CLASSIC_TILE_WIDTH 64U
 #define CLASSIC_TILE_HEIGHT 64U
 #define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
@@ -102,6 +103,8 @@ struct Server
 	AgentTransport transport;
 	DeviceSession* device_session;
 	uint64_t last_stats_log_at;
+	uint64_t next_keepalive_at;
+	int8_t keepalive_dx;
 	Client* active;
 	bool active_closing;
 };
@@ -188,6 +191,38 @@ static void log_message(const char* level, const char* message)
 static bool server_send_control(Server* server, uint8_t type, const void* payload, uint16_t length)
 {
 	return agent_transport_send(&server->transport, type, payload, length);
+}
+
+/* Keep the remote host awake from the gateway even when the RDP client is
+ * disconnected. Never inject motion while the RDP client holds a button or
+ * modifier, because a relative report with no button state would release it. */
+static void server_keepalive(Server* server, uint64_t now)
+{
+	if (now < server->next_keepalive_at)
+		return;
+
+	server->next_keepalive_at = now + GATEWAY_KEEPALIVE_INTERVAL_MS;
+	bool idle = true;
+	EnterCriticalSection(&server->lock);
+	Client* active = server->active;
+	if (active)
+	{
+		EnterCriticalSection(&active->lock);
+		idle = active->input_router.pointer_buttons == 0 &&
+		       active->input_router.keyboard_modifiers == 0 &&
+		       !active->input_router.control_space_down;
+		LeaveCriticalSection(&active->lock);
+	}
+	LeaveCriticalSection(&server->lock);
+	if (!idle)
+		return;
+
+	uint8_t payload[5] = { 0 };
+	protocol_write_u16(payload, (uint16_t)(int16_t)server->keepalive_dx);
+	/* The gateway keepalive is a one-unit horizontal relative motion with no
+	 * buttons or wheel. The agent applies it to the USB HID mouse endpoint. */
+	if (server_send_control(server, NANOKVM_CONTROL_POINTER_REL, payload, sizeof(payload)))
+		server->keepalive_dx = (int8_t)-server->keepalive_dx;
 }
 
 static bool server_set_stream_requested(Server* server, bool requested)
@@ -343,6 +378,7 @@ static void server_heartbeat(Server* server)
 {
 	const uint64_t now = monotonic_milliseconds();
 	agent_transport_heartbeat(&server->transport, now);
+	server_keepalive(server, now);
 	if (now - server->last_stats_log_at < STATS_LOG_INTERVAL_MS)
 		return;
 	server->last_stats_log_at = now;
@@ -1326,26 +1362,33 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 	Client* client = (Client*)input->context;
 	const bool raw_extended = (flags & KBD_FLAGS_EXTENDED) != 0;
 	const bool release = (flags & KBD_FLAGS_RELEASE) != 0;
-	const uint8_t modifiers_before = client->input_router.keyboard_modifiers;
 	InputRouterMessage message;
+	uint8_t modifiers_before = 0;
+	uint8_t modifiers_after = 0;
+	bool control_space_down = false;
+	EnterCriticalSection(&client->lock);
+	modifiers_before = client->input_router.keyboard_modifiers;
 	input_router_keyboard(&client->input_router, code, raw_extended, release, &message);
-	if (client->input_router.keyboard_modifiers != 0 || code == 0x3a)
+	modifiers_after = client->input_router.keyboard_modifiers;
+	control_space_down = client->input_router.control_space_down;
+	LeaveCriticalSection(&client->lock);
+	if (modifiers_after != 0 || code == 0x3a)
 	{
 		char diagnostic[192];
 		(void)snprintf(diagnostic, sizeof(diagnostic),
 		               "RDP modifier diagnostic raw=0x%02X extended=%u release=%u mapped=0x%02X extended=%u modifiers=0x%02X",
 		               code, (unsigned)raw_extended, (unsigned)release,
 		               message.payload[0], (unsigned)message.payload[1],
-		               client->input_router.keyboard_modifiers);
+		               modifiers_after);
 		log_message("INFO", diagnostic);
 	}
 	if (code == 0x39 && !raw_extended &&
-	    ((client->input_router.keyboard_modifiers & 0x11U) || client->input_router.control_space_down))
+	    ((modifiers_after & 0x11U) || control_space_down))
 	{
 		char diagnostic[128];
 		(void)snprintf(diagnostic, sizeof(diagnostic),
 		               "RDP Control+Space diagnostic release=%u modifiers=0x%02X",
-		               (unsigned)release, client->input_router.keyboard_modifiers);
+		               (unsigned)release, modifiers_after);
 		log_message("INFO", diagnostic);
 	}
 	const bool input_trace = input_trace_enabled() && input_trace_scancode(code, raw_extended);
@@ -1359,7 +1402,7 @@ static BOOL on_keyboard(rdpInput* input, UINT16 flags, UINT8 code)
 		(void)snprintf(diagnostic, sizeof(diagnostic),
 		               "INPUT TRACE raw=0x%02X extended=%u release=%u modifiers_before=0x%02X modifiers_after=0x%02X payload=0x%02X/%u/%u epoch=%llu sent=%u",
 		               code, (unsigned)raw_extended, (unsigned)release, modifiers_before,
-		               client->input_router.keyboard_modifiers, message.payload[0],
+		               modifiers_after, message.payload[0],
 		               (unsigned)message.payload[1], (unsigned)message.payload[2],
 		               (unsigned long long)input_trace_epoch, (unsigned)sent);
 		log_message("INFO", diagnostic);
@@ -1439,7 +1482,9 @@ static bool client_set_render_size(Client* client)
 static BOOL client_release_all_inputs(Client* client, const char* reason)
 {
 	InputRouterMessage message;
+	EnterCriticalSection(&client->lock);
 	input_router_release_all(&client->input_router, &message);
+	LeaveCriticalSection(&client->lock);
 	const bool sent = client_send_input_message(client, &message);
 	if (sent && reason)
 	{
@@ -1455,15 +1500,22 @@ static BOOL on_synchronize(rdpInput* input, UINT32 toggle_states)
 {
 	Client* client = (Client*)input->context;
 	char message[160];
+	uint8_t previous_modifiers = 0;
+	uint8_t previous_buttons = 0;
+	EnterCriticalSection(&client->lock);
+	previous_modifiers = client->input_router.keyboard_modifiers;
+	previous_buttons = client->input_router.pointer_buttons;
+	LeaveCriticalSection(&client->lock);
 	(void)snprintf(message, sizeof(message),
 	               "RDP Synchronize toggles=0x%08X previous_modifiers=0x%02X previous_buttons=0x%02X",
-	               toggle_states, client->input_router.keyboard_modifiers,
-	               client->input_router.pointer_buttons);
+	               toggle_states, previous_modifiers, previous_buttons);
 	log_message("INFO", message);
 	/* TS_SYNC_EVENT resets held keys. Subsequent down events restore held keys;
 	 * do not cancel preceding input that is still waiting for USB delivery. */
 	InputRouterMessage output;
+	EnterCriticalSection(&client->lock);
 	input_router_synchronize(&client->input_router, &output);
+	LeaveCriticalSection(&client->lock);
 	return client_send_input_message(client, &output);
 }
 
@@ -1472,14 +1524,20 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	Client* client = (Client*)input->context;
 	const bool has_wheel = (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) != 0U;
 	InputRouterMessage message;
+	uint8_t pointer_buttons = 0;
+	uint8_t keyboard_modifiers = 0;
+	EnterCriticalSection(&client->lock);
 	input_router_absolute_pointer(&client->input_router, x, y, flags, has_wheel, &message);
+	pointer_buttons = client->input_router.pointer_buttons;
+	keyboard_modifiers = client->input_router.keyboard_modifiers;
+	LeaveCriticalSection(&client->lock);
 	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) != 0)
 	{
 		char message[160];
 		(void)snprintf(message, sizeof(message),
 		               "RDP absolute button flags=0x%04X x=%u y=%u down=%u mask=0x%02X modifiers=0x%02X",
 		               flags, x, y, (unsigned)((flags & PTR_FLAGS_DOWN) != 0),
-		               client->input_router.pointer_buttons, client->input_router.keyboard_modifiers);
+		               pointer_buttons, keyboard_modifiers);
 		log_message("INFO", message);
 	}
 	/* 휠 비트만 있는 이벤트는 좌표가 0이다. 위치 보고와 분리해 커서가 원점으로 튀지 않게 한다. */
@@ -1522,14 +1580,20 @@ static BOOL on_relative_mouse(rdpInput* input, UINT16 flags, INT16 x_delta, INT1
 	}
 	const bool has_wheel = (flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) != 0;
 	InputRouterMessage message;
+	uint8_t pointer_buttons = 0;
+	uint8_t keyboard_modifiers = 0;
+	EnterCriticalSection(&client->lock);
 	input_router_relative_pointer(&client->input_router, x_delta, y_delta, flags, has_wheel, &message);
+	pointer_buttons = client->input_router.pointer_buttons;
+	keyboard_modifiers = client->input_router.keyboard_modifiers;
+	LeaveCriticalSection(&client->lock);
 	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) != 0)
 	{
 		char message[192];
 		(void)snprintf(message, sizeof(message),
 		               "RDP relative button flags=0x%04X dx=%d dy=%d mask=0x%02X down=%u modifiers=0x%02X",
-		               flags, x_delta, y_delta, client->input_router.pointer_buttons,
-		               (unsigned)((flags & PTR_FLAGS_DOWN) != 0), client->input_router.keyboard_modifiers);
+		               flags, x_delta, y_delta, pointer_buttons,
+		               (unsigned)((flags & PTR_FLAGS_DOWN) != 0), keyboard_modifiers);
 		log_message("INFO", message);
 	}
 	const bool sent = client_send_input_message(client, &message);
@@ -2048,6 +2112,8 @@ int main(int argc, char* argv[])
 	if (server.config.width == 0 || server.config.height == 0 || server.config.bitrate == 0 ||
 	    server.config.control_port == 0 || server.config.video_port == 0)
 		return 2;
+	server.next_keepalive_at = monotonic_milliseconds() + GATEWAY_KEEPALIVE_INTERVAL_MS;
+	server.keepalive_dx = 1;
 	if (!InitializeCriticalSectionAndSpinCount(&server.lock, 4000))
 		return 1;
 	const AgentTransportCallbacks transport_callbacks = {
