@@ -325,19 +325,22 @@ def first_seen_and_stalls(observations, fps):
     # Count distinct frames over the entire observation period.  Do not use just
     # first-to-last first-seen time: that conceals a freeze at either boundary.
     observed_fps = (len(times) * 1000 / elapsed) if elapsed > 0 else None
+    capture_sampling_hz = (len(observations) * 1000 / elapsed) if elapsed > 0 else None
     gaps = [right - left for left, right in zip([observation_start] + times,
                                                  times + [observation_end])]
     threshold = 3_000 / fps
     return {
         'first_seen_unique_frame_count': len(times),
         'observed_first_seen_fps': observed_fps,
+        'capture_sampling_hz': capture_sampling_hz,
         'observation_duration_ms': elapsed,
-        'limitation': 'first-seen OCR/capture rate over the full observation period only; sampling, OCR failures, and repeated displayed frames can understate delivery FPS, and it does not measure encoder or display refresh FPS',
-        'stall_threshold_ms': threshold,
-        'stall_count': sum(gap > threshold for gap in gaps),
-        'max_first_seen_gap_ms': max(gaps) if gaps else None,
-        'initial_first_seen_gap_ms': gaps[0] if gaps else None,
-        'terminal_first_seen_gap_ms': gaps[-1] if gaps else None,
+        'video_stall_status': 'not_measurable_from_sampled_captures',
+        'limitation': 'first-seen OCR/capture rate and observation gaps only; this sampling cannot establish encoder, transport, compositor, or display-refresh FPS/stalls, so it must not be used as a video FPS performance pass criterion',
+        'observation_gap_threshold_ms': threshold,
+        'observation_gap_count': sum(gap > threshold for gap in gaps),
+        'max_observation_gap_ms': max(gaps) if gaps else None,
+        'initial_observation_gap_ms': gaps[0] if gaps else None,
+        'terminal_observation_gap_ms': gaps[-1] if gaps else None,
     }
 
 

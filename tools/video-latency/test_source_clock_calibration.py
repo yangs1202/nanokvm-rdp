@@ -185,8 +185,10 @@ class SourceClockCalibrationTest(unittest.TestCase):
         fixture['observations'] = [dict(item, frame_id='frozen') for item in observations]
         frozen = ANALYZE.analyze_formal(fixture)
         self.assertTrue(frozen['eligible_for_formal_analysis'])
-        self.assertGreater(frozen['observed_first_seen']['terminal_first_seen_gap_ms'], 60_000)
-        self.assertEqual(frozen['observed_first_seen']['stall_count'], 1)
+        self.assertGreater(frozen['observed_first_seen']['terminal_observation_gap_ms'], 60_000)
+        self.assertEqual(frozen['observed_first_seen']['observation_gap_count'], 1)
+        self.assertEqual(frozen['observed_first_seen']['video_stall_status'],
+                         'not_measurable_from_sampled_captures')
         fixture['producer_session'] = dict(fixture['producer_session'],
                                            capture_attempt_count=1001, ocr_failure_count=1)
         failed_ocr = ANALYZE.analyze_formal(fixture)

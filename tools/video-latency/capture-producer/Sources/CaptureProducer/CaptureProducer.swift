@@ -3,6 +3,7 @@ import CoreImage
 import CoreMedia
 import Darwin
 import Foundation
+import AppKit
 import ScreenCaptureKit
 
 private enum Exit: Int32 {
@@ -285,6 +286,14 @@ private struct CaptureProducer {
             at: outputDirectory,
             withIntermediateDirectories: true
         )
+        // SCContentFilter(desktopIndependentWindow:) reaches CoreGraphics/SLS.
+        // A pure SwiftPM CLI has no NSApplication bootstrap, so initialize the
+        // AppKit/CGS client before constructing the filter. Prohibited policy
+        // keeps this capture helper from creating or activating a user-facing app.
+        await MainActor.run {
+            _ = NSApplication.shared
+            NSApp.setActivationPolicy(.prohibited)
+        }
         let clock = MonotonicClock()
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let configuration = SCStreamConfiguration()

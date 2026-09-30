@@ -43,7 +43,9 @@ for a formal run; record that exact limitation and leave the A/B decision pendin
 Start `server.py`, then open the source page with the exact run ID before starting
 the collector: `http://<host>:8765/1?run_id=<run-id>`. Keep that tab visible.
 The collector requests source start calibration, waits for it before reading JSONL,
-then requests and waits for source end calibration after stdin closes. End stdin
+then requests and waits for source end calibration after stdin closes. For short run IDs,
+the source URL may use `http://<host>:8765/1/<run-id>`; the server validates that alias
+and redirects it to the query form. End stdin
 (Ctrl-D) to take end calibration and write the artifact. Empty lines are ignored. Every
 nonempty line must be a JSON object with these required fields:
 
@@ -62,6 +64,11 @@ capture API call, on the producer host. `source_timestamp_server_ms` and
 `frame_id` are read from that captured receiving-window frame; a producer may
 use validated OCR, but the unchanged input line makes that method auditable.
 `capture_artifact` is a nonempty path or immutable external capture ID. The
+capture producer may be slower than the video path when it performs OCR; the
+capture sampling rate must therefore be recorded separately from video FPS.
+The analyzer names long gaps `observation_gap_count` and reports video-stall
+status as not measurable from sampled captures. It must not be used as an FPS or
+stall acceptance signal.
 collector preserves it but does not create, inspect, hash, or claim the artifact
 exists.
 

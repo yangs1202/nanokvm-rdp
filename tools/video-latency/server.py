@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
 import time
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 
 RUN_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
@@ -134,7 +134,7 @@ def main():
     parser.add_argument('--bind', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=8765)
     args = parser.parse_args()
-    page = Path(__file__).with_name('pattern.html').read_bytes()
+    page_path = Path(__file__).with_name('pattern.html')
     origin_ms = time.time_ns() / 1e6
     origin_ns = time.monotonic_ns()
 
@@ -148,13 +148,34 @@ def main():
             received = now_ms()
             path = urlparse(self.path).path
             if path in ('/1', '/1/'):
-                self.send_bytes(200, page, 'text/html; charset=utf-8')
+                # Read per request so a prepared pattern revision is served by
+                # the existing measurement server without losing run state.
+                self.send_bytes(200, page_path.read_bytes(), 'text/html; charset=utf-8')
             elif path == '/1/clock':
                 self.send_json(200, {'received': received, 'sent': now_ms()})
             elif path.startswith('/1/runs/'):
                 self.run_get(path)
+            elif path.startswith('/1/'):
+                self.run_alias(path)
             else:
                 self.send_error(404)
+
+        def run_alias(self, path):
+            """Redirect a short, validated run path to the query-based source page."""
+            encoded_run_id = path[len('/1/'):]
+            if not encoded_run_id or '/' in encoded_run_id:
+                self.send_error(404)
+                return
+            try:
+                run_id = runs.validate_run_id(unquote(encoded_run_id))
+            except ValueError:
+                self.send_error(404)
+                return
+            self.send_response(302)
+            self.send_header('Location', '/1?run_id=' + quote(run_id, safe=''))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
 
         def do_POST(self):
             path = urlparse(self.path).path
