@@ -169,6 +169,7 @@ struct Client
 	uint64_t bitmap_last_send_started_at;
 	bool keyboard_input_logged;
 	bool pointer_input_logged;
+	bool pointer_position_logged;
 	bool wheel_input_logged;
 	InputRouter input_router;
 	uint64_t last_rtp_received_at;
@@ -1345,6 +1346,33 @@ static bool client_send_input_message(Client* client, const InputRouterMessage* 
 	       server_send_control(client->server, message->type, message->payload, message->length);
 }
 
+/* Keep the RDP client's cursor independent from the captured host video. The
+ * host cursor will eventually appear in a video frame, but that frame can be
+ * delayed by mobile decoder/backpressure. RDP has a small standalone pointer
+ * position update for exactly this case. */
+static void client_send_pointer_position(Client* client, UINT16 x, UINT16 y)
+{
+	rdpUpdate* update = client->context.update;
+	if (!update || !update->pointer || !update->pointer->PointerPosition)
+		return;
+	if (!client->pointer_position_logged && update->pointer->PointerSystem)
+	{
+		POINTER_SYSTEM_UPDATE pointer_system = { .type = SYSPTR_DEFAULT };
+		(void)update->pointer->PointerSystem(&client->context, &pointer_system);
+	}
+	POINTER_POSITION_UPDATE position = {
+		.xPos = hid_clamp_absolute(x, client->render_width),
+		.yPos = hid_clamp_absolute(y, client->render_height),
+	};
+	if (!update->pointer->PointerPosition(&client->context, &position))
+		return;
+	if (!client->pointer_position_logged)
+	{
+		log_message("INFO", "RDP pointer position fast path 활성화");
+		client->pointer_position_logged = true;
+	}
+}
+
 static bool input_trace_enabled(void)
 {
 	const char* value = getenv("NANOKVM_INPUT_TRACE");
@@ -1531,6 +1559,8 @@ static BOOL on_mouse(rdpInput* input, UINT16 flags, UINT16 x, UINT16 y)
 	pointer_buttons = client->input_router.pointer_buttons;
 	keyboard_modifiers = client->input_router.keyboard_modifiers;
 	LeaveCriticalSection(&client->lock);
+	if (!has_wheel)
+		client_send_pointer_position(client, x, y);
 	if ((flags & (PTR_FLAGS_BUTTON1 | PTR_FLAGS_BUTTON2 | PTR_FLAGS_BUTTON3)) != 0)
 	{
 		char message[160];
