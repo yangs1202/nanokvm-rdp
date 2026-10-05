@@ -36,7 +36,24 @@ while :; do
     [ -e "$STOPFILE" ] && exit 0
     "$DAEMON" -gateway "$GATEWAY" -control-port "$CONTROL_PORT" \\
         -video-port "$VIDEO_PORT" -width "$WIDTH" -height "$HEIGHT" \\
-        -bitrate "$BITRATE"
+        -bitrate "$BITRATE" &
+    child=\$!
+    waited=0
+    # 메인 스레드가 종료돼도 HID/캡처 스레드가 남으면 BusyBox wait가 반환하지 않는다.
+    # 20초를 넘기면 프로세스 그룹을 정리해 깨끗한 상태로 재시작한다.
+    while kill -0 "\$child" 2>/dev/null; do
+        if [ -e "$STOPFILE" ]; then
+            kill "\$child" 2>/dev/null || true
+        fi
+        if [ "\$waited" -ge 20 ]; then
+            echo "nanokvm-agent pid=\$child 종료 대기 초과, 남은 스레드를 정리합니다"
+            kill -9 "\$child" 2>/dev/null || true
+            break
+        fi
+        sleep 1
+        waited=\$((waited + 1))
+    done
+    wait "\$child"
     rc=\$?
     [ -e "$STOPFILE" ] && exit 0
     echo "nanokvm-agent exited rc=\$rc, 1초 후 watchdog 재시작"
