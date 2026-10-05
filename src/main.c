@@ -70,6 +70,7 @@
 #define CLASSIC_MAX_UPDATE_SIZE (32U * 1024U)
 #define STATS_LOG_INTERVAL_MS 5000U
 #define PEER_SHUTDOWN_JOIN_TIMEOUT_MS 5000U
+#define CLASSIC_INPUT_DRAIN_TILES 8U
 #define WHEEL_ROTATION_MASK 0x01FFU
 
 typedef struct
@@ -910,12 +911,19 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	uint16_t rectangle_count = 0;
 	uint32_t frame_tiles = 0;
 	uint64_t frame_bytes = 0;
+	uint32_t tiles_since_input_drain = 0;
 
 	if (!client->context.update || !client->context.update->BitmapUpdate ||
 	    settings == NULL || !client->interleaved ||
 	    !client->classic_encoded ||
 	    length != expected_length ||
 	    client_should_stop(client))
+		return false;
+	/* A full-screen classic update is hundreds of blocking socket writes.
+	 * Drain the client between batches so a slow mobile peer is not left
+	 * unread for the whole frame. */
+	if (client->peer && client->peer->CheckFileDescriptor &&
+	    !client->peer->CheckFileDescriptor(client->peer))
 		return false;
 	if (!client->previous_bitmap)
 	{
@@ -990,6 +998,13 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 					return false;
 				rectangle_count = 0;
 				update_size = 1024U;
+				if (++tiles_since_input_drain >= CLASSIC_INPUT_DRAIN_TILES)
+				{
+					tiles_since_input_drain = 0;
+					if (client->peer && client->peer->CheckFileDescriptor &&
+					    !client->peer->CheckFileDescriptor(client->peer))
+						return false;
+				}
 			}
 		}
 	}
@@ -1220,8 +1235,12 @@ static bool client_flush_pending_bitmap(Client* client)
 	const uint64_t now = monotonic_milliseconds();
 	EnterCriticalSection(&client->lock);
 	client->bitmap_flushes++;
-	const unsigned interval = client->gfx_uses_progressive
-	                              ? frame_flow_interval(&client->frame_flow) : BITMAP_FRAME_INTERVAL_MS;
+	unsigned interval = client->gfx_uses_progressive
+	                        ? frame_flow_interval(&client->frame_flow) : BITMAP_FRAME_INTERVAL_MS;
+	/* Classic bitmap has no frame ACK. A send longer than the base interval
+	 * must pace the next frame, or a slow mobile client is written continuously. */
+	if (!client->gfx_uses_progressive && client->last_rdp_send_ms > interval)
+		interval = client->last_rdp_send_ms > 250U ? 250U : (unsigned)client->last_rdp_send_ms;
 	if ((client->gfx_uses_progressive && frame_flow_blocked(&client->frame_flow)) ||
 	    (client->bitmap_last_send_started_at && now - client->bitmap_last_send_started_at < interval))
 	{
