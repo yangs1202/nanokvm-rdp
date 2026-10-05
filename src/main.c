@@ -947,12 +947,16 @@ static void client_output_unlock(Client* client)
 
 static bool client_output_write_ready(Client* client)
 {
-	if (!client->peer || !client->peer->IsWriteBlocked || !client->peer->DrainOutputBuffer)
+	/* FreeRDP aborts inside IsWriteBlocked once Disconnect clears frontBio.
+	 * A closing or disconnected peer is not writable; do not probe it. */
+	if (!client->peer || !client->peer->connected || client_should_stop(client) ||
+	    !client->peer->IsWriteBlocked || !client->peer->DrainOutputBuffer)
 		return true;
 	if (!client->peer->IsWriteBlocked(client->peer))
 		return true;
 	(void)client->peer->DrainOutputBuffer(client->peer);
-	return !client->peer->IsWriteBlocked(client->peer);
+	return client->peer->connected && !client_should_stop(client) &&
+	       !client->peer->IsWriteBlocked(client->peer);
 }
 
 static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
@@ -1073,6 +1077,7 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 				rectangle_count = 0;
 				update_size = 1024U;
 				if (client->peer && client->peer->IsWriteBlocked &&
+				    client->peer->connected && !client_should_stop(client) &&
 				    client->peer->IsWriteBlocked(client->peer))
 				{
 					client->classic_resume_left = (uint16_t)(left + CLASSIC_TILE_WIDTH);
@@ -1453,6 +1458,7 @@ static DWORD WINAPI output_thread(LPVOID argument)
 				timeout = WINPR_ASSERTING_INT_CAST(DWORD, interval - (now - last_send));
 		}
 		if (timeout == 0 && client->peer && client->peer->IsWriteBlocked &&
+		    client->peer->connected && !client_should_stop(client) &&
 		    client->peer->IsWriteBlocked(client->peer))
 			timeout = 20;
 		if (timeout == 0)
@@ -2252,6 +2258,11 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		if (client->direct_gfx_active && !client_check_gfx_timeout(client))
 			break;
 	}
+	/* Stop output before Disconnect. IsWriteBlocked asserts if frontBio is
+	 * already cleared, and that abort takes the whole gateway down. */
+	client_stop(client);
+	if (client->output_thread)
+		(void)WaitForSingleObject(client->output_thread, 1000);
 out:
 	if (peer->Disconnect)
 		peer->Disconnect(peer);
