@@ -1333,10 +1333,13 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 		}
 		(void)h264_copy_annexb(annexb, data, length);
 		const bool packet_loss = access_unit.packet_loss;
-		const bool pushed = ffmpeg_decoder_push(&decoder, annexb, annexb_length);
+		/* client_stop() makes the decoded-frame callback reject the frame.
+		 * That is teardown, not a decoder failure, so do not log or stop again. */
+		const bool stopping = client_should_stop(client);
+		const bool pushed = stopping || ffmpeg_decoder_push(&decoder, annexb, annexb_length);
 		free(annexb);
 		video_source_release_access_unit(&access_unit);
-		if (!pushed)
+		if (!stopping && !pushed)
 		{
 			log_message("ERROR", "FFmpeg H.264 decoder 입력 실패");
 			client_stop(client);
@@ -1867,8 +1870,11 @@ static bool client_process_dynamic_channels(Client* client)
 	    !WTSVirtualChannelManagerIsChannelJoined(client->vcm, DRDYNVC_SVC_CHANNEL_NAME))
 		return true;
 
-	/* This only flushes the VCM's local queue; it does not read the peer transport. */
-	if (!WTSVirtualChannelManagerCheckFileDescriptor(client->vcm))
+	/* Flush only when the queue is ready. A large frame write blocks this thread,
+	 * and FreeRDP treats a client read that waits longer than 100 ms as fatal. */
+	const HANDLE channel_event = WTSVirtualChannelManagerGetEventHandle(client->vcm);
+	if (channel_event && WaitForSingleObject(channel_event, 0) == WAIT_OBJECT_0 &&
+	    !WTSVirtualChannelManagerCheckFileDescriptor(client->vcm))
 		return false;
 
 	if (!client->gfx)
@@ -2034,13 +2040,17 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 			break;
 		if (WaitForSingleObject(client->shutdown_event, 0) == WAIT_OBJECT_0)
 			break;
-		/* Read key/button releases before spending time encoding the next frame. */
+		/* Read the client before flushing a queued frame. FreeRDP's blocking
+		 * transport_read_layer fails if BIO_read has to wait more than 100 ms. */
 		if (!peer->CheckFileDescriptor(peer))
+			break;
+		if (client->direct_gfx_active && !client_process_dynamic_channels(client))
+			break;
+		if (peer->HasMoreToRead && peer->HasMoreToRead(peer) && !peer->CheckFileDescriptor(peer))
 			break;
 		if (client->bitmap_fallback_active && !client_flush_pending_bitmap(client))
 			break;
-		if (client->direct_gfx_active &&
-		    (!client_process_dynamic_channels(client) || !client_check_gfx_timeout(client)))
+		if (client->direct_gfx_active && !client_check_gfx_timeout(client))
 			break;
 	}
 out:
