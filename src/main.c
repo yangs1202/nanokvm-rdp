@@ -15,7 +15,6 @@
 #include <freerdp/channels/rdpgfx.h>
 #include <freerdp/channels/wtsvc.h>
 #include <freerdp/codec/color.h>
-#include <freerdp/codec/interleaved.h>
 #include <freerdp/codec/nsc.h>
 #include <freerdp/codec/progressive.h>
 #include <freerdp/codec/rfx.h>
@@ -65,12 +64,12 @@
 #define GATEWAY_KEEPALIVE_INTERVAL_MS 10000U
 #define CLASSIC_TILE_WIDTH 64U
 #define CLASSIC_TILE_HEIGHT 64U
-#define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 4U)
+#define CLASSIC_TILE_MAX_ENCODED (CLASSIC_TILE_WIDTH * CLASSIC_TILE_HEIGHT * 2U)
 #define CLASSIC_BITMAP_BATCH 1U
 #define CLASSIC_MAX_UPDATE_SIZE (32U * 1024U)
 #define STATS_LOG_INTERVAL_MS 5000U
 #define PEER_SHUTDOWN_JOIN_TIMEOUT_MS 5000U
-#define CLASSIC_INPUT_DRAIN_TILES 8U
+#define CLASSIC_SLICE_BUDGET_MS 4U
 #define WHEEL_ROTATION_MASK 0x01FFU
 
 typedef struct
@@ -122,10 +121,10 @@ struct Client
 	RFX_CONTEXT* rfx;
 	NSC_CONTEXT* nsc;
 	PROGRESSIVE_CONTEXT* progressive;
-	BITMAP_INTERLEAVED_CONTEXT* interleaved;
 	wStream* bitmap_stream;
 	CRITICAL_SECTION lock;
 	AVFrame* pending_decoded;
+	AVFrame* pending_next_decoded;
 	FfmpegConverter converter;
 	uint32_t converted_frames;
 	uint8_t* previous_bitmap;
@@ -163,11 +162,16 @@ struct Client
 	uint32_t bitmap_empty_flushes;
 	uint64_t classic_tiles_sent;
 	uint64_t classic_bytes_sent;
+	uint64_t pointer_position_updates;
 	uint32_t rtp_nals;
 	uint32_t rtp_access_units;
 	uint32_t rtp_idr_units;
 	uint32_t rtp_p_units;
 	uint64_t bitmap_last_send_started_at;
+	uint64_t classic_slice_started_at;
+	uint16_t classic_resume_left;
+	uint16_t classic_resume_top;
+	bool classic_frame_open;
 	bool keyboard_input_logged;
 	bool pointer_input_logged;
 	bool pointer_position_logged;
@@ -401,6 +405,7 @@ static void server_heartbeat(Server* server)
 		uint32_t bitmap_empty_flushes = 0;
 		uint64_t classic_tiles_sent = 0;
 		uint64_t classic_bytes_sent = 0;
+		uint64_t pointer_position_updates = 0;
 		uint32_t rtp_nals = 0;
 		uint32_t rtp_access_units = 0;
 		uint32_t rtp_idr_units = 0;
@@ -424,25 +429,27 @@ static void server_heartbeat(Server* server)
 			bitmap_empty_flushes = active->bitmap_empty_flushes;
 			classic_tiles_sent = active->classic_tiles_sent;
 			classic_bytes_sent = active->classic_bytes_sent;
+			pointer_position_updates = active->pointer_position_updates;
 			rtp_nals = active->rtp_nals;
 			rtp_access_units = active->rtp_access_units;
 			rtp_idr_units = active->rtp_idr_units;
 			rtp_p_units = active->rtp_p_units;
-			bitmap_pending = active->pending_decoded != NULL;
+			bitmap_pending = active->pending_decoded != NULL || active->pending_next_decoded != NULL;
 			rdp_send_ms = active->last_rdp_send_ms;
 			LeaveCriticalSection(&active->lock);
 		}
 		LeaveCriticalSection(&server->lock);
 		char message[512] = { 0 };
 		(void)snprintf(message, sizeof(message),
-			               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u converted=%u interval_ms=%u queued=%u queue_drop=%u stale_drop=%u flush=%u empty_flush=%u rdp_frames=%u classic_tiles=%llu classic_bytes=%llu queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
-			               agent_stats.sent_packets, agent_stats.dropped_packets,
-			               agent_stats.capture_frames, agent_stats.dropped_frames,
-			               rtp_nals, rtp_access_units, rtp_idr_units, rtp_p_units, decoded_frames, converted_frames, interval_ms,
-			               bitmap_queued_frames, bitmap_queue_drops, bitmap_stale_drops, bitmap_flushes,
-			               bitmap_empty_flushes,
-			               bitmap_frames, (unsigned long long)classic_tiles_sent,
-			               (unsigned long long)classic_bytes_sent, bitmap_pending ? 1U : 0U,
+		               "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u converted=%u interval_ms=%u queued=%u queue_drop=%u stale_drop=%u flush=%u empty_flush=%u rdp_frames=%u classic_tiles=%llu classic_bytes=%llu pointer_updates=%llu queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
+		               agent_stats.sent_packets, agent_stats.dropped_packets,
+		               agent_stats.capture_frames, agent_stats.dropped_frames,
+		               rtp_nals, rtp_access_units, rtp_idr_units, rtp_p_units, decoded_frames, converted_frames, interval_ms,
+		               bitmap_queued_frames, bitmap_queue_drops, bitmap_stale_drops, bitmap_flushes,
+		               bitmap_empty_flushes,
+		               bitmap_frames, (unsigned long long)classic_tiles_sent,
+		               (unsigned long long)classic_bytes_sent,
+		               (unsigned long long)pointer_position_updates, bitmap_pending ? 1U : 0U,
 		               usage.ru_maxrss, (unsigned long long)decode_ms,
 		               (unsigned long long)rdp_send_ms);
 		log_message("INFO", message);
@@ -894,6 +901,36 @@ static void classic_tile_copy(uint8_t* destination, const uint8_t* source, uint1
 	}
 }
 
+/* FreeRDP's interleaved 16-bit compressor aborts when a noisy tile makes its
+ * internal pixel counter exceed int16 range. Pack RGB565 directly instead. */
+static void classic_pack_rgb16(uint8_t* destination, const uint8_t* bgra, uint16_t width,
+                               uint16_t left, uint16_t top, uint16_t columns, uint16_t rows)
+{
+	size_t written = 0;
+	for (uint16_t row = 0; row < rows; row++)
+	{
+		const size_t offset = ((size_t)(top + row) * width + left) * 4U;
+		for (uint16_t column = 0; column < columns; column++)
+		{
+			const uint8_t* pixel = bgra + offset + (size_t)column * 4U;
+			const uint16_t color = (uint16_t)(((pixel[2] & 0xF8U) << 8) |
+			                                  ((pixel[1] & 0xFCU) << 3) | (pixel[0] >> 3));
+			destination[written++] = (uint8_t)color;
+			destination[written++] = (uint8_t)(color >> 8);
+		}
+	}
+}
+
+static bool client_service_peer_input(Client* client)
+{
+	if (!client->peer || !client->peer->CheckFileDescriptor)
+		return false;
+	if (!client->peer->CheckFileDescriptor(client->peer))
+		return false;
+	return !(client->peer->HasMoreToRead && client->peer->HasMoreToRead(client->peer) &&
+	         !client->peer->CheckFileDescriptor(client->peer));
+}
+
 static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
 {
 	const uint16_t width = client->render_width;
@@ -911,19 +948,16 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	uint16_t rectangle_count = 0;
 	uint32_t frame_tiles = 0;
 	uint64_t frame_bytes = 0;
-	uint32_t tiles_since_input_drain = 0;
+	const uint64_t slice_started_at = monotonic_milliseconds();
+	bool yielded = false;
 
 	if (!client->context.update || !client->context.update->BitmapUpdate ||
-	    settings == NULL || !client->interleaved ||
-	    !client->classic_encoded ||
-	    length != expected_length ||
-	    client_should_stop(client))
+	    settings == NULL || !client->classic_encoded ||
+	    length != expected_length || client_should_stop(client))
 		return false;
-	/* A full-screen classic update is hundreds of blocking socket writes.
-	 * Drain the client between batches so a slow mobile peer is not left
-	 * unread for the whole frame. */
-	if (client->peer && client->peer->CheckFileDescriptor &&
-	    !client->peer->CheckFileDescriptor(client->peer))
+	/* One classic tile is a blocking socket write. Yield before that write
+	 * exceeds the slice budget so mouse input is not stuck behind a frame. */
+	if (!client_service_peer_input(client))
 		return false;
 	if (!client->previous_bitmap)
 	{
@@ -933,43 +967,46 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 	if (!client->previous_bitmap || client->previous_bitmap_length != expected_length)
 		return false;
 
-	for (uint16_t top = 0; top < height; top += CLASSIC_TILE_HEIGHT)
+	for (uint16_t top = client->classic_resume_top; top < height; top += CLASSIC_TILE_HEIGHT)
 	{
 		const uint16_t rows = MIN(CLASSIC_TILE_HEIGHT, (uint16_t)(height - top));
-		for (uint16_t left = 0; left < width; left += CLASSIC_TILE_WIDTH)
+		const uint16_t first_left = top == client->classic_resume_top ? client->classic_resume_left : 0;
+		for (uint16_t left = first_left; left < width; left += CLASSIC_TILE_WIDTH)
 		{
 			const uint16_t columns = MIN(CLASSIC_TILE_WIDTH, (uint16_t)(width - left));
+			if (frame_tiles >= 1 &&
+			    monotonic_milliseconds() - slice_started_at >= CLASSIC_SLICE_BUDGET_MS)
+			{
+				client->classic_resume_left = left;
+				client->classic_resume_top = top;
+				client->classic_frame_open = true;
+				yielded = true;
+				break;
+			}
 			if (client->previous_bitmap_valid &&
 			    !bitmap_tile_changed(client->previous_bitmap, bgra, width, left, top, columns, rows))
 				continue;
-			BITMAP_DATA* rectangle = &rectangles[rectangle_count];
-			uint32_t encoded_length = CLASSIC_TILE_MAX_ENCODED;
+			const uint32_t encoded_length = (uint32_t)columns * rows * 2U;
 			uint8_t* encoded_data =
 			    client->classic_encoded + (size_t)rectangle_count * CLASSIC_TILE_MAX_ENCODED;
-			if ((columns % 4) != 0 ||
-			    !interleaved_compress(client->interleaved, encoded_data,
-			                          &encoded_length, columns, rows, bgra,
-			                          PIXEL_FORMAT_BGRX32, (uint32_t)width * 4U,
-			                          left, top, NULL, bits_per_pixel))
-			{
-				encoded_data = NULL;
-			}
-			if (!encoded_data || encoded_length == 0 || encoded_length > CLASSIC_TILE_MAX_ENCODED)
+			if (encoded_length == 0 || encoded_length > CLASSIC_TILE_MAX_ENCODED)
 				return false;
 			if (rectangle_count > 0 &&
 			    update_size + encoded_length + 16U >= max_update_size)
 			{
 				bitmap.number = rectangle_count;
 				bitmap.rectangles = rectangles;
-				bitmap.skipCompression = FALSE;
+				bitmap.skipCompression = TRUE;
 				if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
 					return false;
-				memcpy(client->classic_encoded, encoded_data, encoded_length);
-				encoded_data = client->classic_encoded;
-				rectangle = &rectangles[0];
 				rectangle_count = 0;
 				update_size = 1024U;
+				encoded_data = client->classic_encoded;
+				if (!client_service_peer_input(client))
+					return false;
 			}
+			classic_pack_rgb16(encoded_data, bgra, width, left, top, columns, rows);
+			BITMAP_DATA* rectangle = &rectangles[rectangle_count];
 			rectangle->destLeft = left;
 			rectangle->destTop = top;
 			rectangle->destRight = left + columns - 1;
@@ -979,7 +1016,7 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 			rectangle->bitsPerPixel = bits_per_pixel;
 			rectangle->bitmapLength = WINPR_ASSERTING_INT_CAST(uint16_t, encoded_length);
 			rectangle->bitmapDataStream = encoded_data;
-			rectangle->compressed = TRUE;
+			rectangle->compressed = FALSE;
 			rectangle->cbCompFirstRowSize = 0;
 			rectangle->cbCompMainBodySize = encoded_length;
 			rectangle->cbScanWidth = columns * (bits_per_pixel / 8U);
@@ -993,34 +1030,53 @@ static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_
 			{
 				bitmap.number = rectangle_count;
 				bitmap.rectangles = rectangles;
-				bitmap.skipCompression = FALSE;
+				bitmap.skipCompression = TRUE;
 				if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
 					return false;
 				rectangle_count = 0;
 				update_size = 1024U;
-				if (++tiles_since_input_drain >= CLASSIC_INPUT_DRAIN_TILES)
+				/* FreeRDP blocks inside this write for up to 100 ms. Stop
+				 * before that wait so the peer thread can read mouse input. */
+				if (client->peer && client->peer->IsWriteBlocked &&
+				    client->peer->IsWriteBlocked(client->peer))
 				{
-					tiles_since_input_drain = 0;
-					if (client->peer && client->peer->CheckFileDescriptor &&
-					    !client->peer->CheckFileDescriptor(client->peer))
-						return false;
+					client->classic_resume_left = (uint16_t)(left + CLASSIC_TILE_WIDTH);
+					client->classic_resume_top = top;
+					if (client->classic_resume_left >= width)
+					{
+						client->classic_resume_left = 0;
+						client->classic_resume_top = (uint16_t)(top + CLASSIC_TILE_HEIGHT);
+					}
+					client->classic_frame_open = true;
+					yielded = true;
+					break;
 				}
+				if (!client_service_peer_input(client))
+					return false;
 			}
 		}
+		if (yielded) break;
 	}
 	if (rectangle_count > 0)
 	{
 		bitmap.number = rectangle_count;
 		bitmap.rectangles = rectangles;
-		bitmap.skipCompression = FALSE;
+		bitmap.skipCompression = TRUE;
 		if (!client->context.update->BitmapUpdate(&client->context, &bitmap))
+			return false;
+		if (!client_service_peer_input(client))
 			return false;
 	}
 	EnterCriticalSection(&client->lock);
 	client->classic_tiles_sent += frame_tiles;
 	client->classic_bytes_sent += frame_bytes;
 	LeaveCriticalSection(&client->lock);
-	client->previous_bitmap_valid = true;
+	if (yielded)
+		return true;
+	client->classic_resume_left = 0;
+	client->classic_resume_top = 0;
+	client->classic_frame_open = false;
+	if (frame_tiles > 0) client->previous_bitmap_valid = true;
 	return true;
 }
 
@@ -1207,8 +1263,14 @@ static bool on_decoded_frame(void* context, const AVFrame* frame)
 	AVFrame* retained = av_frame_clone(frame);
 	if (!retained) return false;
 	EnterCriticalSection(&client->lock);
-	AVFrame* stale = client->pending_decoded;
-	client->pending_decoded = retained;
+	/* A classic slice still owns converter.frame. Keep the newest decoded
+	 * frame queued, but do not replace the pixels that slice is sending. */
+	AVFrame* stale = client->classic_frame_open ? client->pending_next_decoded
+	                                            : client->pending_decoded;
+	if (client->classic_frame_open)
+		client->pending_next_decoded = retained;
+	else
+		client->pending_decoded = retained;
 	client->decoded_frames++;
 	client->bitmap_queued_frames++;
 	if (stale)
@@ -1237,18 +1299,18 @@ static bool client_flush_pending_bitmap(Client* client)
 	client->bitmap_flushes++;
 	unsigned interval = client->gfx_uses_progressive
 	                        ? frame_flow_interval(&client->frame_flow) : BITMAP_FRAME_INTERVAL_MS;
-	/* Classic bitmap has no frame ACK. A send longer than the base interval
-	 * must pace the next frame, or a slow mobile client is written continuously. */
-	if (!client->gfx_uses_progressive && client->last_rdp_send_ms > interval)
-		interval = client->last_rdp_send_ms > 250U ? 250U : (unsigned)client->last_rdp_send_ms;
+	/* A classic frame is sliced. Pace only between completed frames; an open
+	 * slice must resume immediately so input is not delayed by the old 250 ms cap. */
+	const bool classic_resume = !client->gfx_uses_progressive && client->classic_frame_open;
 	if ((client->gfx_uses_progressive && frame_flow_blocked(&client->frame_flow)) ||
-	    (client->bitmap_last_send_started_at && now - client->bitmap_last_send_started_at < interval))
+	    (!classic_resume && client->bitmap_last_send_started_at &&
+	     now - client->bitmap_last_send_started_at < interval))
 	{
 		LeaveCriticalSection(&client->lock);
 		return true;
 	}
 	AVFrame* frame = client->pending_decoded;
-	if (!frame)
+	if (!frame && !classic_resume)
 	{
 		client->bitmap_empty_flushes++;
 		LeaveCriticalSection(&client->lock);
@@ -1256,17 +1318,48 @@ static bool client_flush_pending_bitmap(Client* client)
 	}
 	/* Keep replacing the pending raw frame while blocked. Even when capture
 	 * stops, the final frame survives until pacing/ACK/transport allows it. */
-	client->pending_decoded = NULL;
-	client->bitmap_last_send_started_at = now;
+	if (frame) client->pending_decoded = NULL;
+	if (!classic_resume) client->bitmap_last_send_started_at = now;
 	LeaveCriticalSection(&client->lock);
 
-	const bool converted = ffmpeg_converter_convert(&client->converter, frame,
-	                                                client->render_width, client->render_height);
-	av_frame_free(&frame);
-	const bool sent = converted && send_bitmap_frame(client, client->converter.frame,
-	                                                client->converter.frame_size);
+	bool sent = false;
+	if (classic_resume)
+	{
+		sent = send_classic_bitmap_frame(client, client->converter.frame,
+		                                 client->converter.frame_size);
+	}
+	else
+	{
+		const bool converted = ffmpeg_converter_convert(&client->converter, frame,
+		                                                client->render_width, client->render_height);
+		av_frame_free(&frame);
+		sent = converted && send_bitmap_frame(client, client->converter.frame,
+		                                     client->converter.frame_size);
+		EnterCriticalSection(&client->lock);
+		if (converted) client->converted_frames++;
+		LeaveCriticalSection(&client->lock);
+	}
+	if (sent && !client->classic_frame_open)
+	{
+		EnterCriticalSection(&client->lock);
+		AVFrame* next = client->pending_next_decoded;
+		client->pending_next_decoded = NULL;
+		if (next)
+		{
+			if (client->pending_decoded)
+			{
+				client->bitmap_queue_drops++;
+				client->bitmap_stale_drops++;
+				av_frame_free(&client->pending_decoded);
+			}
+			client->pending_decoded = next;
+			next = NULL;
+		}
+		LeaveCriticalSection(&client->lock);
+		av_frame_free(&next);
+	}
 	const uint64_t completed_at = monotonic_milliseconds();
-	if (completed_at - now >= 100U)
+	if (!client->classic_frame_open && completed_at - now >= 100U)
 	{
 		char message[128];
 		(void)snprintf(message, sizeof(message), "RDP slow frame send elapsed_ms=%llu ok=%u",
@@ -1274,8 +1367,8 @@ static bool client_flush_pending_bitmap(Client* client)
 		log_message("WARN", message);
 	}
 	EnterCriticalSection(&client->lock);
-	if (converted) client->converted_frames++;
-	if (sent) client->last_rdp_send_ms = completed_at - now;
+	if (sent && !client->classic_frame_open)
+		client->last_rdp_send_ms = completed_at - client->bitmap_last_send_started_at;
 	if (client->gfx_uses_progressive)
 		frame_flow_send_cost(&client->frame_flow, completed_at - now, completed_at);
 	LeaveCriticalSection(&client->lock);
@@ -1402,6 +1495,9 @@ static void client_send_pointer_position(Client* client, UINT16 x, UINT16 y)
 	};
 	if (!update->pointer->PointerPosition(&client->context, &position))
 		return;
+	EnterCriticalSection(&client->lock);
+	client->pointer_position_updates++;
+	LeaveCriticalSection(&client->lock);
 	if (!client->pointer_position_logged)
 	{
 		log_message("INFO", "RDP pointer position fast path 활성화");
@@ -1755,11 +1851,10 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 		nsc_context_free(client->nsc);
 	if (client->progressive)
 		progressive_context_free(client->progressive);
-	if (client->interleaved)
-		bitmap_interleaved_context_free(client->interleaved);
 	if (client->bitmap_stream)
 		Stream_Free(client->bitmap_stream, TRUE);
 	av_frame_free(&client->pending_decoded);
+	av_frame_free(&client->pending_next_decoded);
 	ffmpeg_converter_free(&client->converter);
 	free(client->previous_bitmap);
 	free(client->classic_encoded);
@@ -1836,10 +1931,7 @@ static bool client_prepare_bitmap(Client* client)
 		if (color_depth == 24 &&
 		    !freerdp_settings_set_uint32((rdpSettings*)settings, FreeRDP_ColorDepth, 16))
 			return false;
-		client->interleaved = bitmap_interleaved_context_new(TRUE);
-		if (!client->interleaved)
-			return false;
-		log_message("INFO", "RemoteFX/NSCodec 없이 16-bit interleaved BitmapUpdate 경로를 사용합니다");
+		log_message("INFO", "RemoteFX/NSCodec 없이 16-bit raw BitmapUpdate 경로를 사용합니다");
 	}
 	if (client->bitmap_uses_rfx || client->nsc)
 	{
@@ -2033,17 +2125,19 @@ static DWORD WINAPI peer_thread(LPVOID argument)
 		if (client->bitmap_fallback_active)
 		{
 			EnterCriticalSection(&client->lock);
-			const bool bitmap_pending = client->pending_decoded != NULL;
+			const bool bitmap_pending = client->pending_decoded != NULL ||
+			                            client->pending_next_decoded != NULL;
+			const bool classic_resume = client->classic_frame_open;
 			const bool waiting_for_ack = client->gfx_uses_progressive &&
 			                             frame_flow_blocked(&client->frame_flow);
 			const uint64_t last_send_started_at = client->bitmap_last_send_started_at;
 			const uint64_t interval = client->gfx_uses_progressive
 			                              ? frame_flow_interval(&client->frame_flow) : BITMAP_FRAME_INTERVAL_MS;
 			LeaveCriticalSection(&client->lock);
-			if (bitmap_pending && !waiting_for_ack)
+			if ((bitmap_pending || classic_resume) && !waiting_for_ack)
 			{
 				const uint64_t now = monotonic_milliseconds();
-				if (last_send_started_at == 0 ||
+				if (classic_resume || last_send_started_at == 0 ||
 				    now - last_send_started_at >= interval)
 					timeout = 0;
 				else
