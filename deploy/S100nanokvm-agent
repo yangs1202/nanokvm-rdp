@@ -38,20 +38,22 @@ while :; do
         -video-port "$VIDEO_PORT" -width "$WIDTH" -height "$HEIGHT" \\
         -bitrate "$BITRATE" &
     child=\$!
-    waited=0
-    # 메인 스레드가 종료돼도 HID/캡처 스레드가 남으면 BusyBox wait가 반환하지 않는다.
-    # 20초를 넘기면 프로세스 그룹을 정리해 깨끗한 상태로 재시작한다.
-    while kill -0 "\$child" 2>/dev/null; do
+    # BusyBox wait는 메인 스레드가 좀비가 돼도 다른 스레드가 남으면 반환하지 않는다.
+    # 정상 실행 중에는 절대 죽이지 않고, 메인 스레드가 Z가 된 뒤에만 정리한다.
+    while :; do
         if [ -e "$STOPFILE" ]; then
             kill "\$child" 2>/dev/null || true
         fi
-        if [ "\$waited" -ge 20 ]; then
-            echo "nanokvm-agent pid=\$child 종료 대기 초과, 남은 스레드를 정리합니다"
+        state=\$(awk '{print \$3}' /proc/"\$child"/stat 2>/dev/null || true)
+        if [ -z "\$state" ]; then
+            break
+        fi
+        if [ "\$state" = "Z" ]; then
+            echo "nanokvm-agent pid=\$child 메인 스레드가 종료됐지만 자식 스레드가 남아 정리합니다"
             kill -9 "\$child" 2>/dev/null || true
             break
         fi
         sleep 1
-        waited=\$((waited + 1))
     done
     wait "\$child"
     rc=\$?
