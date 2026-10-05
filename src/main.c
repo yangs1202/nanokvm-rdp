@@ -649,6 +649,16 @@ static bool client_can_send(Client* client)
 	return can_send;
 }
 
+static bool client_accept_avc_frame(Client* client, uint32_t bytes)
+{
+	bool accepted = false;
+	EnterCriticalSection(&client->lock);
+	accepted = client->gfx_ready && !client->stopping &&
+	           frame_flow_ready(&client->frame_flow, bytes, monotonic_milliseconds());
+	LeaveCriticalSection(&client->lock);
+	return accepted;
+}
+
 static bool make_idr_payload(Client* client, const uint8_t* data, size_t length, uint8_t** owned,
 	                           const uint8_t** payload, size_t* payload_length)
 {
@@ -752,6 +762,7 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 		return false;
 	}
 	EnterCriticalSection(&client->lock);
+	(void)frame_flow_sent_sized(&client->frame_flow, start.frameId, (uint32_t)length, send_done);
 	client->bitmap_frames++;
 	const uint32_t frame_count = client->bitmap_frames;
 	LeaveCriticalSection(&client->lock);
@@ -838,7 +849,10 @@ static DWORD WINAPI video_thread(LPVOID argument)
 			bool payload_ok = true;
 			if (idr)
 				payload_ok = make_idr_payload(client, data, length, &owned, &payload, &payload_length);
-			if (!payload_ok || !send_avc420_frame(client, payload, payload_length,
+			if (!payload_ok)
+				client_stop(client);
+			else if (client_accept_avc_frame(client, (uint32_t)payload_length) &&
+			         !send_avc420_frame(client, payload, payload_length,
 			                                          access_unit.ssrc, access_unit.timestamp,
 			                                          received_at, receive_wall))
 				client_stop(client);

@@ -9,6 +9,8 @@
 #define FRAME_FLOW_MIN_INTERVAL 16U
 #define FRAME_FLOW_SUSPENDED_INTERVAL 20U
 #define FRAME_FLOW_MAX_INTERVAL 100U
+#define FRAME_FLOW_SLOW_ACK_MS 250U
+#define FRAME_FLOW_MAX_INFLIGHT_BYTES (192U * 1024U)
 
 typedef struct
 {
@@ -21,6 +23,9 @@ typedef struct
 	unsigned count;
 	uint32_t ids[FRAME_FLOW_LIMIT];
 	uint64_t sent_at[FRAME_FLOW_LIMIT];
+	uint32_t bytes[FRAME_FLOW_LIMIT];
+	uint32_t inflight_bytes;
+	uint64_t last_ack_at;
 } FrameFlow;
 
 /* Unknown clients start conservatively; explicit ACK suspension permits 50 fps. */
@@ -68,12 +73,36 @@ static inline bool frame_flow_blocked(const FrameFlow* flow)
 	return !flow->suspended && flow->count == FRAME_FLOW_LIMIT;
 }
 
-static inline bool frame_flow_sent(FrameFlow* flow, uint32_t id, uint64_t now)
+static inline bool frame_flow_sent_sized(FrameFlow* flow, uint32_t id, uint32_t bytes, uint64_t now)
 {
 	if (flow->suspended) return true;
 	if (frame_flow_blocked(flow)) return false;
+	if (flow->count != 0 && flow->inflight_bytes + bytes > FRAME_FLOW_MAX_INFLIGHT_BYTES)
+		return false;
 	flow->ids[flow->count] = id;
+	flow->bytes[flow->count] = bytes;
 	flow->sent_at[flow->count++] = now;
+	flow->inflight_bytes += bytes;
+	return true;
+}
+
+static inline bool frame_flow_sent(FrameFlow* flow, uint32_t id, uint64_t now)
+{
+	return frame_flow_sent_sized(flow, id, 0, now);
+}
+
+/* A client that stops acknowledging cannot hide behind a zero queueDepth.
+ * Keep one fresh frame in flight, but do not accumulate multi-megabyte IDRs. */
+static inline bool frame_flow_ready(const FrameFlow* flow, uint32_t bytes, uint64_t now)
+{
+	if (flow->suspended || flow->count == 0)
+		return true;
+	if (frame_flow_blocked(flow))
+		return false;
+	if (flow->inflight_bytes + bytes > FRAME_FLOW_MAX_INFLIGHT_BYTES)
+		return false;
+	if (flow->last_ack_at != 0 && now - flow->last_ack_at >= FRAME_FLOW_SLOW_ACK_MS)
+		return false;
 	return true;
 }
 
@@ -93,9 +122,12 @@ static inline bool frame_flow_ack(FrameFlow* flow, uint32_t id, uint32_t depth,
 		flow->fast_sends = 0;
 		flow->last_slow_at = 0;
 		flow->count = 0;
+		flow->inflight_bytes = 0;
+		flow->last_ack_at = 0;
 		return false;
 	}
 	flow->suspended = false;
+	flow->last_ack_at = now;
 	/* A queued byte count is useful even for ACKs sent before tracking resumed. */
 	if (depth > 256U * 1024U) frame_flow_slow(flow, now);
 	for (unsigned i = 0; i < flow->count; i++)
@@ -103,6 +135,7 @@ static inline bool frame_flow_ack(FrameFlow* flow, uint32_t id, uint32_t depth,
 		if (flow->ids[i] != id) continue;
 		*elapsed = now - flow->sent_at[i];
 		flow->have_ack = true;
+		flow->inflight_bytes -= flow->bytes[i];
 		if (*elapsed > 120U) frame_flow_slow(flow, now);
 		else if (depth == 0 && *elapsed <= 60U)
 		{
@@ -119,6 +152,7 @@ static inline bool frame_flow_ack(FrameFlow* flow, uint32_t id, uint32_t depth,
 		for (unsigned j = i; j < flow->count; j++)
 		{
 			flow->ids[j] = flow->ids[j + 1];
+			flow->bytes[j] = flow->bytes[j + 1];
 			flow->sent_at[j] = flow->sent_at[j + 1];
 		}
 		return true;

@@ -85,6 +85,19 @@ int main(void)
 	assert(frame_flow_interval(&flow) > 20);
 	assert(!frame_flow_ack(&flow, 100, 1000000, 28000, &elapsed));
 	assert(!flow.suspended && frame_flow_interval(&flow) >= 40);
+	/* A mobile client that ACKs for seconds, then stops, must not accumulate IDRs. */
+	flow = (FrameFlow){ 0 };
+	assert(frame_flow_sent_sized(&flow, 1, 400000, 1000));
+	assert(!frame_flow_ready(&flow, 14000, 1100));
+	assert(frame_flow_ack(&flow, 1, 0, 1200, &elapsed) && elapsed == 200);
+	assert(flow.inflight_bytes == 0 && flow.last_ack_at == 1200);
+	assert(frame_flow_sent_sized(&flow, 2, 14000, 1210));
+	assert(!frame_flow_ready(&flow, 400000, 1300));
+	assert(!frame_flow_ready(&flow, 14000, 1500));
+	assert(frame_flow_ack(&flow, 2, 0, 1600, &elapsed));
+	assert(frame_flow_ready(&flow, 400000, 1610));
+	assert(frame_flow_sent_sized(&flow, 3, 400000, 1620));
+	assert(!frame_flow_ready(&flow, 14000, 1640));
 	puts("Frame flow: slow client, duplicate/out-of-order ACK, suspend/resume and wrap passed");
 	return 0;
 }
