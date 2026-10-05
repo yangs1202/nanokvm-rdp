@@ -1327,7 +1327,6 @@ static bool on_decoded_frame(void* context, const AVFrame* frame)
 
 static bool client_flush_pending_bitmap(Client* client)
 {
-	if (client->bitmap_ready_event) (void)ResetEvent(client->bitmap_ready_event);
 	if (!client_output_write_ready(client))
 		return true;
 	const uint64_t now = monotonic_milliseconds();
@@ -1430,15 +1429,6 @@ static DWORD WINAPI output_thread(LPVOID argument)
 				(void)WaitForSingleObject(client->output_wakeup, 50);
 			continue;
 		}
-		if (!client_flush_pending_bitmap(client))
-			break;
-		HANDLE handles[2] = WINPR_C_ARRAY_INIT;
-		DWORD count = 0;
-		if (client->output_wakeup)
-			handles[count++] = client->output_wakeup;
-		if (client->shutdown_event)
-			handles[count++] = client->shutdown_event;
-		DWORD timeout = 20;
 		EnterCriticalSection(&client->lock);
 		const bool pending = client->pending_decoded != NULL ||
 		                     client->pending_next_decoded != NULL || client->classic_frame_open;
@@ -1449,11 +1439,16 @@ static DWORD WINAPI output_thread(LPVOID argument)
 		                              ? frame_flow_interval(&client->frame_flow)
 		                              : BITMAP_FRAME_INTERVAL_MS;
 		LeaveCriticalSection(&client->lock);
+		DWORD timeout = 50;
 		if (pending && !waiting_for_ack)
 		{
 			const uint64_t now = monotonic_milliseconds();
 			if (client->classic_frame_open || last_send == 0 || now - last_send >= interval)
+			{
+				if (!client_flush_pending_bitmap(client))
+					break;
 				timeout = 0;
+			}
 			else
 				timeout = WINPR_ASSERTING_INT_CAST(DWORD, interval - (now - last_send));
 		}
@@ -1462,6 +1457,12 @@ static DWORD WINAPI output_thread(LPVOID argument)
 			timeout = 20;
 		if (timeout == 0)
 			continue;
+		HANDLE handles[2] = WINPR_C_ARRAY_INIT;
+		DWORD count = 0;
+		if (client->output_wakeup)
+			handles[count++] = client->output_wakeup;
+		if (client->shutdown_event)
+			handles[count++] = client->shutdown_event;
 		if (count == 0)
 			Sleep(timeout);
 		else
