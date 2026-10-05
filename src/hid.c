@@ -962,6 +962,27 @@ static void write_touch_position(uint8_t report[6], uint16_t x, uint16_t y)
 	report[4] = (uint8_t)(y >> 8U);
 }
 
+static bool pointer_queue_busy(const HidState* hid)
+{
+	return hid->pointer_queue.count != 0;
+}
+
+/* Pure absolute motion has no click ordering constraint. If USB is idle, write
+ * it now so the host cursor is not delayed by the agent poll loop. */
+static bool write_absolute_now(HidState* hid, const uint8_t* report, size_t length)
+{
+	/* A click or release may still be in flight on the relative endpoint.
+	 * Do not let the next absolute position overtake it. */
+	if (pointer_queue_busy(hid) || hid->pointer_queue.inflight_endpoint != 0 || hid->touch_fd < 0)
+		return false;
+	const ssize_t written = write(hid->touch_fd, report, length);
+	if (written != (ssize_t)length)
+		return false;
+	hid->submitted_state[2] = report[0];
+	hid->reports_sent++;
+	return true;
+}
+
 static bool send_absolute(HidState* hid, bool motion)
 {
 	uint8_t report[7] = { touch_buttons(hid->buttons), 0, 0, 0, 0, 0, 0 };
@@ -970,8 +991,11 @@ static bool send_absolute(HidState* hid, bool motion)
 	report[5] = (uint8_t)hid->wheel;
 	if (length == 7)
 		report[6] = (uint8_t)hid->pan;
+	const bool pure_motion = motion && hid->wheel == 0 && hid->pan == 0;
+	if (pure_motion && write_absolute_now(hid, report, length))
+		return true;
 	const bool ok = queue_report(hid, &hid->pointer_queue, hid->touch_path, report, length,
-	                             motion && hid->wheel == 0 && hid->pan == 0, 0);
+	                             pure_motion, 0);
 	/* Wheel and relative axes are deltas, not persistent state. */
 	hid->wheel = 0;
 	hid->pan = 0;
