@@ -951,7 +951,7 @@ static bool client_output_write_ready(Client* client)
 	 * A closing or disconnected peer is not writable; do not probe it. */
 	if (!client->peer || !client->peer->connected || client_should_stop(client) ||
 	    !client->peer->IsWriteBlocked || !client->peer->DrainOutputBuffer)
-		return true;
+		return false;
 	if (!client->peer->IsWriteBlocked(client->peer))
 		return true;
 	/* A blocked socket means the client has not consumed the previous update.
@@ -1712,8 +1712,11 @@ static bool client_force_source_desktop_size(Client* client)
 {
 	rdpSettings* settings = client->context.settings;
 	rdpUpdate* update = client->context.update;
-	const uint32_t width = client->server->config.width;
-	const uint32_t height = client->server->config.height;
+	/* Windows App has no graphics channel, so this desktop is sent as raw
+	 * bitmap updates. A full 1920x1080 frame fills its socket and the client
+	 * closes the session after a few minutes. */
+	const uint32_t width = 960;
+	const uint32_t height = 540;
 	if (!settings || !update || !update->DesktopResize)
 		return false;
 	if (freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth) == width &&
@@ -1723,7 +1726,7 @@ static bool client_force_source_desktop_size(Client* client)
 	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height) ||
 	    !update->DesktopResize(update->context))
 		return false;
-	log_message("INFO", "RDP desktop을 NanoKVM 원본 1920x1080으로 재협상");
+	log_message("INFO", "RDP desktop을 classic bitmap 960x540으로 재협상");
 	return true;
 }
 
