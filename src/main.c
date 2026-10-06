@@ -25,6 +25,7 @@
 #include <freerdp/server/rdpgfx.h>
 #include <freerdp/settings.h>
 #include <freerdp/update.h>
+#include <freerdp/constants.h>
 
 #include <winpr/crt.h>
 #include <winpr/ssl.h>
@@ -1712,11 +1713,8 @@ static bool client_force_source_desktop_size(Client* client)
 {
 	rdpSettings* settings = client->context.settings;
 	rdpUpdate* update = client->context.update;
-	/* Windows App has no graphics channel, so this desktop is sent as raw
-	 * bitmap updates. A full 1920x1080 frame fills its socket and the client
-	 * closes the session after a few minutes. */
-	const uint32_t width = 960;
-	const uint32_t height = 540;
+	const uint32_t width = client->server->config.width;
+	const uint32_t height = client->server->config.height;
 	if (!settings || !update || !update->DesktopResize)
 		return false;
 	if (freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth) == width &&
@@ -1726,7 +1724,7 @@ static bool client_force_source_desktop_size(Client* client)
 	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, height) ||
 	    !update->DesktopResize(update->context))
 		return false;
-	log_message("INFO", "RDP desktop을 classic bitmap 960x540으로 재협상");
+	log_message("INFO", "RDP desktop을 NanoKVM 원본 1920x1080으로 재협상");
 	return true;
 }
 
@@ -2044,19 +2042,8 @@ static bool client_prepare_bitmap(Client* client)
 	}
 	else
 	{
-		const uint32_t color_depth = freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth);
-		client->classic_encoded = calloc(CLASSIC_BITMAP_BATCH, CLASSIC_TILE_MAX_ENCODED);
-		if (!client->classic_encoded)
-			return false;
-		if (color_depth != 16 && color_depth != 24 && color_depth != 32)
-		{
-			log_message("ERROR", "client가 지원하지 않는 classic bitmap 색 깊이를 요청했습니다");
-			return false;
-		}
-		if (color_depth == 24 &&
-		    !freerdp_settings_set_uint32((rdpSettings*)settings, FreeRDP_ColorDepth, 16))
-			return false;
-		log_message("INFO", "RemoteFX/NSCodec 없이 16-bit raw BitmapUpdate 경로를 사용합니다");
+		log_message("ERROR", "client가 RemoteFX/NSCodec을 지원하지 않아 raw bitmap으로 내려가지 않습니다");
+		return false;
 	}
 	if (client->bitmap_uses_rfx || client->nsc)
 	{
@@ -2191,12 +2178,17 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 	    !freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline,
 	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxH264, server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, server->config.direct_gfx) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive,
 	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2,
 	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_RemoteFxCodec, TRUE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_NSCodec, TRUE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_DrawAllowDynamicColorFidelity, TRUE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_DrawAllowColorSubsampling, TRUE) ||
+	    !freerdp_settings_set_bool(settings, FreeRDP_DrawAllowSkipAlpha, TRUE) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled,
 	                               server->config.direct_gfx) ||
 	    !freerdp_settings_set_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled,
@@ -2211,7 +2203,9 @@ static bool configure_peer(freerdp_peer* peer, Server* server)
 	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, server->config.width) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, server->config.height) ||
 	    !freerdp_settings_set_uint32(settings, FreeRDP_ColorDepth, 32) ||
-	    !freerdp_settings_set_uint32(settings, FreeRDP_MultifragMaxRequestSize, 0xFFFFFFU))
+	    !freerdp_settings_set_uint32(settings, FreeRDP_MultifragMaxRequestSize, 0xFFFFFFU) ||
+	    !freerdp_settings_set_uint32(settings, FreeRDP_OsMajorType, OSMAJORTYPE_WINDOWS) ||
+	    !freerdp_settings_set_uint32(settings, FreeRDP_OsMinorType, OSMINORTYPE_WINDOWS_NT))
 		return false;
 
 	peer->PostConnect = peer_post_connect;
