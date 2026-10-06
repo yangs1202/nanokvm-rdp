@@ -2149,19 +2149,13 @@ static bool client_check_gfx_timeout(Client* client)
 	const uint64_t started_at = client->gfx_opened ? client->gfx_opened_at : client->gfx_wait_started_at;
 	if (monotonic_milliseconds() - started_at <= 5000)
 		return true;
-	client->direct_gfx_active = false;
-	client->bitmap_fallback_active = true;
-	client->gfx_wait_started_at = 0;
-	if (!client_prepare_bitmap(client))
-	{
-		log_message("ERROR", "RDPGFX 미지원 client의 classic bitmap fallback을 시작할 수 없습니다");
-		return false;
-	}
+	/* Classic bitmap of a 1920x1080 desktop saturates the client socket and
+	 * the session dies within a few minutes. Fail here instead of falling back. */
 	if (client->gfx_opened)
-		log_message("INFO", "RDPGFX capability 응답이 없는 client를 classic bitmap backend로 전환합니다");
+		log_message("ERROR", "RDPGFX capability 응답이 없어 연결을 종료합니다");
 	else
-		log_message("INFO", "RDPGFX dynamic channel이 없는 client를 classic bitmap backend로 전환합니다");
-	return true;
+		log_message("ERROR", "RDPGFX dynamic channel이 없어 연결을 종료합니다");
+	return false;
 }
 
 static bool configure_peer(freerdp_peer* peer, Server* server)
