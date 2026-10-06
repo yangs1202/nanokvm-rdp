@@ -954,9 +954,12 @@ static bool client_output_write_ready(Client* client)
 		return true;
 	if (!client->peer->IsWriteBlocked(client->peer))
 		return true;
+	/* A blocked socket means the client has not consumed the previous update.
+	 * Drain what is already writable, then skip this frame. Forcing another
+	 * BitmapUpdate onto a full socket is what closes the session. */
 	(void)client->peer->DrainOutputBuffer(client->peer);
 	return client->peer->connected && !client_should_stop(client) &&
-	       !client->peer->IsWriteBlocked(client->peer);
+	       client->peer->IsWriteBlocked && !client->peer->IsWriteBlocked(client->peer);
 }
 
 static bool send_classic_bitmap_frame(Client* client, const uint8_t* bgra, size_t length)
@@ -2149,13 +2152,19 @@ static bool client_check_gfx_timeout(Client* client)
 	const uint64_t started_at = client->gfx_opened ? client->gfx_opened_at : client->gfx_wait_started_at;
 	if (monotonic_milliseconds() - started_at <= 5000)
 		return true;
-	/* Classic bitmap of a 1920x1080 desktop saturates the client socket and
-	 * the session dies within a few minutes. Fail here instead of falling back. */
+	client->direct_gfx_active = false;
+	client->bitmap_fallback_active = true;
+	client->gfx_wait_started_at = 0;
+	if (!client_prepare_bitmap(client))
+	{
+		log_message("ERROR", "RDPGFX 미지원 client의 classic bitmap fallback을 시작할 수 없습니다");
+		return false;
+	}
 	if (client->gfx_opened)
-		log_message("ERROR", "RDPGFX capability 응답이 없어 연결을 종료합니다");
+		log_message("INFO", "RDPGFX capability 응답이 없는 client를 classic bitmap backend로 전환합니다");
 	else
-		log_message("ERROR", "RDPGFX dynamic channel이 없어 연결을 종료합니다");
-	return false;
+		log_message("INFO", "RDPGFX dynamic channel이 없는 client를 classic bitmap backend로 전환합니다");
+	return true;
 }
 
 static bool configure_peer(freerdp_peer* peer, Server* server)
