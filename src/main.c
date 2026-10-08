@@ -144,6 +144,7 @@ struct Client
 	bool bitmap_fallback_active;
 	bool gfx_ready;
 	bool gfx_opened;
+	bool drdynvc_open_attempted;
 	FrameFlow frame_flow;
 	FrameTrace frame_trace;
 	bool need_idr;
@@ -2101,6 +2102,24 @@ static bool client_process_dynamic_channels(Client* client)
 	    !WTSVirtualChannelManagerIsChannelJoined(client->vcm, DRDYNVC_SVC_CHANNEL_NAME))
 		return true;
 
+	/* FreeRDP sends the drdynvc capability request only from ManagerOpen.
+	 * Joining the static channel does not start that exchange, so state stays
+	 * NONE and graphics Open() cannot succeed. */
+	if (!client->drdynvc_open_attempted)
+	{
+		client->drdynvc_open_attempted = true;
+		if (!WTSVirtualChannelManagerOpen(client->vcm))
+		{
+			log_message("ERROR", "drdynvc capability request 전송 실패");
+			return false;
+		}
+		char diagnostic[128];
+		(void)snprintf(diagnostic, sizeof(diagnostic),
+		               "drdynvc capability request 전송 state=%u",
+		               (unsigned)WTSVirtualChannelManagerGetDrdynvcState(client->vcm));
+		log_message("INFO", diagnostic);
+	}
+
 	/* Flush only when the queue is ready. A large frame write blocks this thread,
 	 * and FreeRDP treats a client read that waits longer than 100 ms as fatal. */
 	const HANDLE channel_event = WTSVirtualChannelManagerGetEventHandle(client->vcm);
@@ -2114,7 +2133,10 @@ static bool client_process_dynamic_channels(Client* client)
 	    WTSVirtualChannelManagerGetDrdynvcState(client->vcm) == DRDYNVC_STATE_READY)
 	{
 		if (!client->gfx->Open || !client->gfx->Open(client->gfx))
+		{
+			log_message("ERROR", "RDPGFX dynamic channel open 실패");
 			return false;
+		}
 		client->gfx_opened = true;
 		client->gfx_opened_at = monotonic_milliseconds();
 		log_message("INFO", "RDPGFX dynamic channel open 완료; client capability 대기 중");
@@ -2139,16 +2161,16 @@ static bool client_check_gfx_timeout(Client* client)
 {
 	if (!client->direct_gfx_active || client->gfx_wait_started_at == 0 || client->gfx_ready)
 		return true;
+	const uint64_t now = monotonic_milliseconds();
 	const uint64_t started_at = client->gfx_opened ? client->gfx_opened_at : client->gfx_wait_started_at;
-	if (monotonic_milliseconds() - started_at <= 5000)
+	if (now - started_at <= 15000)
 		return true;
 	char diagnostic[192];
 	(void)snprintf(diagnostic, sizeof(diagnostic),
-	               "RDPGFX 채널 미준비로 연결을 종료합니다 opened=%u joined=%u state=%u",
+	               "RDPGFX 준비 실패로 연결을 종료합니다 opened=%u state=%u waited_ms=%llu",
 	               (unsigned)client->gfx_opened,
-	               (unsigned)WTSVirtualChannelManagerIsChannelJoined(client->vcm,
-	                                                                  DRDYNVC_SVC_CHANNEL_NAME),
-	               (unsigned)WTSVirtualChannelManagerGetDrdynvcState(client->vcm));
+	               (unsigned)WTSVirtualChannelManagerGetDrdynvcState(client->vcm),
+	               (unsigned long long)(now - client->gfx_wait_started_at));
 	log_message("ERROR", diagnostic);
 	return false;
 }
