@@ -87,6 +87,29 @@ static void test_h264_annexb(void)
 	assert(copied[4] == 0x67);
 }
 
+static void test_h264_copy_nal_from_shared_access_unit(void)
+{
+	const uint8_t unit[] = {
+	    0, 0, 0, 1, 0x67, 0x42, 0x00, 0x0a,
+	    0, 0, 0, 1, 0x68, 0xce, 0x38, 0x80,
+	    0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00,
+	};
+	uint8_t* sps = NULL;
+	uint8_t* pps = NULL;
+	size_t sps_length = 0;
+	size_t pps_length = 0;
+	assert(h264_copy_nal(&sps, &sps_length, unit, sizeof(unit), 7));
+	assert(h264_copy_nal(&pps, &pps_length, unit, sizeof(unit), 8));
+	assert(sps_length == 8);
+	assert(pps_length == 8);
+	assert(sps[4] == 0x67 && pps[4] == 0x68);
+	assert(!h264_contains_nal_type(sps, sps_length, 5));
+	assert(!h264_contains_nal_type(pps, pps_length, 5));
+	assert(!h264_copy_nal(&sps, &sps_length, unit, sizeof(unit), 9));
+	free(sps);
+	free(pps);
+}
+
 static void test_hid_mapping(void)
 {
 	char keyboard_path[] = "/tmp/nanokvm-rdp-keyboard-hangul-XXXXXX";
@@ -478,6 +501,7 @@ static void test_hid_emoji_paste(void)
 int main(void)
 {
 	test_h264_annexb();
+	test_h264_copy_nal_from_shared_access_unit();
 	test_hid_mapping();
 	test_hid_control_space_passthrough();
 	test_hid_release_all_absolute_length();

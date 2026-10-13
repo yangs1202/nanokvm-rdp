@@ -1,5 +1,6 @@
 #include "h264.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 bool h264_has_annexb_start_code(const uint8_t* data, size_t length)
@@ -45,4 +46,55 @@ size_t h264_copy_annexb(uint8_t* destination, const uint8_t* data, size_t length
 	destination[3] = 1;
 	memcpy(destination + 4, data, length);
 	return length + 4;
+}
+
+static bool nal_start(const uint8_t* data, size_t length, size_t index, size_t* start_length)
+{
+	if (index + 3 >= length || data[index] != 0 || data[index + 1] != 0)
+		return false;
+	if (data[index + 2] == 1)
+	{
+		*start_length = 3;
+		return true;
+	}
+	if (index + 4 < length && data[index + 2] == 0 && data[index + 3] == 1)
+	{
+		*start_length = 4;
+		return true;
+	}
+	return false;
+}
+
+bool h264_copy_nal(uint8_t** destination, size_t* destination_length, const uint8_t* data,
+                   size_t length, uint8_t type)
+{
+	if (!destination || !destination_length || !data)
+		return false;
+	for (size_t index = 0; index + 3 < length; index++)
+	{
+		size_t start_length = 0;
+		if (!nal_start(data, length, index, &start_length) ||
+		    index + start_length >= length ||
+		    (data[index + start_length] & 0x1fU) != type)
+			continue;
+		size_t end = index + start_length + 1;
+		while (end + 2 < length)
+		{
+			size_t ignored = 0;
+			if (nal_start(data, length, end, &ignored))
+				break;
+			end++;
+		}
+		if (end + 2 >= length)
+			end = length;
+		uint8_t* next = malloc(end - index);
+		if (!next)
+			return false;
+		memcpy(next, data + index, end - index);
+		free(*destination);
+		*destination = next;
+		*destination_length = end - index;
+		return true;
+	}
+	return false;
 }

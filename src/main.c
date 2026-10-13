@@ -471,23 +471,6 @@ static void server_heartbeat(Server* server)
 	}
 }
 
-static bool copy_bytes(uint8_t** destination, size_t* destination_length, const uint8_t* source,
-	                      size_t source_length)
-{
-	uint8_t* next = NULL;
-	if (source_length > 0)
-	{
-		next = malloc(source_length);
-		if (!next)
-			return false;
-		memcpy(next, source, source_length);
-	}
-	free(*destination);
-	*destination = next;
-	*destination_length = source_length;
-	return true;
-}
-
 static bool client_should_stop(Client* client)
 {
 	bool stopping = false;
@@ -848,10 +831,8 @@ static DWORD WINAPI video_thread(LPVOID argument)
 		client->last_rtp_received_at = monotonic_milliseconds();
 		client->rtp_nals++;
 		client->rtp_access_units++;
-		if (h264_contains_nal_type(data, length, 7))
-			(void)copy_bytes(&client->sps, &client->sps_length, data, length);
-		if (h264_contains_nal_type(data, length, 8))
-			(void)copy_bytes(&client->pps, &client->pps_length, data, length);
+		(void)h264_copy_nal(&client->sps, &client->sps_length, data, length, 7);
+		(void)h264_copy_nal(&client->pps, &client->pps_length, data, length, 8);
 		const bool idr = h264_contains_nal_type(data, length, 5);
 		const bool p_frame = h264_contains_nal_type(data, length, 1);
 		if (idr)
@@ -1542,10 +1523,8 @@ static DWORD WINAPI http_video_thread(LPVOID argument)
 				video_source_release_access_unit(&access_unit);
 				continue;
 			}
-			if (h264_contains_nal_type(data, length, 7))
-				(void)copy_bytes(&sps, &sps_length, data, length);
-			if (h264_contains_nal_type(data, length, 8))
-				(void)copy_bytes(&pps, &pps_length, data, length);
+			(void)h264_copy_nal(&sps, &sps_length, data, length, 7);
+			(void)h264_copy_nal(&pps, &pps_length, data, length, 8);
 			const bool idr = h264_contains_nal_type(data, length, 5);
 			if (access_unit.packet_loss)
 				need_idr = true;
