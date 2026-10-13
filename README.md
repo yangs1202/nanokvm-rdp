@@ -120,9 +120,12 @@ Useful gateway options:
 -listen host:port  -cert file  -key file
 -width n           -height n  -bitrate n
 -control-port n    -video-port n
+-http-port n       -jpeg-quality n
 -direct-gfx
 -swap-alt-command
 ```
+
+HTTP snapshot API listens on `-http-port` (default `8080`) without an RDP client. `GET /snapshot.jpg` returns the newest JPEG. `GET /api/status` reports frame size. `POST /api/mouse` takes source-pixel `x`/`y` from that JPEG and maps them onto the configured desktop. `POST /api/key`, `POST /api/text`, `POST /api/wheel`, and `POST /api/release` send HID input through the same control channel as RDP. `GET /` is a small viewer. JPEG quality is FFmpeg's 2-31 scale, where lower is better; the default is 8.
 
 The gateway advertises Korean keyboard layout `0x00000412` and forwards physical scan codes.
 Keyboard scan codes, including Control+Space, Right Alt, Right GUI, and Caps Lock, are forwarded as their real HID keys. The agent does not synthesize a language toggle. Unsent HID reports are retried in order when USB becomes writable, including the final key/button release when no further input arrives. See [input reliability](docs/input-reliability.md) for recovery behavior and diagnostics.
@@ -148,7 +151,7 @@ Deployment scripts are provided in [`deploy/`](deploy/):
 - [`S100nanokvm-agent`](deploy/S100nanokvm-agent) installs and manages the NanoKVM agent.
 - [`S100nanokvm-rdp`](deploy/S100nanokvm-rdp) manages the legacy on-device RDP service.
 
-Before starting the agent, update `GATEWAY`, `CONTROL_PORT`, `VIDEO_PORT`, `WIDTH`, `HEIGHT`, and `BITRATE` in `deploy/S100nanokvm-agent` for the target environment. Permit outbound traffic from NanoKVM to the gateway on TCP `3390` and UDP `5004`, and permit RDP clients to reach gateway TCP `3389`.
+Before starting the agent, update `GATEWAY`, `CONTROL_PORT`, `VIDEO_PORT`, `WIDTH`, `HEIGHT`, and `BITRATE` in `deploy/S100nanokvm-agent` for the target environment. Permit outbound traffic from NanoKVM to the gateway on TCP `3390` and UDP `5004`, and permit RDP clients to reach gateway TCP `3389`. The HTTP snapshot API listens on TCP `8080`.
 
 Do not run this agent simultaneously with the device's existing FoldVNC or stock KVM service: they share the NanoKVM capture path. The agent deployment script stops those services before starting the agent.
 

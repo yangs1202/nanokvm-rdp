@@ -61,7 +61,8 @@ bool device_session_acquire(DeviceSession* session, DeviceSessionConsumer consum
 {
 	if (!session || !lease ||
 	    (consumer != DEVICE_SESSION_CONSUMER_DIRECT_GFX &&
-	     consumer != DEVICE_SESSION_CONSUMER_BITMAP))
+	     consumer != DEVICE_SESSION_CONSUMER_BITMAP &&
+	     consumer != DEVICE_SESSION_CONSUMER_HTTP))
 		return false;
 	*lease = (DeviceSessionLease){ 0 };
 	pthread_mutex_lock(&session->lock);

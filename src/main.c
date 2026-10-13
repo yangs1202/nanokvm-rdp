@@ -6,6 +6,7 @@
 #include "frame_trace.h"
 #include "h264.h"
 #include "hid.h"
+#include "http_api.h"
 #include "input_router.h"
 #include "protocol.h"
 #include "video_source.h"
@@ -87,6 +88,8 @@ typedef struct
 	uint16_t bitrate;
 	uint16_t control_port;
 	uint16_t video_port;
+	uint16_t http_port;
+	int jpeg_quality;
 	bool direct_gfx;
 	bool swap_alt_command;
 } ServerConfig;
@@ -103,6 +106,8 @@ struct Server
 	HANDLE peer_thread;
 	AgentTransport transport;
 	DeviceSession* device_session;
+	HttpApi* http_api;
+	HANDLE http_video_thread;
 	uint64_t last_stats_log_at;
 	uint64_t next_keepalive_at;
 	int8_t keepalive_dx;
@@ -194,6 +199,7 @@ static uint64_t monotonic_milliseconds(void);
 static DWORD WINAPI video_thread(LPVOID argument);
 static DWORD WINAPI bitmap_video_thread(LPVOID argument);
 static DWORD WINAPI output_thread(LPVOID argument);
+static DWORD WINAPI http_video_thread(LPVOID argument);
 
 static void log_message(const char* level, const char* message)
 {
@@ -226,6 +232,8 @@ static void server_keepalive(Server* server, uint64_t now)
 		       !active->input_router.control_space_down;
 		LeaveCriticalSection(&active->lock);
 	}
+	if (idle && server->http_api && !http_api_input_idle(server->http_api))
+		idle = false;
 	LeaveCriticalSection(&server->lock);
 	if (!idle)
 		return;
@@ -1482,6 +1490,78 @@ static DWORD WINAPI output_thread(LPVOID argument)
 	return 0;
 }
 
+static bool on_http_decoded_frame(void* context, const AVFrame* frame)
+{
+	Server* server = context;
+	if (stop_requested || !server->http_api)
+		return false;
+	return http_api_publish_frame(server->http_api, frame);
+}
+
+/* HTTP snapshots do not require an RDP client. The device session still has
+ * one reader, so this thread yields while an RDP client owns the RTP socket. */
+static DWORD WINAPI http_video_thread(LPVOID argument)
+{
+	Server* server = (Server*)argument;
+	while (!stop_requested)
+	{
+		DeviceSessionLease lease = { 0 };
+		FfmpegDecoder decoder = { 0 };
+		if (!device_session_acquire(server->device_session, DEVICE_SESSION_CONSUMER_HTTP,
+		                            &lease) ||
+		    !ffmpeg_decoder_start_raw(&decoder, on_http_decoded_frame, server))
+		{
+			ffmpeg_decoder_stop(&decoder);
+			device_session_release(&lease);
+			Sleep(200);
+			continue;
+		}
+		log_message("INFO", "HTTP JPEG snapshot decoder 시작");
+		while (!stop_requested)
+		{
+			VideoSourceAccessUnit access_unit = { 0 };
+			if (!device_session_read(&lease, &access_unit))
+			{
+				const int error = errno;
+				if (stop_requested)
+					break;
+				if (error == EAGAIN || error == EWOULDBLOCK)
+					continue;
+				log_message("ERROR", "HTTP RTP/H.264 frame 수신 실패");
+				break;
+			}
+			uint8_t* data = access_unit.data;
+			const size_t length = access_unit.length;
+			if (!data || length == 0)
+			{
+				video_source_release_access_unit(&access_unit);
+				continue;
+			}
+			const size_t annexb_length = h264_annexb_size(data, length);
+			uint8_t* annexb = malloc(annexb_length);
+			if (!annexb)
+			{
+				video_source_release_access_unit(&access_unit);
+				break;
+			}
+			(void)h264_copy_annexb(annexb, data, length);
+			video_source_release_access_unit(&access_unit);
+			const bool pushed = ffmpeg_decoder_push(&decoder, annexb, annexb_length);
+			free(annexb);
+			if (!pushed && !stop_requested)
+			{
+				log_message("ERROR", "HTTP FFmpeg H.264 decoder 입력 실패");
+				break;
+			}
+		}
+		ffmpeg_decoder_stop(&decoder);
+		device_session_release(&lease);
+		if (!stop_requested)
+			Sleep(200);
+	}
+	return 0;
+}
+
 static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 {
 	Client* client = (Client*)argument;
@@ -2318,12 +2398,22 @@ static BOOL peer_accepted(freerdp_listener* listener, freerdp_peer* peer)
 	return TRUE;
 }
 
+static bool http_send_control(void* context, uint8_t type, const void* payload, uint16_t length)
+{
+	return server_send_control(context, type, payload, length);
+}
+
+static bool http_set_stream(void* context, bool requested)
+{
+	return server_set_stream_requested(context, requested);
+}
+
 static void print_usage(const char* executable)
 {
 	(void)fprintf(stderr,
 	              "Usage: %s [-listen host:port] [-cert file] [-key file] [-width n] [-height n] "
-	              "[-bitrate n] [-control-port n] [-video-port n] [-direct-gfx] "
-	              "[-swap-alt-command]\n",
+	              "[-bitrate n] [-control-port n] [-video-port n] [-http-port n] "
+	              "[-jpeg-quality n] [-direct-gfx] [-swap-alt-command]\n",
 	              executable);
 }
 
@@ -2359,6 +2449,8 @@ int main(int argc, char* argv[])
 	server.config.bitrate = DEFAULT_BITRATE;
 	server.config.control_port = 3390;
 	server.config.video_port = 5004;
+	server.config.http_port = 8080;
+	server.config.jpeg_quality = 8;
 	server.control_listener = -1;
 	for (int index = 1; index < argc; index++)
 	{
@@ -2381,6 +2473,10 @@ int main(int argc, char* argv[])
 			server.config.control_port = (uint16_t)strtoul(argv[++index], NULL, 10);
 		else if (strcmp(argv[index], "-video-port") == 0 && index + 1 < argc)
 			server.config.video_port = (uint16_t)strtoul(argv[++index], NULL, 10);
+		else if (strcmp(argv[index], "-http-port") == 0 && index + 1 < argc)
+			server.config.http_port = (uint16_t)strtoul(argv[++index], NULL, 10);
+		else if (strcmp(argv[index], "-jpeg-quality") == 0 && index + 1 < argc)
+			server.config.jpeg_quality = (int)strtol(argv[++index], NULL, 10);
 		else if (strcmp(argv[index], "-direct-gfx") == 0)
 			server.config.direct_gfx = true;
 		else if (strcmp(argv[index], "-swap-alt-command") == 0)
@@ -2392,7 +2488,8 @@ int main(int argc, char* argv[])
 		}
 	}
 	if (server.config.width == 0 || server.config.height == 0 || server.config.bitrate == 0 ||
-	    server.config.control_port == 0 || server.config.video_port == 0)
+	    server.config.control_port == 0 || server.config.video_port == 0 ||
+	    server.config.http_port == 0)
 		return 2;
 	server.next_keepalive_at = monotonic_milliseconds() + GATEWAY_KEEPALIVE_INTERVAL_MS;
 	server.keepalive_dx = 1;
@@ -2428,6 +2525,42 @@ int main(int argc, char* argv[])
 		agent_transport_destroy(&server.transport);
 		DeleteCriticalSection(&server.lock);
 		return 1;
+	}
+
+	{
+		HttpApiConfig http_config = {
+			.bind_address = server.config.bind_address,
+			.port = server.config.http_port,
+			.width = server.config.width,
+			.height = server.config.height,
+			.jpeg_quality = server.config.jpeg_quality,
+			.swap_alt_command = server.config.swap_alt_command,
+			.context = &server,
+			.send_control = http_send_control,
+			.set_stream = http_set_stream,
+		};
+		server.http_api = http_api_create(&http_config);
+		if (!server.http_api || !http_api_start(server.http_api))
+		{
+			http_api_destroy(server.http_api);
+			server.http_api = NULL;
+			device_session_destroy(server.device_session);
+			agent_transport_destroy(&server.transport);
+			DeleteCriticalSection(&server.lock);
+			return 1;
+		}
+		server.http_video_thread = CreateThread(NULL, 0, http_video_thread, &server, 0, NULL);
+		if (!server.http_video_thread)
+		{
+			http_api_destroy(server.http_api);
+			server.http_api = NULL;
+			device_session_destroy(server.device_session);
+			agent_transport_destroy(&server.transport);
+			DeleteCriticalSection(&server.lock);
+			return 1;
+		}
+		(void)fprintf(stderr, "%s: INFO: HTTP snapshot API listening on %s:%u\n", TAG,
+		              server.config.bind_address, server.config.http_port);
 	}
 
 	freerdp_listener* listener = freerdp_listener_new();
@@ -2495,6 +2628,15 @@ int main(int argc, char* argv[])
 			break;
 	}
 	stop_requested = 1;
+	http_api_stop(server.http_api);
+	if (server.http_video_thread)
+	{
+		(void)WaitForSingleObject(server.http_video_thread, 3000);
+		(void)CloseHandle(server.http_video_thread);
+		server.http_video_thread = NULL;
+	}
+	http_api_destroy(server.http_api);
+	server.http_api = NULL;
 	listener->Close(listener);
 	freerdp_listener_free(listener);
 	if (!server_join_peer_thread(&server))

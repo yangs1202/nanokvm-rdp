@@ -195,6 +195,7 @@ if(NANOKVM_RDP_BUILD_SERVER)
   add_executable(nanokvm-rdp-gateway
     src/agent_transport.c
     src/device_session.c
+    src/http_api.c
     src/input_router.c
     src/main.c
     src/ffmpeg_decoder.c

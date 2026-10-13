@@ -86,7 +86,7 @@ RUN apt-get update \
 
 COPY --from=builder /src/nanokvm-rdp/build/gateway/nanokvm-rdp-gateway /usr/local/bin/nanokvm-rdp-gateway
 
-EXPOSE 3389/tcp 3390/tcp 5004/udp
+EXPOSE 3389/tcp 3390/tcp 5004/udp 8080/tcp
 
 ENTRYPOINT ["/usr/local/bin/nanokvm-rdp-gateway"]
 CMD ["-listen", "0.0.0.0:3389", "-cert", "/run/tls/tls.crt", "-key", "/run/tls/tls.key"]

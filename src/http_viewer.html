@@ -1,0 +1,88 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>NanoKVM</title>
+<style>
+html, body { margin: 0; background: #111; color: #eee; font: 14px sans-serif; }
+#bar { padding: 8px; }
+img { max-width: 100%; height: auto; cursor: crosshair; background: #000; display: block; }
+</style>
+<div id="bar">Click the image to move and click. Keys typed here go to the host. Coordinates are source pixels.</div>
+<img id="screen" alt="screen">
+<script>
+const img = document.getElementById("screen");
+let lastMove = 0;
+function refresh() {
+  img.src = "/snapshot.jpg?t=" + Date.now();
+}
+img.onload = () => setTimeout(refresh, 80);
+img.onerror = () => setTimeout(refresh, 400);
+refresh();
+function pos(ev) {
+  const r = img.getBoundingClientRect();
+  const x = Math.round((ev.clientX - r.left) * img.naturalWidth / r.width);
+  const y = Math.round((ev.clientY - r.top) * img.naturalHeight / r.height);
+  return { x: Math.max(0, x), y: Math.max(0, y) };
+}
+function post(path, body) {
+  return fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+}
+img.addEventListener("contextmenu", (ev) => ev.preventDefault());
+img.addEventListener("mousemove", (ev) => {
+  const now = Date.now();
+  if (now - lastMove < 30) return;
+  lastMove = now;
+  post("/api/mouse", pos(ev));
+});
+img.addEventListener("mousedown", (ev) => {
+  const body = pos(ev);
+  body.buttons = ev.button === 2 ? 2 : ev.button === 1 ? 4 : 1;
+  body.down = true;
+  post("/api/mouse", body);
+});
+img.addEventListener("mouseup", (ev) => {
+  const body = pos(ev);
+  body.buttons = ev.button === 2 ? 2 : ev.button === 1 ? 4 : 1;
+  body.down = false;
+  post("/api/mouse", body);
+});
+img.addEventListener("wheel", (ev) => {
+  ev.preventDefault();
+  post("/api/wheel", { dy: Math.sign(ev.deltaY) * 120, dx: Math.sign(ev.deltaX) * 120 });
+}, { passive: false });
+const map = {
+  Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, Digit6: 7, Digit7: 8, Digit8: 9, Digit9: 10, Digit0: 11,
+  Minus: 12, Equal: 13, Backspace: 14, Tab: 15, KeyQ: 16, KeyW: 17, KeyE: 18, KeyR: 19, KeyT: 20, KeyY: 21, KeyU: 22, KeyI: 23, KeyO: 24, KeyP: 25,
+  BracketLeft: 26, BracketRight: 27, Enter: 28, ControlLeft: 29, KeyA: 30, KeyS: 31, KeyD: 32, KeyF: 33, KeyG: 34, KeyH: 35, KeyJ: 36, KeyK: 37, KeyL: 38,
+  Semicolon: 39, Quote: 40, Backquote: 41, ShiftLeft: 42, Backslash: 43, KeyZ: 44, KeyX: 45, KeyC: 46, KeyV: 47, KeyB: 48, KeyN: 49, KeyM: 50,
+  Comma: 51, Period: 52, Slash: 53, ShiftRight: 54, AltLeft: 56, Space: 57, CapsLock: 58,
+  F1: 59, F2: 60, F3: 61, F4: 62, F5: 63, F6: 64, F7: 65, F8: 66, F9: 67, F10: 68
+};
+const extMap = {
+  ControlRight: 29, AltRight: 56, MetaLeft: 91, MetaRight: 92,
+  Insert: 82, Delete: 83, Home: 71, End: 79, PageUp: 73, PageDown: 81,
+  ArrowUp: 72, ArrowLeft: 75, ArrowDown: 80, ArrowRight: 77
+};
+function keyBody(ev, release) {
+  const extended = Object.prototype.hasOwnProperty.call(extMap, ev.code);
+  const code = extended ? extMap[ev.code] : map[ev.code];
+  if (!code) return null;
+  return { code, extended, release };
+}
+window.addEventListener("keydown", (ev) => {
+  const body = keyBody(ev, false);
+  if (!body || ev.repeat) return;
+  ev.preventDefault();
+  post("/api/key", body);
+});
+window.addEventListener("keyup", (ev) => {
+  const body = keyBody(ev, true);
+  if (!body) return;
+  ev.preventDefault();
+  post("/api/key", body);
+});
+window.addEventListener("blur", () => post("/api/release", {}));
+</script>

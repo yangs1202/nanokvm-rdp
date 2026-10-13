@@ -12,6 +12,7 @@ typedef enum
 {
 	DEVICE_SESSION_CONSUMER_DIRECT_GFX = 1,
 	DEVICE_SESSION_CONSUMER_BITMAP = 2,
+	DEVICE_SESSION_CONSUMER_HTTP = 3,
 } DeviceSessionConsumer;
 
 typedef struct
