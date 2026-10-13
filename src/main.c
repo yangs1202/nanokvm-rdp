@@ -255,6 +255,14 @@ static bool server_set_stream_requested(Server* server, bool requested)
 	return sent;
 }
 
+/* RDP teardown always clears the agent stream. HTTP snapshots have no RDP
+ * client, so restore the request the HTTP API made at startup. */
+static void restore_http_stream(Server* server)
+{
+	if (server && server->http_api)
+		(void)server_set_stream_requested(server, true);
+}
+
 static bool request_video_idr(void* context, uint64_t video_source_epoch)
 {
 	/* This epoch identifies the successful RTP open that produced the access
@@ -2469,14 +2477,6 @@ static bool http_send_control(void* context, uint8_t type, const void* payload, 
 static bool http_set_stream(void* context, bool requested)
 {
 	return server_set_stream_requested(context, requested);
-}
-
-/* RDP teardown always clears the agent stream. HTTP snapshots have no RDP
- * client, so restore the request the HTTP API made at startup. */
-static void restore_http_stream(Server* server)
-{
-	if (server && server->http_api)
-		(void)server_set_stream_requested(server, true);
 }
 
 static void print_usage(const char* executable)
