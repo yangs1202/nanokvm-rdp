@@ -108,6 +108,7 @@ struct Server
 	DeviceSession* device_session;
 	HttpApi* http_api;
 	HANDLE http_video_thread;
+	HANDLE http_yield_event;
 	uint64_t last_stats_log_at;
 	uint64_t next_keepalive_at;
 	int8_t keepalive_dx;
@@ -600,12 +601,7 @@ static UINT on_gfx_caps_advertise(RdpgfxServerContext* gfx,
 		client_stop(client);
 		return ERROR_NOT_ENOUGH_MEMORY;
 	}
-	if (!server_set_stream_requested(client->server, true))
-	{
-		log_message("ERROR", "RDPGFX NanoKVM agent에 START_STREAM을 보낼 수 없습니다");
-		client_stop(client);
-		return ERROR_CONNECTION_ABORTED;
-	}
+	(void)server_set_stream_requested(client->server, true);
 	if (use_avc420)
 		log_message("INFO", "RDPGFX AVC420 capability 확인 및 surface 초기화 완료");
 	else
@@ -786,8 +782,19 @@ static DWORD WINAPI video_thread(LPVOID argument)
 {
 	Client* client = (Client*)argument;
 	DeviceSessionLease lease = { 0 };
-	if (!device_session_acquire(client->server->device_session,
-	                            DEVICE_SESSION_CONSUMER_DIRECT_GFX, &lease))
+	HANDLE yield_event = client->server->http_yield_event;
+	if (yield_event)
+		(void)SetEvent(yield_event);
+	for (unsigned attempt = 0; attempt < 20 && !client_should_stop(client); attempt++)
+	{
+		if (device_session_acquire(client->server->device_session,
+		                           DEVICE_SESSION_CONSUMER_DIRECT_GFX, &lease))
+			break;
+		Sleep(50);
+	}
+	if (yield_event)
+		(void)ResetEvent(yield_event);
+	if (!lease.session)
 	{
 		log_message("ERROR", "RDPGFX RTP/H.264 receiver를 시작할 수 없습니다");
 		client_stop(client);
@@ -1497,14 +1504,21 @@ static DWORD WINAPI http_video_thread(LPVOID argument)
 			Sleep(200);
 			continue;
 		}
+		bool yielded = false;
 		log_message("INFO", "HTTP JPEG snapshot decoder 시작");
 		uint8_t* sps = NULL;
 		size_t sps_length = 0;
 		uint8_t* pps = NULL;
 		size_t pps_length = 0;
 		bool need_idr = true;
-		while (!stop_requested)
+		while (!stop_requested && !yielded)
 		{
+			if (server->http_yield_event &&
+			    WaitForSingleObject(server->http_yield_event, 0) == WAIT_OBJECT_0)
+			{
+				yielded = true;
+				break;
+			}
 			VideoSourceAccessUnit access_unit = { 0 };
 			if (!device_session_read(&lease, &access_unit))
 			{
@@ -1512,7 +1526,15 @@ static DWORD WINAPI http_video_thread(LPVOID argument)
 				if (stop_requested)
 					break;
 				if (error == EAGAIN || error == EWOULDBLOCK)
+			{
+				if (server->http_yield_event &&
+				    WaitForSingleObject(server->http_yield_event, 0) == WAIT_OBJECT_0)
+				{
+					yielded = true;
+					break;
+				}
 					continue;
+			}
 				log_message("ERROR", "HTTP RTP/H.264 frame 수신 실패");
 				break;
 			}
@@ -1591,7 +1613,7 @@ static DWORD WINAPI http_video_thread(LPVOID argument)
 		free(pps);
 		ffmpeg_decoder_stop(&decoder);
 		device_session_release(&lease);
-		if (!stop_requested)
+		if (!stop_requested && !yielded)
 			Sleep(200);
 	}
 	return 0;
@@ -1603,6 +1625,9 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 	DeviceSessionLease lease = { 0 };
 	FfmpegDecoder decoder = { 0 };
 	bool backend_ready = false;
+	HANDLE yield_event = client->server->http_yield_event;
+	if (yield_event)
+		(void)SetEvent(yield_event);
 
 	for (unsigned attempt = 0; attempt < 10 && !client_should_stop(client); attempt++)
 	{
@@ -1617,6 +1642,8 @@ static DWORD WINAPI bitmap_video_thread(LPVOID argument)
 		device_session_release(&lease);
 		Sleep(1000);
 	}
+	if (yield_event)
+		(void)ResetEvent(yield_event);
 	if (!backend_ready)
 	{
 		log_message("ERROR", "RTP/H.264 receiver 또는 FFmpeg decoder를 시작할 수 없습니다");
@@ -2051,6 +2078,7 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	{
 		(void)client_release_all_inputs(client, NULL);
 		(void)server_set_stream_requested(client->server, false);
+		restore_http_stream(client->server);
 	}
 	if (client->server)
 	{
@@ -2443,6 +2471,14 @@ static bool http_set_stream(void* context, bool requested)
 	return server_set_stream_requested(context, requested);
 }
 
+/* RDP teardown always clears the agent stream. HTTP snapshots have no RDP
+ * client, so restore the request the HTTP API made at startup. */
+static void restore_http_stream(Server* server)
+{
+	if (server && server->http_api)
+		(void)server_set_stream_requested(server, true);
+}
+
 static void print_usage(const char* executable)
 {
 	(void)fprintf(stderr,
@@ -2530,6 +2566,12 @@ int main(int argc, char* argv[])
 	server.keepalive_dx = 1;
 	if (!InitializeCriticalSectionAndSpinCount(&server.lock, 4000))
 		return 1;
+	server.http_yield_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if (!server.http_yield_event)
+	{
+		DeleteCriticalSection(&server.lock);
+		return 1;
+	}
 	const AgentTransportCallbacks transport_callbacks = {
 		.event = on_transport_event,
 		.clock = transport_clock,
@@ -2672,6 +2714,8 @@ int main(int argc, char* argv[])
 	}
 	http_api_destroy(server.http_api);
 	server.http_api = NULL;
+	if (server.http_yield_event)
+		(void)CloseHandle(server.http_yield_event);
 	listener->Close(listener);
 	freerdp_listener_free(listener);
 	if (!server_join_peer_thread(&server))
