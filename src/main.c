@@ -1491,7 +1491,10 @@ static bool on_http_decoded_frame(void* context, const AVFrame* frame)
 	Server* server = context;
 	if (stop_requested || !server->http_api)
 		return false;
-	return http_api_publish_frame(server->http_api, frame);
+	/* A JPEG encode failure is not a broken H.264 session. Returning false
+	 * here makes the decoder discard every following IDR. */
+	(void)http_api_publish_frame(server->http_api, frame);
+	return true;
 }
 
 /* HTTP snapshots do not require an RDP client. The device session still has

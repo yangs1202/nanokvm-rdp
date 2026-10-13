@@ -32,6 +32,10 @@ struct HttpApi
 	bool running;
 	bool started;
 	const AVCodec* jpeg_codec;
+	AVCodecContext* jpeg_encoder;
+	struct SwsContext* jpeg_scaler;
+	AVFrame* jpeg_yuv;
+	int jpeg_source_format;
 	uint8_t* jpeg;
 	size_t jpeg_length;
 	uint32_t frame_id;
@@ -111,39 +115,100 @@ bool http_api_publish_frame(HttpApi* api, const struct AVFrame* source)
 	if (!api || !api->running || !frame || frame->width <= 0 || frame->height <= 0 ||
 	    !api->jpeg_codec)
 		return false;
-	AVCodecContext* codec = avcodec_alloc_context3(api->jpeg_codec);
 	AVPacket* packet = av_packet_alloc();
-	AVFrame* yuv = av_frame_alloc();
-	struct SwsContext* scaler = NULL;
 	bool ok = false;
-	if (!codec || !packet || !yuv)
+	const char* failure = NULL;
+	if (!packet)
+	{
+		failure = "packet";
 		goto out;
-	codec->width = frame->width;
-	codec->height = frame->height;
-	codec->pix_fmt = AV_PIX_FMT_YUVJ420P;
-	codec->time_base = (AVRational){ 1, 25 };
-	codec->color_range = AVCOL_RANGE_JPEG;
-	if (av_opt_set_int(codec->priv_data, "q", api->config.jpeg_quality, 0) < 0 ||
-	    avcodec_open2(codec, api->jpeg_codec, NULL) < 0)
+	}
+	if (!api->jpeg_encoder || api->jpeg_encoder->width != frame->width ||
+	    api->jpeg_encoder->height != frame->height)
+	{
+		avcodec_free_context(&api->jpeg_encoder);
+		api->jpeg_encoder = avcodec_alloc_context3(api->jpeg_codec);
+		if (!api->jpeg_encoder)
+		{
+			failure = "encoder";
+			goto out;
+		}
+		api->jpeg_encoder->width = frame->width;
+		api->jpeg_encoder->height = frame->height;
+		api->jpeg_encoder->pix_fmt = AV_PIX_FMT_YUVJ420P;
+		api->jpeg_encoder->time_base = (AVRational){ 1, 25 };
+		api->jpeg_encoder->color_range = AVCOL_RANGE_JPEG;
+		if (av_opt_set_int(api->jpeg_encoder->priv_data, "q", api->config.jpeg_quality, 0) < 0 ||
+		    avcodec_open2(api->jpeg_encoder, api->jpeg_codec, NULL) < 0)
+		{
+			failure = "open";
+			avcodec_free_context(&api->jpeg_encoder);
+			goto out;
+		}
+	}
+	if (!api->jpeg_yuv || api->jpeg_yuv->width != frame->width ||
+	    api->jpeg_yuv->height != frame->height)
+	{
+		av_frame_free(&api->jpeg_yuv);
+		api->jpeg_yuv = av_frame_alloc();
+		if (!api->jpeg_yuv)
+		{
+			failure = "yuv";
+			goto out;
+		}
+		api->jpeg_yuv->format = AV_PIX_FMT_YUVJ420P;
+		api->jpeg_yuv->width = frame->width;
+		api->jpeg_yuv->height = frame->height;
+		api->jpeg_yuv->color_range = AVCOL_RANGE_JPEG;
+		if (av_frame_get_buffer(api->jpeg_yuv, 32) < 0)
+		{
+			failure = "buffer";
+			av_frame_free(&api->jpeg_yuv);
+			goto out;
+		}
+	}
+	if (!api->jpeg_scaler || api->jpeg_source_format != frame->format ||
+	    api->jpeg_encoder->width != frame->width)
+	{
+		api->jpeg_scaler = sws_getCachedContext(
+		    api->jpeg_scaler, frame->width, frame->height, (enum AVPixelFormat)frame->format,
+		    frame->width, frame->height, AV_PIX_FMT_YUVJ420P, SWS_BILINEAR, NULL, NULL, NULL);
+		api->jpeg_source_format = frame->format;
+	}
+	if (!api->jpeg_scaler)
+	{
+		failure = "scaler";
 		goto out;
-	yuv->format = AV_PIX_FMT_YUVJ420P;
-	yuv->width = frame->width;
-	yuv->height = frame->height;
-	yuv->color_range = AVCOL_RANGE_JPEG;
-	if (av_frame_get_buffer(yuv, 32) < 0)
+	}
+	if (av_frame_make_writable(api->jpeg_yuv) < 0)
+	{
+		failure = "writable";
 		goto out;
-	scaler = sws_getContext(frame->width, frame->height, (enum AVPixelFormat)frame->format,
-	                        frame->width, frame->height, AV_PIX_FMT_YUVJ420P,
-	                        SWS_BILINEAR, NULL, NULL, NULL);
-	if (!scaler || sws_scale(scaler, (const uint8_t* const*)frame->data, frame->linesize,
-	                         0, frame->height, yuv->data, yuv->linesize) != frame->height)
+	}
+	if (sws_scale(api->jpeg_scaler, (const uint8_t* const*)frame->data, frame->linesize,
+	              0, frame->height, api->jpeg_yuv->data, api->jpeg_yuv->linesize) != frame->height)
+	{
+		failure = "scale";
 		goto out;
-	if (avcodec_send_frame(codec, yuv) < 0 || avcodec_receive_packet(codec, packet) < 0 ||
-	    packet->size <= 0 || (size_t)packet->size > HTTP_API_MAX_JPEG)
+	}
+	const int send_status = avcodec_send_frame(api->jpeg_encoder, api->jpeg_yuv);
+	if (send_status < 0)
+	{
+		failure = "send";
 		goto out;
+	}
+	const int receive_status = avcodec_receive_packet(api->jpeg_encoder, packet);
+	if (receive_status < 0 || packet->size <= 0 || (size_t)packet->size > HTTP_API_MAX_JPEG)
+	{
+		failure = "receive";
+		goto out;
+	}
 	uint8_t* copy = malloc((size_t)packet->size);
 	if (!copy)
+	{
+		failure = "copy";
 		goto out;
+	}
 	memcpy(copy, packet->data, (size_t)packet->size);
 	pthread_mutex_lock(&api->lock);
 	free(api->jpeg);
@@ -155,10 +220,15 @@ bool http_api_publish_frame(HttpApi* api, const struct AVFrame* source)
 	pthread_mutex_unlock(&api->lock);
 	ok = true;
 out:
-	sws_freeContext(scaler);
-	av_frame_free(&yuv);
+	if (!ok && failure)
+	{
+		char detail[160];
+		(void)snprintf(detail, sizeof(detail),
+		               "HTTP JPEG encode failed stage=%s %dx%d format=%d",
+		               failure, frame->width, frame->height, frame->format);
+		fprintf(stderr, "%s\n", detail);
+	}
 	av_packet_free(&packet);
-	avcodec_free_context(&codec);
 	return ok;
 }
 
@@ -668,6 +738,9 @@ void http_api_destroy(HttpApi* api)
 		return;
 	http_api_stop(api);
 	free(api->jpeg);
+	sws_freeContext(api->jpeg_scaler);
+	av_frame_free(&api->jpeg_yuv);
+	avcodec_free_context(&api->jpeg_encoder);
 	if (api->lock_ready)
 		pthread_mutex_destroy(&api->lock);
 	free(api);
