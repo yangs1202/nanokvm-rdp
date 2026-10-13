@@ -1517,6 +1517,11 @@ static DWORD WINAPI http_video_thread(LPVOID argument)
 			continue;
 		}
 		log_message("INFO", "HTTP JPEG snapshot decoder 시작");
+		uint8_t* sps = NULL;
+		size_t sps_length = 0;
+		uint8_t* pps = NULL;
+		size_t pps_length = 0;
+		bool need_idr = true;
 		while (!stop_requested)
 		{
 			VideoSourceAccessUnit access_unit = { 0 };
@@ -1537,23 +1542,74 @@ static DWORD WINAPI http_video_thread(LPVOID argument)
 				video_source_release_access_unit(&access_unit);
 				continue;
 			}
-			const size_t annexb_length = h264_annexb_size(data, length);
+			if (h264_contains_nal_type(data, length, 7))
+				(void)copy_bytes(&sps, &sps_length, data, length);
+			if (h264_contains_nal_type(data, length, 8))
+				(void)copy_bytes(&pps, &pps_length, data, length);
+			const bool idr = h264_contains_nal_type(data, length, 5);
+			if (access_unit.packet_loss)
+				need_idr = true;
+			if (need_idr && !idr)
+			{
+				video_source_release_access_unit(&access_unit);
+				continue;
+			}
+			uint8_t* owned = NULL;
+			const uint8_t* payload = data;
+			size_t payload_length = length;
+			if (idr)
+			{
+				const bool has_sps = h264_contains_nal_type(data, length, 7);
+				const bool has_pps = h264_contains_nal_type(data, length, 8);
+				const size_t prepend_sps = has_sps ? 0 : h264_annexb_size(sps, sps_length);
+				const size_t prepend_pps = has_pps ? 0 : h264_annexb_size(pps, pps_length);
+				if ((prepend_sps != 0 && !sps) || (prepend_pps != 0 && !pps))
+				{
+					video_source_release_access_unit(&access_unit);
+					continue;
+				}
+				if (prepend_sps != 0 || prepend_pps != 0)
+				{
+					owned = malloc(prepend_sps + prepend_pps + length);
+					if (!owned)
+					{
+						video_source_release_access_unit(&access_unit);
+						break;
+					}
+					size_t offset = 0;
+					if (prepend_sps != 0)
+						offset += h264_copy_annexb(owned + offset, sps, sps_length);
+					if (prepend_pps != 0)
+						offset += h264_copy_annexb(owned + offset, pps, pps_length);
+					memcpy(owned + offset, data, length);
+					payload = owned;
+					payload_length = offset + length;
+				}
+			}
+			const size_t annexb_length = h264_annexb_size(payload, payload_length);
 			uint8_t* annexb = malloc(annexb_length);
 			if (!annexb)
 			{
+				free(owned);
 				video_source_release_access_unit(&access_unit);
 				break;
 			}
-			(void)h264_copy_annexb(annexb, data, length);
+			(void)h264_copy_annexb(annexb, payload, payload_length);
+			free(owned);
 			video_source_release_access_unit(&access_unit);
 			const bool pushed = ffmpeg_decoder_push(&decoder, annexb, annexb_length);
 			free(annexb);
 			if (!pushed && !stop_requested)
 			{
-				log_message("ERROR", "HTTP FFmpeg H.264 decoder 입력 실패");
-				break;
+				need_idr = true;
+				log_message("WARN", "HTTP FFmpeg H.264 decoder가 손상된 access unit을 건너뜁니다");
+				continue;
 			}
+			if (idr)
+				need_idr = false;
 		}
+		free(sps);
+		free(pps);
 		ffmpeg_decoder_stop(&decoder);
 		device_session_release(&lease);
 		if (!stop_requested)

@@ -143,11 +143,25 @@ bool ffmpeg_decoder_push(FfmpegDecoder* decoder, const uint8_t* data, size_t len
 	if (av_new_packet(decoder->packet, (int)length) < 0)
 		return false;
 	memcpy(decoder->packet->data, data, length);
-	const int result = avcodec_send_packet(decoder->codec, decoder->packet);
-	av_packet_unref(decoder->packet);
-	/* Loss recovery requests an IDR on the control channel. A damaged access
-	 * unit must not tear down the RDP session while that IDR is in flight. */
-	return result == AVERROR_INVALIDDATA || (result >= 0 && decoder_receive(decoder));
+	/* Drain before sending. EAGAIN here means the previous frame was not
+	 * consumed; dropping this packet would leave the decoder one frame behind. */
+	for (;;)
+	{
+		const int result = avcodec_send_packet(decoder->codec, decoder->packet);
+		if (result == AVERROR(EAGAIN))
+		{
+			if (!decoder_receive(decoder))
+			{
+				av_packet_unref(decoder->packet);
+				return false;
+			}
+			continue;
+		}
+		av_packet_unref(decoder->packet);
+		/* Loss recovery requests an IDR on the control channel. A damaged
+		 * access unit must not tear down the session while that IDR is in flight. */
+		return result == AVERROR_INVALIDDATA || (result >= 0 && decoder_receive(decoder));
+	}
 }
 
 void ffmpeg_decoder_stop(FfmpegDecoder* decoder)
