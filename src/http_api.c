@@ -138,8 +138,10 @@ bool http_api_publish_frame(HttpApi* api, const struct AVFrame* source)
 		api->jpeg_encoder->pix_fmt = AV_PIX_FMT_YUVJ420P;
 		api->jpeg_encoder->time_base = (AVRational){ 1, 25 };
 		api->jpeg_encoder->color_range = AVCOL_RANGE_JPEG;
-		if (av_opt_set_int(api->jpeg_encoder->priv_data, "q", api->config.jpeg_quality, 0) < 0 ||
-		    avcodec_open2(api->jpeg_encoder, api->jpeg_codec, NULL) < 0)
+		/* Debian bookworm's MJPEG encoder has no private "q" option. A missing
+		 * option must not prevent the encoder from opening. */
+		(void)av_opt_set_int(api->jpeg_encoder->priv_data, "q", api->config.jpeg_quality, 0);
+		if (avcodec_open2(api->jpeg_encoder, api->jpeg_codec, NULL) < 0)
 		{
 			failure = "open";
 			avcodec_free_context(&api->jpeg_encoder);
