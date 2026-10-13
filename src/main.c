@@ -1611,7 +1611,15 @@ static DWORD WINAPI http_video_thread(LPVOID argument)
 			if (!pushed && !stop_requested)
 			{
 				need_idr = true;
-				log_message("WARN", "HTTP FFmpeg H.264 decoder가 손상된 access unit을 건너뜁니다");
+				char skip_detail[160];
+				(void)snprintf(skip_detail, sizeof(skip_detail),
+				               "HTTP decoder skip bytes=%zu sps=%u pps=%u idr=%u sei=%u",
+				               annexb_length,
+				               (unsigned)h264_contains_nal_type(annexb, annexb_length, 7),
+				               (unsigned)h264_contains_nal_type(annexb, annexb_length, 8),
+				               (unsigned)h264_contains_nal_type(annexb, annexb_length, 5),
+				               (unsigned)h264_contains_nal_type(annexb, annexb_length, 6));
+				log_message("WARN", skip_detail);
 				continue;
 			}
 			if (idr)

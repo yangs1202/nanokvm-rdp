@@ -1,6 +1,7 @@
 #include "ffmpeg_decoder.h"
 
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -160,7 +161,21 @@ bool ffmpeg_decoder_push(FfmpegDecoder* decoder, const uint8_t* data, size_t len
 		av_packet_unref(decoder->packet);
 		/* Loss recovery requests an IDR on the control channel. A damaged
 		 * access unit must not tear down the session while that IDR is in flight. */
-		return result == AVERROR_INVALIDDATA || (result >= 0 && decoder_receive(decoder));
+		if (result == AVERROR_INVALIDDATA)
+			return true;
+		if (result < 0)
+		{
+			char detail[96];
+			av_strerror(result, detail, sizeof(detail));
+			(void)fprintf(stderr, "nanokvm-rdp-gateway: WARN: FFmpeg send_packet failed code=%d bytes=%zu detail=%s\n", result, length, detail);
+			return false;
+		}
+		if (!decoder_receive(decoder))
+		{
+			(void)fprintf(stderr, "nanokvm-rdp-gateway: WARN: FFmpeg receive_frame failed bytes=%zu\n", length);
+			return false;
+		}
+		return true;
 	}
 }
 
