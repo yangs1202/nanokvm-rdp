@@ -1607,7 +1607,6 @@ static DWORD WINAPI http_video_thread(LPVOID argument)
 			free(owned);
 			video_source_release_access_unit(&access_unit);
 			const bool pushed = ffmpeg_decoder_push(&decoder, annexb, annexb_length);
-			free(annexb);
 			if (!pushed && !stop_requested)
 			{
 				need_idr = true;
@@ -1620,8 +1619,10 @@ static DWORD WINAPI http_video_thread(LPVOID argument)
 				               (unsigned)h264_contains_nal_type(annexb, annexb_length, 5),
 				               (unsigned)h264_contains_nal_type(annexb, annexb_length, 6));
 				log_message("WARN", skip_detail);
+				free(annexb);
 				continue;
 			}
+			free(annexb);
 			if (idr)
 				need_idr = false;
 		}
