@@ -1504,6 +1504,14 @@ static DWORD WINAPI http_video_thread(LPVOID argument)
 	Server* server = (Server*)argument;
 	while (!stop_requested)
 	{
+		/* Keep the socket available until the RDP reader finishes acquiring
+		 * its lease. Reacquiring while yield is signaled starves that reader. */
+		if (server->http_yield_event &&
+		    WaitForSingleObject(server->http_yield_event, 0) == WAIT_OBJECT_0)
+		{
+			Sleep(50);
+			continue;
+		}
 		DeviceSessionLease lease = { 0 };
 		FfmpegDecoder decoder = { 0 };
 		if (!device_session_acquire(server->device_session, DEVICE_SESSION_CONSUMER_HTTP,
