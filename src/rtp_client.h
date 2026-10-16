@@ -15,6 +15,7 @@ typedef struct
 	uint8_t* access_unit;
 	size_t access_unit_length;
 	size_t access_unit_capacity;
+	size_t access_unit_capacity_hint;
 	uint32_t access_unit_timestamp;
 	uint32_t access_unit_ssrc;
 	bool have_access_unit;

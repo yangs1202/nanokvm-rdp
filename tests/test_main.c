@@ -87,6 +87,179 @@ static void test_h264_annexb(void)
 	assert(copied[4] == 0x67);
 }
 
+static uint32_t test_random_next(uint32_t* state)
+{
+	*state ^= *state << 13;
+	*state ^= *state >> 17;
+	*state ^= *state << 5;
+	return *state;
+}
+
+static void assert_h264_mask_matches_contains(const uint8_t* data, size_t length)
+{
+	const uint32_t mask = h264_nal_type_mask(data, length);
+	for (uint8_t type = 0; type < 32; type++)
+		assert(((mask & (1U << type)) != 0) == h264_contains_nal_type(data, length, type));
+}
+
+static void test_h264_nal_type_mask(void)
+{
+	uint8_t data[512];
+	uint32_t random_state = 0x6d2b79f5U;
+	for (size_t length = 0; length <= 8; length++)
+	{
+		for (size_t index = 0; index < length; index++)
+			data[index] = (uint8_t)test_random_next(&random_state);
+		assert_h264_mask_matches_contains(data, length);
+	}
+	for (size_t index = 0; index + 4 < sizeof(data); index += 4)
+	{
+		data[index] = 0;
+		data[index + 1] = 0;
+		data[index + 2] = 1;
+		data[index + 3] = (uint8_t)(index & 0x1fU);
+	}
+	for (size_t index = 0; index + 5 < sizeof(data); index += 5)
+	{
+		data[index] = 0;
+		data[index + 1] = 0;
+		data[index + 2] = 0;
+		data[index + 3] = 1;
+		data[index + 4] = (uint8_t)(index & 0x1fU);
+	}
+	assert_h264_mask_matches_contains(data, sizeof(data));
+	for (size_t sample = 0; sample < 10000; sample++)
+	{
+		const size_t length = test_random_next(&random_state) % sizeof(data);
+		for (size_t index = 0; index < length; index++)
+			data[index] = (uint8_t)test_random_next(&random_state);
+		if (sample % 3 == 0)
+		{
+			for (size_t index = 0; index + 5 < length; index += 7)
+			{
+				data[index] = 0;
+				data[index + 1] = 0;
+				data[index + 2] = 1;
+				data[index + 3] = (uint8_t)(test_random_next(&random_state) & 0x1fU);
+			}
+		}
+		else if (sample % 3 == 1)
+		{
+			for (size_t index = 0; index + 6 < length; index += 9)
+			{
+				data[index] = 0;
+				data[index + 1] = 0;
+				data[index + 2] = 0;
+				data[index + 3] = 1;
+				data[index + 4] = (uint8_t)(test_random_next(&random_state) & 0x1fU);
+			}
+		}
+		assert_h264_mask_matches_contains(data, length);
+	}
+}
+
+static void test_h264_parameter_sets(void)
+{
+	const uint8_t sets[] = {
+	    0, 0, 0, 1, 0x67, 0x42, 0x00, 0x0a,
+	    0, 0, 0, 1, 0x68, 0xce, 0x38, 0x80,
+	};
+	const uint8_t idr[] = { 0, 0, 0, 1, 0x65, 0x88, 0x84 };
+	const uint8_t idr_with_sps[] = {
+	    0, 0, 0, 1, 0x67, 0x42, 0x00, 0x0a,
+	    0, 0, 0, 1, 0x65, 0x88, 0x84,
+	};
+	const uint8_t idr_with_both[] = {
+	    0, 0, 0, 1, 0x67, 0x42, 0x00, 0x0a,
+	    0, 0, 0, 1, 0x68, 0xce, 0x38, 0x80,
+	    0, 0, 0, 1, 0x65, 0x88, 0x84,
+	};
+	H264ParameterSets empty = { 0 };
+	const uint8_t* output = NULL;
+	size_t output_length = 0;
+	assert(h264_parameter_sets_prepare_idr(&empty, idr, sizeof(idr),
+	                                       h264_nal_type_mask(idr, sizeof(idr)),
+	                                       &output, &output_length));
+	assert(output == idr && output_length == sizeof(idr));
+	h264_parameter_sets_free(&empty);
+
+	H264ParameterSets parameter_sets = { 0 };
+	h264_parameter_sets_update(&parameter_sets, sets, sizeof(sets),
+	                           h264_nal_type_mask(sets, sizeof(sets)));
+	uint8_t* sps_pointer = parameter_sets.sps.data;
+	uint8_t* pps_pointer = parameter_sets.pps.data;
+	assert(sps_pointer && pps_pointer);
+	assert(h264_parameter_sets_prepare_idr(&parameter_sets, idr, sizeof(idr),
+	                                       h264_nal_type_mask(idr, sizeof(idr)), &output,
+	                                       &output_length));
+	const uint8_t expected[] = {
+	    0, 0, 0, 1, 0x67, 0x42, 0x00, 0x0a,
+	    0, 0, 0, 1, 0x68, 0xce, 0x38, 0x80,
+	    0, 0, 0, 1, 0x65, 0x88, 0x84,
+	};
+	assert(output_length == sizeof(expected) && memcmp(output, expected, sizeof(expected)) == 0);
+	const uint8_t* scratch_pointer = output;
+	assert(h264_parameter_sets_prepare_idr(&parameter_sets, idr, sizeof(idr),
+	                                       h264_nal_type_mask(idr, sizeof(idr)), &output,
+	                                       &output_length));
+	assert(output == scratch_pointer);
+
+	assert(h264_parameter_sets_prepare_idr(&parameter_sets, idr_with_sps, sizeof(idr_with_sps),
+	                                       h264_nal_type_mask(idr_with_sps, sizeof(idr_with_sps)),
+	                                       &output,
+	                                       &output_length));
+	const uint8_t expected_pps_only[] = {
+	    0, 0, 0, 1, 0x68, 0xce, 0x38, 0x80,
+	    0, 0, 0, 1, 0x67, 0x42, 0x00, 0x0a,
+	    0, 0, 0, 1, 0x65, 0x88, 0x84,
+	};
+	assert(output_length == sizeof(expected_pps_only));
+	/* The old prepend path emits the cached PPS first, then leaves AU bytes intact. */
+	assert(memcmp(output, expected_pps_only, sizeof(expected_pps_only)) == 0);
+	assert(h264_parameter_sets_prepare_idr(&parameter_sets, idr_with_both, sizeof(idr_with_both),
+	                                       h264_nal_type_mask(idr_with_both, sizeof(idr_with_both)),
+	                                       &output,
+	                                       &output_length));
+	assert(output == idr_with_both && output_length == sizeof(idr_with_both));
+
+	const uint8_t same_size_update[] = {
+	    0, 0, 0, 1, 0x67, 0xaa, 0xbb, 0xcc,
+	    0, 0, 0, 1, 0x68, 0xdd, 0xee, 0xff,
+	};
+	h264_parameter_sets_update(&parameter_sets, same_size_update, sizeof(same_size_update),
+	                           h264_nal_type_mask(same_size_update, sizeof(same_size_update)));
+	assert(parameter_sets.sps.data == sps_pointer);
+	assert(parameter_sets.pps.data == pps_pointer);
+	h264_parameter_sets_free(&parameter_sets);
+}
+
+static void test_h264_ensure_annexb(void)
+{
+	const uint8_t framed[] = { 0, 0, 0, 1, 0x65, 0x88 };
+	const uint8_t bare[] = { 0x41, 0x9a, 0x02 };
+	const uint8_t expected[] = { 0, 0, 0, 1, 0x41, 0x9a, 0x02 };
+	H264Buffer buffer = { 0 };
+	const uint8_t* out = NULL;
+	size_t out_length = 0;
+
+	/* Framed RTP access units are passed through without copying. */
+	assert(h264_ensure_annexb(&buffer, framed, sizeof(framed), &out, &out_length));
+	assert(out == framed && out_length == sizeof(framed));
+	assert(buffer.data == NULL);
+
+	assert(h264_ensure_annexb(&buffer, bare, sizeof(bare), &out, &out_length));
+	assert(out == buffer.data && out_length == sizeof(expected));
+	assert(memcmp(out, expected, sizeof(expected)) == 0);
+	const uint8_t* first = buffer.data;
+	assert(h264_ensure_annexb(&buffer, bare, sizeof(bare), &out, &out_length));
+	assert(buffer.data == first);
+
+	assert(h264_ensure_annexb(&buffer, NULL, 0, &out, &out_length) && out_length == 0);
+	assert(!h264_ensure_annexb(&buffer, NULL, 1, &out, &out_length));
+	h264_buffer_free(&buffer);
+	assert(buffer.data == NULL && buffer.capacity == 0);
+}
+
 static void test_h264_copy_nal_from_shared_access_unit(void)
 {
 	const uint8_t unit[] = {
@@ -501,6 +674,9 @@ static void test_hid_emoji_paste(void)
 int main(void)
 {
 	test_h264_annexb();
+	test_h264_nal_type_mask();
+	test_h264_parameter_sets();
+	test_h264_ensure_annexb();
 	test_h264_copy_nal_from_shared_access_unit();
 	test_hid_mapping();
 	test_hid_control_space_passthrough();

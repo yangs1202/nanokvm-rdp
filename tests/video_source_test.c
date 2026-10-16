@@ -117,24 +117,28 @@ int main(void)
 	VideoSourceAccessUnit access_unit = { 0 };
 	assert(video_source_read(source, &access_unit));
 	assert(access_unit.epoch == 1 && access_unit.timestamp == 90000 && access_unit.ssrc == 42);
+	assert(access_unit.nal_types == (1U << 7));
 	assert(access_unit.length == sizeof(sps) && memcmp(access_unit.data, sps, sizeof(sps)) == 0);
 	assert(socket.next_packet == 2 && !access_unit.packet_loss && !access_unit.idr_requested);
 	video_source_release_access_unit(&access_unit);
 
 	assert(video_source_read(source, &access_unit));
 	assert(access_unit.timestamp == 92000 && access_unit.length == sizeof(pps));
+	assert(access_unit.nal_types == (1U << 8));
 	assert(memcmp(access_unit.data, pps, sizeof(pps)) == 0 && socket.next_packet == 4);
 	assert(!access_unit.packet_loss && !access_unit.idr_requested);
 	video_source_release_access_unit(&access_unit);
 
 	assert(video_source_read(source, &access_unit));
 	assert(access_unit.timestamp == 93000 && access_unit.length == sizeof(idr));
+	assert(access_unit.nal_types == (1U << 5));
 	assert(memcmp(access_unit.data, idr, sizeof(idr)) == 0);
 	assert(!access_unit.packet_loss && !access_unit.idr_requested);
 	video_source_release_access_unit(&access_unit);
 
 	assert(video_source_read(source, &access_unit));
 	assert(access_unit.timestamp == 95000 && access_unit.length == sizeof(sync));
+	assert(access_unit.nal_types == ((1U << 7) | (1U << 8) | (1U << 5)));
 	assert(memcmp(access_unit.data, sync, sizeof(sync)) == 0);
 	assert(access_unit.packet_loss && access_unit.idr_requested && access_unit.losses == 2);
 	assert(requests.requests == 2 && requests.last_epoch == 1);
@@ -142,6 +146,7 @@ int main(void)
 
 	assert(video_source_read(source, &access_unit));
 	assert(access_unit.timestamp == 96000 && !access_unit.packet_loss && !access_unit.idr_requested);
+	assert(access_unit.nal_types == (1U << 1));
 	video_source_release_access_unit(&access_unit);
 	assert(video_source_request_idr(source));
 	assert(requests.requests == 3 && requests.last_epoch == 1);

@@ -53,6 +53,14 @@ static uint16_t available_port(void)
 	return ntohs(address.sin_port);
 }
 
+static size_t expected_capacity_hint(size_t length)
+{
+	size_t capacity = 4096U;
+	while (capacity < length && capacity < RTP_H264_MAX_NAL)
+		capacity = capacity > RTP_H264_MAX_NAL / 2U ? RTP_H264_MAX_NAL : capacity * 2U;
+	return capacity;
+}
+
 int main(void)
 {
 	RtpClient receiver = { .fd = socket(AF_INET, SOCK_DGRAM, 0) };
@@ -100,6 +108,37 @@ int main(void)
 		assert(memcmp(data + prefix, start_code, 4) == 0);
 		assert(memcmp(data + prefix + 4, frames[i], sizeof(frames[i])) == 0);
 		free(data);
+	}
+
+	/* Capacity follows the previous AU, grows when the next one is larger,
+	 * then covers the following AU without another size increase. */
+	const size_t nal_lengths[] = { 500U, 12000U, 3000U, 32000U, 30000U };
+	uint8_t* variable_nals[sizeof(nal_lengths) / sizeof(nal_lengths[0])] = { 0 };
+	for (size_t i = 0; i < sizeof(nal_lengths) / sizeof(nal_lengths[0]); i++)
+	{
+		variable_nals[i] = malloc(nal_lengths[i]);
+		assert(variable_nals[i]);
+		memset(variable_nals[i], (int)(0x30U + i), nal_lengths[i]);
+		variable_nals[i][0] = i == 0 ? 0x65 : 0x41;
+		assert(rtp_h264_packetize(&packetizer, variable_nals[i], nal_lengths[i],
+		                          10000U + (uint32_t)i * 3000U, send_packet, &sender));
+	}
+	const uint8_t start_code[] = { 0, 0, 0, 1 };
+	uint8_t* variable_data = NULL;
+	size_t variable_length = 0;
+	for (size_t i = 0; i < sizeof(nal_lengths) / sizeof(nal_lengths[0]); i++)
+	{
+		variable_data = NULL;
+		variable_length = 0;
+		assert(rtp_client_read_h264(&receiver, &variable_data, &variable_length));
+		assert(receiver.access_unit_timestamp == 10000U + (uint32_t)i * 3000U);
+		assert(receiver.access_unit_ssrc == 42);
+		assert(variable_length == sizeof(start_code) + nal_lengths[i]);
+		assert(memcmp(variable_data, start_code, sizeof(start_code)) == 0);
+		assert(memcmp(variable_data + sizeof(start_code), variable_nals[i], nal_lengths[i]) == 0);
+		assert(receiver.access_unit_capacity_hint == expected_capacity_hint(variable_length));
+		free(variable_data);
+		free(variable_nals[i]);
 	}
 	uint8_t* data = NULL;
 	size_t length = 0;
