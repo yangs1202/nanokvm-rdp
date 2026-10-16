@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,16 +30,21 @@ struct HttpApi
 	pthread_t thread;
 	pthread_mutex_t lock;
 	bool lock_ready;
-	bool running;
+	atomic_bool running;
+	atomic_bool input_busy;
 	bool started;
 	const AVCodec* jpeg_codec;
 	AVCodecContext* jpeg_encoder;
 	struct SwsContext* jpeg_scaler;
 	AVFrame* jpeg_yuv;
 	int jpeg_source_format;
+	int jpeg_source_width;
+	int jpeg_source_height;
+	AVFrame* frame;
 	uint8_t* jpeg;
 	size_t jpeg_length;
 	uint32_t frame_id;
+	uint32_t jpeg_frame_id;
 	uint16_t frame_width;
 	uint16_t frame_height;
 	InputRouter router;
@@ -87,34 +93,25 @@ static bool send_response(int fd, int status, const char* reason, const char* ty
 
 static bool send_text(int fd, int status, const char* type, const char* body)
 {
-	char converted[1024];
-	size_t used = 0;
 	if (!body)
 		body = "";
-	for (const char* cursor = body; *cursor && used + 1 < sizeof(converted); cursor++)
-		converted[used++] = *cursor == 39 ? 34 : *cursor;
-	converted[used] = 0;
-	return send_response(fd, status, status == 200 ? "OK" : "Error", type, converted, used, NULL);
+	return send_response(fd, status, status == 200 ? "OK" : "Error", type, body, strlen(body), NULL);
 }
 
 static bool send_ok(int fd, bool ok)
 {
-	return send_text(fd, ok ? 200 : 503, "application/json", ok ? "{'ok':true}" : "{'ok':false}");
+	return send_text(fd, ok ? 200 : 503, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
 static bool send_error(int fd, int status, const char* error)
 {
 	char body[160];
-	(void)snprintf(body, sizeof(body), "{'ok':false,'error':'%s'}", error);
+	(void)snprintf(body, sizeof(body), "{\"ok\":false,\"error\":\"%s\"}", error);
 	return send_text(fd, status, "application/json", body);
 }
 
-bool http_api_publish_frame(HttpApi* api, const struct AVFrame* source)
+static bool encode_frame(HttpApi* api, const AVFrame* frame, uint8_t** jpeg, size_t* jpeg_length)
 {
-	const AVFrame* frame = source;
-	if (!api || !api->running || !frame || frame->width <= 0 || frame->height <= 0 ||
-	    !api->jpeg_codec)
-		return false;
 	AVPacket* packet = av_packet_alloc();
 	bool ok = false;
 	const char* failure = NULL;
@@ -170,12 +167,14 @@ bool http_api_publish_frame(HttpApi* api, const struct AVFrame* source)
 		}
 	}
 	if (!api->jpeg_scaler || api->jpeg_source_format != frame->format ||
-	    api->jpeg_encoder->width != frame->width)
+	    api->jpeg_source_width != frame->width || api->jpeg_source_height != frame->height)
 	{
 		api->jpeg_scaler = sws_getCachedContext(
 		    api->jpeg_scaler, frame->width, frame->height, (enum AVPixelFormat)frame->format,
 		    frame->width, frame->height, AV_PIX_FMT_YUVJ420P, SWS_BILINEAR, NULL, NULL, NULL);
 		api->jpeg_source_format = frame->format;
+		api->jpeg_source_width = frame->width;
+		api->jpeg_source_height = frame->height;
 	}
 	if (!api->jpeg_scaler)
 	{
@@ -212,14 +211,8 @@ bool http_api_publish_frame(HttpApi* api, const struct AVFrame* source)
 		goto out;
 	}
 	memcpy(copy, packet->data, (size_t)packet->size);
-	pthread_mutex_lock(&api->lock);
-	free(api->jpeg);
-	api->jpeg = copy;
-	api->jpeg_length = (size_t)packet->size;
-	api->frame_width = (uint16_t)frame->width;
-	api->frame_height = (uint16_t)frame->height;
-	api->frame_id++;
-	pthread_mutex_unlock(&api->lock);
+	*jpeg = copy;
+	*jpeg_length = (size_t)packet->size;
 	ok = true;
 out:
 	if (!ok && failure)
@@ -232,6 +225,24 @@ out:
 	}
 	av_packet_free(&packet);
 	return ok;
+}
+
+bool http_api_publish_frame(HttpApi* api, const struct AVFrame* source)
+{
+	if (!api || !source || source->width <= 0 || source->height <= 0)
+		return false;
+	AVFrame* frame = av_frame_clone(source);
+	if (!frame)
+		return false;
+	pthread_mutex_lock(&api->lock);
+	AVFrame* replaced = api->frame;
+	api->frame = frame;
+	api->frame_id++;
+	api->frame_width = (uint16_t)frame->width;
+	api->frame_height = (uint16_t)frame->height;
+	pthread_mutex_unlock(&api->lock);
+	av_frame_free(&replaced);
+	return true;
 }
 
 static const char* header_value(const char* request, const char* name)
@@ -329,9 +340,9 @@ static bool send_router_message(HttpApi* api, const InputRouterMessage* message)
 
 static void note_input_busy(HttpApi* api)
 {
-	api->config.input_busy = api->router.pointer_buttons != 0 ||
-	                         api->router.keyboard_modifiers != 0 ||
-	                         api->router.control_space_down;
+	atomic_store(&api->input_busy, api->router.pointer_buttons != 0 ||
+	                                  api->router.keyboard_modifiers != 0 ||
+	                                  api->router.control_space_down);
 }
 
 static bool handle_key(HttpApi* api, const char* body, int fd)
@@ -485,7 +496,7 @@ static bool handle_mouse(HttpApi* api, const char* body, int fd)
 	const bool sent = send_router_message(api, &message);
 	char json[192];
 	(void)snprintf(json, sizeof(json),
-	               "{'ok':%s,'x':%u,'y':%u,'source_x':%ld,'source_y':%ld,'width':%u,'height':%u}",
+	               "{\"ok\":%s,\"x\":%u,\"y\":%u,\"source_x\":%ld,\"source_y\":%ld,\"width\":%u,\"height\":%u}",
 	               sent ? "true" : "false", mapped_x, mapped_y, x, y, desktop_width,
 	               desktop_height);
 	return send_text(fd, sent ? 200 : 503, "application/json", json);
@@ -520,17 +531,50 @@ static bool handle_release(HttpApi* api, int fd)
 	return send_ok(fd, send_router_message(api, &message));
 }
 
-static bool copy_jpeg(HttpApi* api, uint8_t** jpeg, size_t* length, uint32_t* id)
+static bool get_snapshot(HttpApi* api, uint8_t** jpeg, size_t* length, uint32_t* id)
 {
+	AVFrame* frame = NULL;
 	pthread_mutex_lock(&api->lock);
-	*length = api->jpeg_length;
-	*id = api->frame_id;
 	*jpeg = NULL;
-	if (api->jpeg && api->jpeg_length)
+	*length = 0;
+	if (!api->frame)
+	{
+		pthread_mutex_unlock(&api->lock);
+		return false;
+	}
+	*id = api->frame_id;
+	if (api->jpeg && api->jpeg_length && api->jpeg_frame_id == *id)
 	{
 		*jpeg = malloc(api->jpeg_length);
 		if (*jpeg)
+		{
 			memcpy(*jpeg, api->jpeg, api->jpeg_length);
+			*length = api->jpeg_length;
+		}
+	}
+	else
+		frame = av_frame_clone(api->frame);
+	pthread_mutex_unlock(&api->lock);
+	if (*jpeg)
+		return true;
+	if (!frame)
+		return false;
+	uint8_t* encoded = NULL;
+	size_t encoded_length = 0;
+	const bool encoded_ok = encode_frame(api, frame, &encoded, &encoded_length);
+	av_frame_free(&frame);
+	if (!encoded_ok)
+		return false;
+	pthread_mutex_lock(&api->lock);
+	free(api->jpeg);
+	api->jpeg = encoded;
+	api->jpeg_length = encoded_length;
+	api->jpeg_frame_id = *id;
+	*jpeg = malloc(encoded_length);
+	if (*jpeg)
+	{
+		memcpy(*jpeg, encoded, encoded_length);
+		*length = encoded_length;
 	}
 	pthread_mutex_unlock(&api->lock);
 	return *jpeg != NULL;
@@ -541,7 +585,7 @@ static bool handle_snapshot(HttpApi* api, int fd)
 	uint8_t* jpeg = NULL;
 	size_t length = 0;
 	uint32_t id = 0;
-	if (!copy_jpeg(api, &jpeg, &length, &id))
+	if (!get_snapshot(api, &jpeg, &length, &id))
 		return send_error(fd, 503, "no-frame");
 	char extra[96];
 	(void)snprintf(extra, sizeof(extra), "X-Frame-Id: %u%s", id, CRLF);
@@ -556,14 +600,16 @@ static bool handle_status(HttpApi* api, int fd)
 	const uint32_t id = api->frame_id;
 	const uint16_t width = api->frame_width ? api->frame_width : api->config.width;
 	const uint16_t height = api->frame_height ? api->frame_height : api->config.height;
-	const bool has_frame = api->jpeg_length > 0;
+	const bool has_frame = api->frame != NULL;
+	const uint16_t desktop_width = api->config.width;
+	const uint16_t desktop_height = api->config.height;
 	pthread_mutex_unlock(&api->lock);
 	char json[256];
 	(void)snprintf(json, sizeof(json),
-	               "{'ok':true,'frame_id':%u,'width':%u,'height':%u,'has_frame':%s,"
-	               "'desktop_width':%u,'desktop_height':%u}",
+	               "{\"ok\":true,\"frame_id\":%u,\"width\":%u,\"height\":%u,\"has_frame\":%s,"
+	               "\"desktop_width\":%u,\"desktop_height\":%u}",
 	               id, width, height, has_frame ? "true" : "false",
-	               api->config.width, api->config.height);
+	               desktop_width, desktop_height);
 	return send_text(fd, 200, "application/json", json);
 }
 
@@ -649,11 +695,11 @@ static void serve_client(HttpApi* api, int fd)
 	char* header_end = strstr(request, CRLF2);
 	if (!header_end)
 		return;
+	const char* length_header = header_value(request, "Content-Length");
+	const size_t content_length = length_header ? (size_t)strtoul(length_header, NULL, 10) : 0;
 	*header_end = 0;
 	const char* inline_body = header_end + 4;
 	const size_t have = used - (size_t)(inline_body - request);
-	const char* length_header = header_value(request, "Content-Length");
-	const size_t content_length = length_header ? (size_t)strtoul(length_header, NULL, 10) : 0;
 	if (content_length > HTTP_API_MAX_BODY)
 	{
 		(void)send_error(fd, 413, "body");
@@ -690,14 +736,14 @@ static void serve_client(HttpApi* api, int fd)
 static void* http_thread(void* argument)
 {
 	HttpApi* api = argument;
-	while (api->running)
+	while (atomic_load(&api->running))
 	{
 		struct sockaddr_in peer;
 		socklen_t peer_length = sizeof(peer);
 		const int fd = accept(api->listener, (struct sockaddr*)&peer, &peer_length);
 		if (fd < 0)
 		{
-			if (!api->running || errno == EBADF || errno == EINVAL)
+			if (!atomic_load(&api->running) || errno == EBADF || errno == EINVAL)
 				break;
 			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
 				continue;
@@ -721,6 +767,8 @@ HttpApi* http_api_create(const HttpApiConfig* config)
 		return NULL;
 	api->config = *config;
 	api->listener = -1;
+	atomic_init(&api->running, false);
+	atomic_init(&api->input_busy, false);
 	api->jpeg_codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
 	if (api->config.jpeg_quality < 2 || api->config.jpeg_quality > 31)
 		api->config.jpeg_quality = 8;
@@ -740,6 +788,7 @@ void http_api_destroy(HttpApi* api)
 		return;
 	http_api_stop(api);
 	free(api->jpeg);
+	av_frame_free(&api->frame);
 	sws_freeContext(api->jpeg_scaler);
 	av_frame_free(&api->jpeg_yuv);
 	avcodec_free_context(&api->jpeg_encoder);
@@ -767,10 +816,10 @@ bool http_api_start(HttpApi* api)
 		return false;
 	}
 	api->listener = fd;
-	api->running = true;
+	atomic_store(&api->running, true);
 	if (pthread_create(&api->thread, NULL, http_thread, api) != 0)
 	{
-		api->running = false;
+		atomic_store(&api->running, false);
 		(void)close(fd);
 		api->listener = -1;
 		return false;
@@ -783,7 +832,7 @@ bool http_api_start(HttpApi* api)
 
 bool http_api_input_idle(const HttpApi* api)
 {
-	return !api || !api->config.input_busy;
+	return !api || !atomic_load(&api->input_busy);
 }
 
 void http_api_set_desktop(HttpApi* api, uint16_t width, uint16_t height)
@@ -802,7 +851,7 @@ void http_api_stop(HttpApi* api)
 {
 	if (!api || !api->started)
 		return;
-	api->running = false;
+	atomic_store(&api->running, false);
 	if (api->listener >= 0)
 	{
 		(void)shutdown(api->listener, SHUT_RDWR);

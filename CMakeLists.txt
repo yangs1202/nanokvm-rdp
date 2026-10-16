@@ -39,6 +39,10 @@ if(NANOKVM_RDP_BUILD_TESTS)
   target_include_directories(nanokvm-frame-trace-test PRIVATE src)
   target_compile_options(nanokvm-frame-trace-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
   add_test(NAME nanokvm-frame-trace-test COMMAND nanokvm-frame-trace-test)
+  add_executable(nanokvm-gateway-config-test tests/gateway_config_test.c src/gateway_config.c)
+  target_include_directories(nanokvm-gateway-config-test PRIVATE src)
+  target_compile_options(nanokvm-gateway-config-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+  add_test(NAME nanokvm-gateway-config-test COMMAND nanokvm-gateway-config-test)
   if(NANOKVM_RDP_TEST_FFMPEG)
     add_executable(nanokvm-ffmpeg-latency-test tests/ffmpeg_latency_test.c src/ffmpeg_decoder.c)
     target_include_directories(nanokvm-ffmpeg-latency-test PRIVATE src)
@@ -46,6 +50,18 @@ if(NANOKVM_RDP_BUILD_TESTS)
     target_link_libraries(nanokvm-ffmpeg-latency-test PRIVATE Threads::Threads PkgConfig::FFMPEG)
     add_test(NAME nanokvm-ffmpeg-latency-test COMMAND nanokvm-ffmpeg-latency-test)
     set_tests_properties(nanokvm-ffmpeg-latency-test PROPERTIES TIMEOUT 10)
+    add_executable(nanokvm-http-api-test
+      tests/http_api_test.c
+      src/http_api.c
+      src/input_router.c
+      src/hid.c
+      src/protocol.c
+    )
+    target_include_directories(nanokvm-http-api-test PRIVATE src)
+    target_compile_options(nanokvm-http-api-test PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+    target_link_libraries(nanokvm-http-api-test PRIVATE Threads::Threads PkgConfig::FFMPEG)
+    add_test(NAME nanokvm-http-api-test COMMAND nanokvm-http-api-test)
+    set_tests_properties(nanokvm-http-api-test PROPERTIES TIMEOUT 10)
   endif()
   add_executable(nanokvm-frame-flow-test tests/frame_flow_test.c)
   target_include_directories(nanokvm-frame-flow-test PRIVATE src)
@@ -198,6 +214,13 @@ if(NANOKVM_RDP_BUILD_SERVER)
     src/http_api.c
     src/input_router.c
     src/main.c
+    src/gateway_config.c
+    src/gateway_log.c
+    src/gateway_server.c
+    src/rdp_gfx.c
+    src/rdp_bitmap.c
+    src/rdp_input.c
+    src/rdp_peer.c
     src/ffmpeg_decoder.c
     src/hid.c
     src/h264.c

@@ -129,9 +129,10 @@ bool video_source_read(VideoSource* source, VideoSourceAccessUnit* access_unit)
 			    video_source_request_idr(source) || source->pending_idr_requested;
 		}
 		source->observed_losses = access_unit->losses;
-		const bool has_sps = h264_contains_nal_type(access_unit->data, access_unit->length, 7);
-		const bool has_pps = h264_contains_nal_type(access_unit->data, access_unit->length, 8);
-		const bool has_idr = h264_contains_nal_type(access_unit->data, access_unit->length, 5);
+		access_unit->nal_types = h264_nal_type_mask(access_unit->data, access_unit->length);
+		const bool has_sps = (access_unit->nal_types & (1U << 7)) != 0;
+		const bool has_pps = (access_unit->nal_types & (1U << 8)) != 0;
+		const bool has_idr = (access_unit->nal_types & (1U << 5)) != 0;
 		source->have_sps = source->have_sps || has_sps;
 		source->have_pps = source->have_pps || has_pps;
 		if (has_idr && source->have_sps && source->have_pps)

@@ -16,9 +16,17 @@ static bool append_access_unit(RtpClient* client, const uint8_t* data, size_t le
 	const size_t needed = client->access_unit_length + length;
 	if (needed > client->access_unit_capacity)
 	{
-		size_t capacity = client->access_unit_capacity ? client->access_unit_capacity : 4096U;
+		size_t capacity = client->access_unit_capacity ? client->access_unit_capacity :
+		                  client->access_unit_capacity_hint;
+		if (capacity < 4096U || capacity > RTP_H264_MAX_NAL)
+			capacity = 4096U;
 		while (capacity < needed)
-			capacity *= 2U;
+		{
+			if (capacity > RTP_H264_MAX_NAL / 2U)
+				capacity = RTP_H264_MAX_NAL;
+			else
+				capacity *= 2U;
+		}
 		uint8_t* resized = realloc(client->access_unit, capacity);
 		if (!resized)
 			return false;
@@ -28,6 +36,19 @@ static bool append_access_unit(RtpClient* client, const uint8_t* data, size_t le
 	memcpy(client->access_unit + client->access_unit_length, data, length);
 	client->access_unit_length += length;
 	return true;
+}
+
+static size_t access_unit_capacity_hint(size_t length)
+{
+	size_t capacity = 4096U;
+	while (capacity < length && capacity < RTP_H264_MAX_NAL)
+	{
+		if (capacity > RTP_H264_MAX_NAL / 2U)
+			capacity = RTP_H264_MAX_NAL;
+		else
+			capacity *= 2U;
+	}
+	return capacity;
 }
 
 static bool save_nal(void* context, const uint8_t* nal, size_t length, uint32_t timestamp,
@@ -107,12 +128,14 @@ bool rtp_client_read_h264(RtpClient* client, uint8_t** data, size_t* length)
 		if (!rtp_h264_reassembler_push(&client->reassembler, packet, (size_t)received, save_nal,
 		                              client, count_loss, client))
 			continue;
+		/* A successful push guarantees the full 12-byte RTP header is present. */
 		if ((packet[1] & 0x80U) == 0 || client->access_unit_length == 0)
 			continue;
 		client->access_unit_ssrc = ((uint32_t)packet[8] << 24) | ((uint32_t)packet[9] << 16) |
 		                           ((uint32_t)packet[10] << 8) | packet[11];
 		*data = client->access_unit;
 		*length = client->access_unit_length;
+		client->access_unit_capacity_hint = access_unit_capacity_hint(client->access_unit_length);
 		client->access_unit = NULL;
 		client->access_unit_length = 0;
 		client->access_unit_capacity = 0;

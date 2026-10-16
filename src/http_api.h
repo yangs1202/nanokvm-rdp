@@ -20,8 +20,6 @@ typedef struct
 	void* context;
 	bool (*send_control)(void* context, uint8_t type, const void* payload, uint16_t length);
 	bool (*set_stream)(void* context, bool requested);
-	/* True while HTTP holds a pointer button or keyboard modifier. */
-	bool input_busy;
 } HttpApiConfig;
 
 HttpApi* http_api_create(const HttpApiConfig* config);
@@ -31,7 +29,7 @@ void http_api_stop(HttpApi* api);
 bool http_api_input_idle(const HttpApi* api);
 void http_api_set_desktop(HttpApi* api, uint16_t width, uint16_t height);
 
-/* Encode and keep only the newest JPEG. Safe to call from the decoder thread. */
+/* Keep a reference to the newest frame. Safe to call from the decoder thread. */
 bool http_api_publish_frame(HttpApi* api, const struct AVFrame* frame);
 
 #endif

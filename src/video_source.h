@@ -40,6 +40,7 @@ typedef struct
 	uint32_t timestamp;
 	uint32_t ssrc;
 	uint32_t losses;
+	uint32_t nal_types;
 	uint64_t epoch;
 	bool packet_loss;
 	bool idr_requested;
