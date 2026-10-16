@@ -11,6 +11,14 @@
 #define FRAME_FLOW_MAX_INTERVAL 100U
 #define FRAME_FLOW_SLOW_ACK_MS 250U
 #define FRAME_FLOW_MAX_INFLIGHT_BYTES (192U * 1024U)
+#define FRAME_FLOW_AVC_WAIT_MS 150U
+
+typedef enum
+{
+	FRAME_FLOW_AVC_SEND,
+	FRAME_FLOW_AVC_WAIT,
+	FRAME_FLOW_AVC_RESYNC
+} FrameFlowAvcAdmission;
 
 typedef struct
 {
@@ -130,6 +138,20 @@ static inline bool frame_flow_ready_keyframe(const FrameFlow* flow, uint64_t now
 	if (flow->last_ack_at != 0 && now - flow->last_ack_at >= FRAME_FLOW_SLOW_ACK_MS)
 		return false;
 	return true;
+}
+
+static inline FrameFlowAvcAdmission frame_flow_avc_admit(const FrameFlow* flow,
+	                                                        uint32_t bytes, bool idr,
+	                                                        uint64_t now,
+	                                                        uint64_t wait_started_at)
+{
+	if (wait_started_at != 0 && now - wait_started_at >= FRAME_FLOW_AVC_WAIT_MS)
+		return FRAME_FLOW_AVC_RESYNC;
+	const bool ready = idr ? frame_flow_ready_keyframe(flow, now)
+	                       : frame_flow_ready(flow, bytes, now);
+	if (ready)
+		return FRAME_FLOW_AVC_SEND;
+	return FRAME_FLOW_AVC_WAIT;
 }
 
 /* Once a reference is lost, admit no P-frame until an IDR is submitted. */

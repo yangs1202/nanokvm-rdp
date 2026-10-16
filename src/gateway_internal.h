@@ -95,6 +95,7 @@ typedef struct
 	uint32_t rtp_p_units;
 	uint32_t avc_skipped;
 	uint32_t avc_resyncs;
+	uint32_t avc_waits;
 	uint64_t last_decode_latency_ms;
 	uint64_t last_rdp_send_ms;
 } ClientStats;
@@ -146,6 +147,7 @@ struct Client
 	uint8_t* classic_encoded;
 	bool previous_bitmap_valid;
 	HANDLE shutdown_event;
+	HANDLE avc_ack_event;
 	bool stopping;
 	bool owns_active_client;
 	bool direct_gfx_active;
