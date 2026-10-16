@@ -17,6 +17,8 @@ void client_stop(Client* client)
 		(void)SetEvent(client->output_wakeup);
 	if (client->shutdown_event)
 		(void)SetEvent(client->shutdown_event);
+	if (client->avc_ack_event)
+		(void)SetEvent(client->avc_ack_event);
 }
 
 static bool client_force_source_desktop_size(Client* client)
@@ -70,7 +72,8 @@ static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 	client->peer = peer;
 	client->shutdown_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 	client->output_wakeup = CreateEvent(NULL, FALSE, FALSE, NULL);
-	if (!client->shutdown_event || !client->output_wakeup)
+	client->avc_ack_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+	if (!client->shutdown_event || !client->output_wakeup || !client->avc_ack_event)
 		goto fail;
 	client->need_idr = true;
 	input_router_init(&client->input_router, server->config.width, server->config.height,
@@ -141,6 +144,8 @@ static void client_context_free(freerdp_peer* peer, rdpContext* context)
 	}
 	if (client->output_wakeup)
 		(void)CloseHandle(client->output_wakeup);
+	if (client->avc_ack_event)
+		(void)CloseHandle(client->avc_ack_event);
 	if (client->gfx)
 		rdpgfx_server_context_free(client->gfx);
 	if (client->rfx)

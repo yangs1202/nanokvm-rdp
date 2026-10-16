@@ -130,6 +130,8 @@ UINT on_gfx_frame_ack(RdpgfxServerContext* gfx,
 	}
 	const unsigned pending = client->frame_flow.count;
 	LeaveCriticalSection(&client->lock);
+	if (client->avc_ack_event)
+		(void)SetEvent(client->avc_ack_event);
 	gateway_log(elapsed >= 200U ? "WARN" : "INFO",
 	            "RDP frame ACK id=%u decoded=%u queue_bytes=%u pending=%u matched=%u elapsed_ms=%llu",
 	            acknowledge->frameId, acknowledge->totalFramesDecoded, acknowledge->queueDepth,
@@ -148,33 +150,60 @@ UINT on_gfx_frame_ack(RdpgfxServerContext* gfx,
 
 static bool client_accept_avc_frame(Client* client, uint32_t bytes, bool idr)
 {
-	bool accepted = false;
-	bool request_idr = false;
-	unsigned pending = 0;
-	uint32_t inflight_bytes = 0;
-	EnterCriticalSection(&client->lock);
-	const uint64_t now = monotonic_milliseconds();
-	const bool active = client->gfx_ready && !client->stopping;
-	accepted = active && (idr ? frame_flow_ready_keyframe(&client->frame_flow, now)
-	                           : frame_flow_ready(&client->frame_flow, bytes, now));
-	if (active && !accepted)
+	uint64_t wait_started_at = 0;
+	for (;;)
 	{
-		request_idr = frame_flow_avc_flow_rejected(&client->need_idr);
-		client->stats.avc_skipped++;
-		if (request_idr)
-			client->stats.avc_resyncs++;
-		pending = client->frame_flow.count;
-		inflight_bytes = client->frame_flow.inflight_bytes;
+		bool request_idr = false;
+		unsigned pending = 0;
+		uint32_t inflight_bytes = 0;
+		uint64_t now;
+		FrameFlowAvcAdmission admission;
+		EnterCriticalSection(&client->lock);
+		now = monotonic_milliseconds();
+		if (!client->gfx_ready || client->stopping)
+		{
+			LeaveCriticalSection(&client->lock);
+			return false;
+		}
+		admission = frame_flow_avc_admit(&client->frame_flow, bytes, idr, now,
+		                                 wait_started_at);
+		if (admission == FRAME_FLOW_AVC_WAIT && wait_started_at == 0)
+		{
+			wait_started_at = now;
+			client->stats.avc_waits++;
+		}
+		if (admission == FRAME_FLOW_AVC_RESYNC)
+		{
+			request_idr = frame_flow_avc_flow_rejected(&client->need_idr);
+			client->stats.avc_skipped++;
+			if (request_idr)
+				client->stats.avc_resyncs++;
+			pending = client->frame_flow.count;
+			inflight_bytes = client->frame_flow.inflight_bytes;
+		}
+		LeaveCriticalSection(&client->lock);
+		if (admission == FRAME_FLOW_AVC_SEND)
+			return true;
+		if (admission == FRAME_FLOW_AVC_RESYNC)
+		{
+			if (request_idr)
+			{
+				gateway_log("WARN",
+				            "RDPGFX 흐름 제어로 frame을 건너뜀; 다음 IDR까지 전송을 멈춥니다 idr=%u bytes=%u pending=%u inflight_bytes=%u",
+				            idr ? 1U : 0U, bytes, pending, inflight_bytes);
+				(void)server_send_control(client->server, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
+			}
+			return false;
+		}
+		if (client_should_stop(client))
+			return false;
+		const uint64_t elapsed = now - wait_started_at;
+		const DWORD remaining = elapsed >= FRAME_FLOW_AVC_WAIT_MS
+		                            ? 0U : (DWORD)(FRAME_FLOW_AVC_WAIT_MS - elapsed);
+		if (!client->avc_ack_event ||
+		    WaitForSingleObject(client->avc_ack_event, remaining) == WAIT_FAILED)
+			return false;
 	}
-	LeaveCriticalSection(&client->lock);
-	if (request_idr)
-	{
-		gateway_log("WARN",
-		            "RDPGFX 흐름 제어로 frame을 건너뜀; 다음 IDR까지 전송을 멈춥니다 idr=%u bytes=%u pending=%u inflight_bytes=%u",
-		            idr ? 1U : 0U, bytes, pending, inflight_bytes);
-		(void)server_send_control(client->server, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
-	}
-	return accepted;
 }
 
 static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length,

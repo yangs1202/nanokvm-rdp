@@ -2,6 +2,69 @@
 #include <assert.h>
 #include <stdio.h>
 
+typedef struct
+{
+	uint32_t id;
+	uint64_t at;
+} SimulatedAck;
+
+static void simulate_avc_stream(unsigned ack_delay_ms)
+{
+	FrameFlow flow = { 0 };
+	SimulatedAck acks[FRAME_FLOW_LIMIT] = { 0 };
+	unsigned ack_count = 0;
+	uint64_t elapsed = 0;
+	uint64_t now = 0;
+	uint64_t wait_started_at = 0;
+	uint32_t next_id = 1;
+	unsigned sent = 0;
+	unsigned resyncs = 0;
+
+	for (unsigned frame = 0; frame < 300; frame++)
+	{
+		const uint64_t arrival = (uint64_t)frame * 33U;
+		if (now < arrival)
+			now = arrival;
+		const bool idr = frame % 30U == 0;
+		const uint32_t bytes = idr ? 300000U : 20000U;
+		FrameFlowAvcAdmission admission;
+		for (;;)
+		{
+			admission = frame_flow_avc_admit(&flow, bytes, idr, now, wait_started_at);
+			if (admission != FRAME_FLOW_AVC_WAIT)
+				break;
+			if (wait_started_at == 0)
+				wait_started_at = now;
+			assert(ack_count > 0);
+			if (now < acks[0].at)
+				now = acks[0].at;
+			for (unsigned i = 0; i < ack_count;)
+			{
+				if (acks[i].at > now)
+				{
+					i++;
+					continue;
+				}
+				assert(frame_flow_ack(&flow, acks[i].id, 0, now, &elapsed));
+				for (unsigned j = i; j + 1 < ack_count; j++)
+					acks[j] = acks[j + 1];
+				ack_count--;
+			}
+		}
+		if (admission == FRAME_FLOW_AVC_RESYNC)
+			resyncs++;
+		assert(admission == FRAME_FLOW_AVC_SEND);
+		const uint32_t id = next_id++;
+		assert(idr ? frame_flow_sent_keyframe_sized(&flow, id, bytes, now)
+		           : frame_flow_sent_sized(&flow, id, bytes, now));
+		assert(ack_count < FRAME_FLOW_LIMIT);
+		acks[ack_count++] = (SimulatedAck){ .id = id, .at = now + ack_delay_ms };
+		wait_started_at = 0;
+		sent++;
+	}
+	assert(sent == 300 && resyncs == 0);
+}
+
 int main(void)
 {
 	FrameFlow flow = { 0 };
@@ -126,7 +189,43 @@ int main(void)
 	flow.last_ack_at = 3500;
 	assert(!frame_flow_ready_keyframe(&flow, 3750));
 	assert(need_idr);
+	/* Unlike main's immediate byte-cap rejection, the first P-frame after a
+	 * 300 KB IDR waits for its ACK and is then admitted. */
+	flow = (FrameFlow){ 0 };
+	assert(frame_flow_sent_keyframe_sized(&flow, 20, 300000, 1000));
+	assert(!frame_flow_ready(&flow, 20000, 1010));
+	assert(frame_flow_avc_admit(&flow, 20000, false, 1010, 0) == FRAME_FLOW_AVC_WAIT);
+	assert(frame_flow_ack(&flow, 20, 0, 1020, &elapsed));
+	assert(frame_flow_avc_admit(&flow, 20000, false, 1020, 1010) == FRAME_FLOW_AVC_SEND);
+	simulate_avc_stream(15);
+	simulate_avc_stream(60);
+	/* A stalled client drops the expired frame and requests exactly one resync.
+	 * P-frames remain suppressed until an IDR is actually submitted. */
+	flow = (FrameFlow){ 0 };
+	for (uint32_t id = 1; id <= FRAME_FLOW_LIMIT; id++)
+		assert(frame_flow_sent(&flow, id, 4000 + id));
+	bool stalled_need_idr = false;
+	unsigned stalled_requests = 0;
+	assert(frame_flow_avc_admit(&flow, 20000, false, 4100, 0) == FRAME_FLOW_AVC_WAIT);
+	assert(frame_flow_avc_admit(&flow, 20000, false, 4250, 4100) == FRAME_FLOW_AVC_RESYNC);
+	if (frame_flow_avc_flow_rejected(&stalled_need_idr)) stalled_requests++;
+	assert(stalled_need_idr && stalled_requests == 1);
+	assert(!frame_flow_avc_should_send(stalled_need_idr, false, true));
+	if (frame_flow_avc_flow_rejected(&stalled_need_idr)) stalled_requests++;
+	assert(stalled_requests == 1);
+	for (uint32_t id = 1; id <= FRAME_FLOW_LIMIT; id++)
+		assert(frame_flow_ack(&flow, id, 0, 4300 + id, &elapsed));
+	assert(frame_flow_avc_admit(&flow, 300000, true, 4400, 0) == FRAME_FLOW_AVC_SEND);
+	assert(frame_flow_sent_keyframe_sized(&flow, 4, 300000, 4400));
+	frame_flow_avc_sent(&stalled_need_idr, true);
+	assert(!stalled_need_idr && frame_flow_avc_should_send(stalled_need_idr, false, true));
+	/* Suspended ACK flow admits oversized IDRs and P-frames immediately. */
+	flow = (FrameFlow){ 0 };
+	assert(!frame_flow_ack(&flow, 0, UINT32_MAX, 5000, &elapsed));
+	assert(frame_flow_avc_admit(&flow, 300000, true, 5001, 0) == FRAME_FLOW_AVC_SEND);
+	assert(frame_flow_avc_admit(&flow, 20000, false, 5002, 0) == FRAME_FLOW_AVC_SEND);
 	/* IDR admission ignores the byte cap, while ordinary admission does not. */
+	flow.suspended = false;
 	flow.count = 1;
 	flow.last_ack_at = 3800;
 	flow.inflight_bytes = FRAME_FLOW_MAX_INFLIGHT_BYTES;
