@@ -86,6 +86,19 @@ static inline bool frame_flow_sent_sized(FrameFlow* flow, uint32_t id, uint32_t 
 	return true;
 }
 
+/* Recovery IDRs are admitted beyond the byte cap, so track their bytes too. */
+static inline bool frame_flow_sent_keyframe_sized(FrameFlow* flow, uint32_t id, uint32_t bytes,
+	                                               uint64_t now)
+{
+	if (flow->suspended) return true;
+	if (frame_flow_blocked(flow)) return false;
+	flow->ids[flow->count] = id;
+	flow->bytes[flow->count] = bytes;
+	flow->sent_at[flow->count++] = now;
+	flow->inflight_bytes += bytes;
+	return true;
+}
+
 static inline bool frame_flow_sent(FrameFlow* flow, uint32_t id, uint64_t now)
 {
 	return frame_flow_sent_sized(flow, id, 0, now);
@@ -104,6 +117,46 @@ static inline bool frame_flow_ready(const FrameFlow* flow, uint32_t bytes, uint6
 	if (flow->last_ack_at != 0 && now - flow->last_ack_at >= FRAME_FLOW_SLOW_ACK_MS)
 		return false;
 	return true;
+}
+
+/* A recovery IDR must fit even when ordinary P-frames have filled the byte
+ * budget. Keep the in-flight count and stale-ACK guards for slow clients. */
+static inline bool frame_flow_ready_keyframe(const FrameFlow* flow, uint64_t now)
+{
+	if (flow->suspended || flow->count == 0)
+		return true;
+	if (frame_flow_blocked(flow))
+		return false;
+	if (flow->last_ack_at != 0 && now - flow->last_ack_at >= FRAME_FLOW_SLOW_ACK_MS)
+		return false;
+	return true;
+}
+
+/* Once a reference is lost, admit no P-frame until an IDR is submitted. */
+static inline bool frame_flow_avc_should_send(bool need_idr, bool idr, bool p_frame)
+{
+	return idr || (!need_idr && p_frame);
+}
+
+/* Returns true only on the transition that should trigger a resync request. */
+static inline bool frame_flow_avc_flow_rejected(bool* need_idr)
+{
+	if (*need_idr)
+		return false;
+	*need_idr = true;
+	return true;
+}
+
+static inline void frame_flow_avc_send_failed(bool* need_idr)
+{
+	*need_idr = true;
+}
+
+/* Call only after the surface submission succeeds. */
+static inline void frame_flow_avc_sent(bool* need_idr, bool idr)
+{
+	if (idr)
+		*need_idr = false;
 }
 
 /* Each ACK names one frame; do not release others on duplicate/out-of-order ACKs. */

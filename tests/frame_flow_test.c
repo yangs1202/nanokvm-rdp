@@ -98,6 +98,55 @@ int main(void)
 	assert(frame_flow_ready(&flow, 400000, 1610));
 	assert(frame_flow_sent_sized(&flow, 3, 400000, 1620));
 	assert(!frame_flow_ready(&flow, 14000, 1640));
-	puts("Frame flow: slow client, duplicate/out-of-order ACK, suspend/resume and wrap passed");
+	/* Losing one P-frame breaks the whole AVC reference chain. Request one IDR,
+	 * suppress all later P-frames, and keep waiting until an IDR is submitted. */
+	flow = (FrameFlow){ 0 };
+	bool need_idr = false;
+	unsigned idr_requests = 0;
+	for (uint32_t id = 0; id < FRAME_FLOW_LIMIT; id++)
+		assert(frame_flow_sent(&flow, id, 3000 + id));
+	assert(!frame_flow_ready(&flow, 100, 3100));
+	if (frame_flow_avc_flow_rejected(&need_idr)) idr_requests++;
+	assert(need_idr && idr_requests == 1);
+	if (frame_flow_avc_flow_rejected(&need_idr)) idr_requests++;
+	assert(idr_requests == 1);
+	uint32_t ignored_bytes = 0;
+	for (uint32_t id = 0; id < FRAME_FLOW_LIMIT; id++)
+		assert(frame_flow_ack(&flow, id, 0, 3200 + id, &elapsed));
+	assert(frame_flow_ready(&flow, 100, 3300));
+	if (frame_flow_avc_should_send(need_idr, false, true)) ignored_bytes++;
+	assert(ignored_bytes == 0);
+	assert(frame_flow_avc_should_send(need_idr, true, false));
+	/* A received IDR rejected by count or stale ACK is not a submitted IDR. */
+	assert(frame_flow_sent(&flow, 10, 3400));
+	flow.count = FRAME_FLOW_LIMIT;
+	assert(!frame_flow_ready_keyframe(&flow, 3410));
+	assert(need_idr);
+	flow.count = 1;
+	flow.last_ack_at = 3500;
+	assert(!frame_flow_ready_keyframe(&flow, 3750));
+	assert(need_idr);
+	/* IDR admission ignores the byte cap, while ordinary admission does not. */
+	flow.count = 1;
+	flow.last_ack_at = 3800;
+	flow.inflight_bytes = FRAME_FLOW_MAX_INFLIGHT_BYTES;
+	assert(!frame_flow_ready(&flow, 400000, 3810));
+	assert(frame_flow_ready_keyframe(&flow, 3810));
+	assert(frame_flow_sent_keyframe_sized(&flow, 11, 400000, 3810));
+	assert(flow.count == 2 && flow.inflight_bytes == FRAME_FLOW_MAX_INFLIGHT_BYTES + 400000U);
+	assert(!frame_flow_ready(&flow, 1, 3820));
+	frame_flow_avc_sent(&need_idr, true);
+	assert(!need_idr);
+	need_idr = false;
+	frame_flow_avc_send_failed(&need_idr);
+	assert(need_idr);
+	flow.suspended = false;
+	flow.count = 1;
+	flow.last_ack_at = 1;
+	flow.inflight_bytes = FRAME_FLOW_MAX_INFLIGHT_BYTES;
+	assert(!frame_flow_ack(&flow, 0, UINT32_MAX, 1000, &elapsed));
+	assert(frame_flow_ready_keyframe(&flow, 1000));
+	assert(frame_flow_ready(&flow, 400000, 1000));
+	puts("Frame flow: congestion, AVC reference recovery, suspend/resume and ACK tracking passed");
 	return 0;
 }
