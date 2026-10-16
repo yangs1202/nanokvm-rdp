@@ -146,19 +146,40 @@ UINT on_gfx_frame_ack(RdpgfxServerContext* gfx,
 	return CHANNEL_RC_OK;
 }
 
-static bool client_accept_avc_frame(Client* client, uint32_t bytes)
+static bool client_accept_avc_frame(Client* client, uint32_t bytes, bool idr)
 {
 	bool accepted = false;
+	bool request_idr = false;
+	unsigned pending = 0;
+	uint32_t inflight_bytes = 0;
 	EnterCriticalSection(&client->lock);
-	accepted = client->gfx_ready && !client->stopping &&
-	           frame_flow_ready(&client->frame_flow, bytes, monotonic_milliseconds());
+	const uint64_t now = monotonic_milliseconds();
+	const bool active = client->gfx_ready && !client->stopping;
+	accepted = active && (idr ? frame_flow_ready_keyframe(&client->frame_flow, now)
+	                           : frame_flow_ready(&client->frame_flow, bytes, now));
+	if (active && !accepted)
+	{
+		request_idr = frame_flow_avc_flow_rejected(&client->need_idr);
+		client->stats.avc_skipped++;
+		if (request_idr)
+			client->stats.avc_resyncs++;
+		pending = client->frame_flow.count;
+		inflight_bytes = client->frame_flow.inflight_bytes;
+	}
 	LeaveCriticalSection(&client->lock);
+	if (request_idr)
+	{
+		gateway_log("WARN",
+		            "RDPGFX 흐름 제어로 frame을 건너뜀; 다음 IDR까지 전송을 멈춥니다 idr=%u bytes=%u pending=%u inflight_bytes=%u",
+		            idr ? 1U : 0U, bytes, pending, inflight_bytes);
+		(void)server_send_control(client->server, NANOKVM_CONTROL_IDR_REQUEST, NULL, 0);
+	}
 	return accepted;
 }
 
 static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length,
                               uint32_t ssrc, uint32_t rtp_timestamp, uint64_t received_at,
-                              uint64_t receive_wall)
+                              uint64_t receive_wall, bool idr)
 {
 	RECTANGLE_16 rect = { .left = 0, .top = 0, .right = client->server->config.width,
 		.bottom = client->server->config.height };
@@ -191,7 +212,7 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 	if (!client->gfx_ready || client->stopping)
 	{
 		LeaveCriticalSection(&client->lock);
-		return true;
+		return false;
 	}
 	start.frameId = client->next_frame_id++;
 	start.timestamp = 0;
@@ -218,13 +239,19 @@ static bool send_avc420_frame(Client* client, const uint8_t* data, size_t length
 	if (error != CHANNEL_RC_OK)
 	{
 		EnterCriticalSection(&client->lock);
-		client->need_idr = true;
+		frame_flow_avc_send_failed(&client->need_idr);
+		client->stats.avc_skipped++;
 		LeaveCriticalSection(&client->lock);
 		gateway_log("ERROR", "RDPGFX AVC420 frame 전송 실패");
 		return false;
 	}
 	EnterCriticalSection(&client->lock);
-	(void)frame_flow_sent_sized(&client->frame_flow, start.frameId, (uint32_t)length, send_done);
+	if (idr)
+		(void)frame_flow_sent_keyframe_sized(&client->frame_flow, start.frameId,
+		                                     (uint32_t)length, send_done);
+	else
+		(void)frame_flow_sent_sized(&client->frame_flow, start.frameId, (uint32_t)length, send_done);
+	frame_flow_avc_sent(&client->need_idr, idr);
 	client->stats.bitmap_frames++;
 	const uint32_t frame_count = client->stats.bitmap_frames;
 	LeaveCriticalSection(&client->lock);
@@ -285,7 +312,6 @@ DWORD WINAPI video_thread(LPVOID argument)
 		const bool idr = (nal_types & (1U << 5)) != 0;
 		const bool p_frame = (nal_types & (1U << 1)) != 0;
 		h264_parameter_sets_update(&client->parameter_sets, data, length, nal_types);
-		bool need_idr;
 		bool should_send;
 		EnterCriticalSection(&client->lock);
 		client->stats.rtp_nals++;
@@ -296,11 +322,13 @@ DWORD WINAPI video_thread(LPVOID argument)
 			client->stats.rtp_p_units++;
 		client->last_rtp_received_at = received_at;
 		if (access_unit.packet_loss)
-			client->need_idr = true;
-		need_idr = client->need_idr;
-		if (idr)
-			client->need_idr = false;
-		should_send = (idr || (!need_idr && p_frame)) && client->gfx_ready && !client->stopping;
+			frame_flow_avc_send_failed(&client->need_idr);
+		should_send = !access_unit.packet_loss &&
+		              frame_flow_avc_should_send(client->need_idr, idr, p_frame) &&
+		              client->gfx_ready && !client->stopping;
+		if (!should_send && client->gfx_ready && !client->stopping &&
+		    (access_unit.packet_loss || client->need_idr))
+			client->stats.avc_skipped++;
 		LeaveCriticalSection(&client->lock);
 		if (access_unit.packet_loss)
 			gateway_log("WARN", "RDPGFX RTP frame loss 감지; NanoKVM agent에 IDR 재동기화를 요청합니다");
@@ -314,16 +342,20 @@ DWORD WINAPI video_thread(LPVOID argument)
 				if (!h264_parameter_sets_prepare_idr(&client->parameter_sets, data, length,
 				                                     nal_types, &payload, &payload_length))
 				{
+					EnterCriticalSection(&client->lock);
+					frame_flow_avc_send_failed(&client->need_idr);
+					client->stats.avc_skipped++;
+					LeaveCriticalSection(&client->lock);
 					client_stop(client);
 					video_source_release_access_unit(&access_unit);
 					break;
 				}
 			}
-			if (!client_accept_avc_frame(client, (uint32_t)payload_length))
+			if (!client_accept_avc_frame(client, (uint32_t)payload_length, idr))
 				goto release_access_unit;
 			if (!send_avc420_frame(client, payload, payload_length,
 			                       access_unit.ssrc, access_unit.timestamp,
-			                       received_at, receive_wall))
+			                       received_at, receive_wall, idr))
 				client_stop(client);
 		}
 	release_access_unit:

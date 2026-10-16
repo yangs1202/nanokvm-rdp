@@ -93,6 +93,8 @@ typedef struct
 	uint32_t rtp_access_units;
 	uint32_t rtp_idr_units;
 	uint32_t rtp_p_units;
+	uint32_t avc_skipped;
+	uint32_t avc_resyncs;
 	uint64_t last_decode_latency_ms;
 	uint64_t last_rdp_send_ms;
 } ClientStats;

@@ -213,7 +213,7 @@ void server_heartbeat(Server* server)
 	}
 	LeaveCriticalSection(&server->lock);
 	gateway_log("INFO",
-	            "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u converted=%u interval_ms=%u queued=%u queue_drop=%u stale_drop=%u flush=%u empty_flush=%u rdp_frames=%u classic_tiles=%llu classic_bytes=%llu pointer_updates=%llu queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu",
+	            "STATS agent packets=%u dropped=%u frames=%u dropped_frames=%u rtp_nals=%u au=%u idr=%u p=%u decoded=%u converted=%u interval_ms=%u queued=%u queue_drop=%u stale_drop=%u flush=%u empty_flush=%u rdp_frames=%u classic_tiles=%llu classic_bytes=%llu pointer_updates=%llu queue=%u gateway_rss=%ld decode_ms=%llu rdp_send_ms=%llu avc_skipped=%u avc_resyncs=%u",
 	            agent_stats.sent_packets, agent_stats.dropped_packets,
 	            agent_stats.capture_frames, agent_stats.dropped_frames,
 	            stats.rtp_nals, stats.rtp_access_units, stats.rtp_idr_units, stats.rtp_p_units,
@@ -224,7 +224,8 @@ void server_heartbeat(Server* server)
 	            (unsigned long long)stats.classic_bytes_sent,
 	            (unsigned long long)stats.pointer_position_updates, bitmap_pending ? 1U : 0U,
 	            usage.ru_maxrss, (unsigned long long)stats.last_decode_latency_ms,
-	            (unsigned long long)stats.last_rdp_send_ms);
+	            (unsigned long long)stats.last_rdp_send_ms,
+	            stats.avc_skipped, stats.avc_resyncs);
 }
 
 static bool on_http_decoded_frame(void* context, const AVFrame* frame)
