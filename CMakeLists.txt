@@ -62,6 +62,17 @@ if(NANOKVM_RDP_BUILD_TESTS)
     target_link_libraries(nanokvm-http-api-test PRIVATE Threads::Threads PkgConfig::FFMPEG)
     add_test(NAME nanokvm-http-api-test COMMAND nanokvm-http-api-test)
     set_tests_properties(nanokvm-http-api-test PROPERTIES TIMEOUT 10)
+    find_program(NANOKVM_RDP_NODE node)
+    if(NANOKVM_RDP_NODE)
+      set(NANOKVM_RDP_VIEWER_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/http-viewer.js")
+      set_tests_properties(nanokvm-http-api-test PROPERTIES
+        ENVIRONMENT "NANOKVM_RDP_VIEWER_SCRIPT=${NANOKVM_RDP_VIEWER_SCRIPT}"
+        FIXTURES_SETUP nanokvm-http-viewer-script)
+      add_test(NAME nanokvm-http-viewer-syntax-test
+        COMMAND "${NANOKVM_RDP_NODE}" --check "${NANOKVM_RDP_VIEWER_SCRIPT}")
+      set_tests_properties(nanokvm-http-viewer-syntax-test PROPERTIES
+        FIXTURES_REQUIRED nanokvm-http-viewer-script)
+    endif()
   endif()
   add_executable(nanokvm-frame-flow-test tests/frame_flow_test.c)
   target_include_directories(nanokvm-frame-flow-test PRIVATE src)

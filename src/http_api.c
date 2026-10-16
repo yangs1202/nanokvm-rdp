@@ -624,7 +624,7 @@ static const char VIEWER_PAGE[] =
 	"img.onload=()=>setTimeout(refresh,80);img.onerror=()=>setTimeout(refresh,400);refresh();"
 	"function pos(ev){const r=img.getBoundingClientRect();"
 	"return {x:Math.max(0,Math.round((ev.clientX-r.left)*img.naturalWidth/r.width)),"
-	"y:Math.max(0,Math.round((ev.clientY-r.top)*img.naturalHeight/r.height));}}"
+	"y:Math.max(0,Math.round((ev.clientY-r.top)*img.naturalHeight/r.height))};}"
 	"function post(path,body){return fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});}"
 	"img.addEventListener('contextmenu',ev=>ev.preventDefault());"
 	"img.addEventListener('mousemove',ev=>{const now=Date.now();if(now-last<30)return;last=now;post('/api/mouse',pos(ev));});"

@@ -109,6 +109,25 @@ static unsigned response_frame_id(const char* response)
 	return (unsigned)strtoul(header + strlen("X-Frame-Id: "), NULL, 10);
 }
 
+/* The viewer script is a C string literal, so a typo only shows up in the
+ * browser. When NANOKVM_RDP_VIEWER_SCRIPT is set, write the served script
+ * there so CTest can syntax-check it with node. */
+static void export_viewer_script(const char* response)
+{
+	const char* path = getenv("NANOKVM_RDP_VIEWER_SCRIPT");
+	const char* start = strstr(response_body(response), "<script>");
+	assert(start != NULL);
+	start += strlen("<script>");
+	const char* end = strstr(start, "</script>");
+	assert(end != NULL && end > start);
+	if (!path || path[0] == 0)
+		return;
+	FILE* file = fopen(path, "w");
+	assert(file != NULL);
+	assert(fwrite(start, 1, (size_t)(end - start), file) == (size_t)(end - start));
+	assert(fclose(file) == 0);
+}
+
 int main(void)
 {
 	const uint16_t port = free_port();
@@ -128,6 +147,11 @@ int main(void)
 	assert(http_api_start(api));
 	assert(context.stream_calls == 1 && context.stream_requested);
 	char response[RESPONSE_CAPACITY];
+
+	(void)request(port, "GET", "/", NULL, response, sizeof(response));
+	assert(strncmp(response, "HTTP/1.1 200 OK", 15) == 0);
+	assert(strstr(response, "Content-Type: text/html") != NULL);
+	export_viewer_script(response);
 	(void)request(port, "GET", "/snapshot.jpg", NULL, response, sizeof(response));
 	assert(strncmp(response, "HTTP/1.1 503", 12) == 0);
 	assert(strstr(response_body(response), "{\"ok\":false,\"error\":\"no-frame\"}") != NULL);
