@@ -1,6 +1,7 @@
 FROM debian:bookworm AS builder
 
-ARG FREERDP_VERSION=3.14.0
+# FreeRDP 3.14.0 drops a session once it has sent 4 GiB; 3.14.1 fixes it (FreeRDP PR #11377).
+ARG FREERDP_VERSION=3.14.1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
