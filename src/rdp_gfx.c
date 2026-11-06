@@ -1,4 +1,11 @@
 #include "gateway_internal.h"
+
+/* The HTTP snapshot reader gives up the shared RTP socket only between reads.
+ * One read can block for the 1 s receive timeout, or longer while it drops
+ * frames until the next IDR. Budget the handoff by time so a slow release
+ * does not end the RDP session. */
+#define DIRECT_GFX_LEASE_WAIT_MS 5000U
+
 static bool client_cap_supports_avc420(const RDPGFX_CAPSET* cap)
 {
 	if (cap->version == RDPGFX_CAPVERSION_81)
@@ -158,6 +165,10 @@ static bool client_accept_avc_frame(Client* client, uint32_t bytes, bool idr)
 		uint32_t inflight_bytes = 0;
 		uint64_t now;
 		FrameFlowAvcAdmission admission;
+		/* Reset before reading state. The ACK callback and client_stop() set the
+		 * event after they update state, so the wait below cannot miss them. */
+		if (client->avc_ack_event)
+			(void)ResetEvent(client->avc_ack_event);
 		EnterCriticalSection(&client->lock);
 		now = monotonic_milliseconds();
 		if (!client->gfx_ready || client->stopping)
@@ -296,22 +307,24 @@ DWORD WINAPI video_thread(LPVOID argument)
 	HANDLE yield_event = client->server->http_yield_event;
 	if (yield_event)
 		(void)SetEvent(yield_event);
-	for (unsigned attempt = 0; attempt < 20 && !client_should_stop(client); attempt++)
-	{
-		if (device_session_acquire(client->server->device_session,
-		                           DEVICE_SESSION_CONSUMER_DIRECT_GFX, &lease))
-			break;
+	const uint64_t lease_wait_started_at = monotonic_milliseconds();
+	while (!client_should_stop(client) &&
+	       !device_session_acquire(client->server->device_session,
+	                               DEVICE_SESSION_CONSUMER_DIRECT_GFX, &lease) &&
+	       monotonic_milliseconds() - lease_wait_started_at < DIRECT_GFX_LEASE_WAIT_MS)
 		Sleep(50);
-	}
+	const uint64_t lease_wait_ms = monotonic_milliseconds() - lease_wait_started_at;
 	if (yield_event)
 		(void)ResetEvent(yield_event);
 	if (!lease.session)
 	{
-		gateway_log("ERROR", "RDPGFX RTP/H.264 receiver를 시작할 수 없습니다");
+		gateway_log("ERROR", "RDPGFX RTP/H.264 receiver를 시작할 수 없습니다 lease_wait_ms=%llu",
+		            (unsigned long long)lease_wait_ms);
 		client_stop(client);
 		return 0;
 	}
-	gateway_log("INFO", "RDPGFX RTP/H.264 passthrough 시작");
+	gateway_log("INFO", "RDPGFX RTP/H.264 passthrough 시작 lease_wait_ms=%llu",
+	            (unsigned long long)lease_wait_ms);
 	gateway_log("INFO", "RTP receive buffer bytes=%d",
 	            device_session_receive_buffer_bytes(&lease));
 	while (!client_should_stop(client))

@@ -71,8 +71,10 @@ static BOOL client_context_new(freerdp_peer* peer, rdpContext* context)
 	client->server = server;
 	client->peer = peer;
 	client->shutdown_event = CreateEvent(NULL, TRUE, FALSE, NULL);
-	client->output_wakeup = CreateEvent(NULL, FALSE, FALSE, NULL);
-	client->avc_ack_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+	/* WinPR does not implement auto-reset events, and a wait leaves the event
+	 * signaled. Use manual reset; each waiter resets before it checks state. */
+	client->output_wakeup = CreateEvent(NULL, TRUE, FALSE, NULL);
+	client->avc_ack_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 	if (!client->shutdown_event || !client->output_wakeup || !client->avc_ack_event)
 		goto fail;
 	client->need_idr = true;

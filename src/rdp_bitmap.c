@@ -545,6 +545,9 @@ DWORD WINAPI output_thread(LPVOID argument)
 	Client* client = (Client*)argument;
 	while (!client_should_stop(client))
 	{
+		/* Reset before reading state; producers set the event after updating it. */
+		if (client->output_wakeup)
+			(void)ResetEvent(client->output_wakeup);
 		if (client->shutdown_event &&
 		    WaitForSingleObject(client->shutdown_event, 0) == WAIT_OBJECT_0)
 			break;
