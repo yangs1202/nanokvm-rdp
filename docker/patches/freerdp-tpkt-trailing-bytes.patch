@@ -1,8 +1,42 @@
+diff --git a/libfreerdp/core/capabilities.c b/libfreerdp/core/capabilities.c
+index 0cf8489..4a43826 100644
+--- a/libfreerdp/core/capabilities.c
++++ b/libfreerdp/core/capabilities.c
+@@ -4510,6 +4510,8 @@ static BOOL rdp_read_capability_sets(wLog* log, wStream* s, rdpSettings* setting
+ 
+ 		if (!rdp_read_capability_set_header(log, s, &length, &type))
+ 			goto fail;
++		WLog_Print(log, WLOG_WARN, "capability set type=%" PRIu16 " length=%" PRIu16
++		           " (remaining count %" PRIu16 ")", type, length, numberCapabilities);
+ 		sub = Stream_StaticInit(&subbuffer, Stream_Pointer(s), length - 4);
+ 		if (!Stream_SafeSeek(s, length - 4))
+ 			goto fail;
+diff --git a/libfreerdp/core/server.c b/libfreerdp/core/server.c
+index 48b2072..1f47f4b 100644
+--- a/libfreerdp/core/server.c
++++ b/libfreerdp/core/server.c
+@@ -185,13 +185,13 @@ static BOOL wts_read_drdynvc_create_response(rdpPeerChannel* channel, wStream* s
+ 
+ 	if ((INT32)CreationStatus < 0)
+ 	{
+-		DEBUG_DVC("ChannelId %" PRIu32 " creation failed (%" PRId32 ")", channel->channelId,
+-		          (INT32)CreationStatus);
++		WLog_WARN(TAG, "ChannelId %" PRIu32 " creation failed (%" PRId32 ")", channel->channelId,
++		           (INT32)CreationStatus);
+ 		channel->dvc_open_state = DVC_OPEN_STATE_FAILED;
+ 	}
+ 	else
+ 	{
+-		DEBUG_DVC("ChannelId %" PRIu32 " creation succeeded", channel->channelId);
++		WLog_WARN(TAG, "ChannelId %" PRIu32 " creation succeeded", channel->channelId);
+ 		channel->dvc_open_state = DVC_OPEN_STATE_SUCCEEDED;
+ 	}
+ 
 diff --git a/libfreerdp/core/tpkt.c b/libfreerdp/core/tpkt.c
-index 5d7beef..db55e91 100644
+index 5d7beef..149537d 100644
 --- a/libfreerdp/core/tpkt.c
 +++ b/libfreerdp/core/tpkt.c
-@@ -145,9 +145,11 @@ BOOL tpkt_ensure_stream_consumed_(wLog* log, wStream* s, size_t length, const ch
+@@ -145,9 +145,19 @@ BOOL tpkt_ensure_stream_consumed_(wLog* log, wStream* s, size_t length, const ch
  	{
  		WLog_Print(log, WLOG_ERROR,
  		           "[%s] Received invalid TPKT header length %" PRIu16 ", %" PRIdz
@@ -11,7 +45,15 @@ index 5d7beef..db55e91 100644
  		           fkt, length, rem);
 -		return FALSE;
 +		/* Jump Desktop appends bytes that the PDU parsers do not account for.
-+		 * Skip them instead of dropping the connection. */
++		 * Log them and skip instead of dropping the connection. */
++		{
++			char hex[3 * 64 + 1] = { 0 };
++			const BYTE* ptr = Stream_ConstPointer(s);
++			const size_t n = (rem < 64) ? rem : 64;
++			for (size_t i = 0; i < n; i++)
++				(void)snprintf(&hex[3 * i], 4, "%02X ", ptr[i]);
++			WLog_Print(log, WLOG_WARN, "[%s] skipped bytes: %s", fkt, hex);
++		}
 +		Stream_Seek(s, rem);
  	}
  	return TRUE;
