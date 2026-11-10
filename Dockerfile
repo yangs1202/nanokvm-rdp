@@ -22,10 +22,10 @@ WORKDIR /src
 
 RUN git clone --branch "${FREERDP_VERSION}" --depth 1 https://github.com/FreeRDP/FreeRDP.git freerdp
 
-# Jump Desktop appends bytes after its capability sets in Confirm Active, and FreeRDP 3.14.x
-# rejects the PDU ("bytes too long"). The patch skips the trailing bytes.
-COPY docker/patches/freerdp-confirm-active-trailing.patch /tmp/freerdp-confirm-active-trailing.patch
-RUN git -C freerdp apply /tmp/freerdp-confirm-active-trailing.patch
+# Jump Desktop sends PDUs with bytes after the parsed payload (Confirm Active, input data), and
+# FreeRDP 3.14.x drops the connection ("bytes too long"). The patch skips those bytes.
+COPY docker/patches/freerdp-tpkt-trailing-bytes.patch /tmp/freerdp-tpkt-trailing-bytes.patch
+RUN git -C freerdp apply /tmp/freerdp-tpkt-trailing-bytes.patch
 
 RUN cmake -S freerdp -B build/freerdp \
         -DCMAKE_BUILD_TYPE=Release \
