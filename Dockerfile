@@ -22,6 +22,11 @@ WORKDIR /src
 
 RUN git clone --branch "${FREERDP_VERSION}" --depth 1 https://github.com/FreeRDP/FreeRDP.git freerdp
 
+# Jump Desktop appends bytes after its capability sets in Confirm Active, and FreeRDP 3.14.x
+# rejects the PDU ("bytes too long"). The patch skips the trailing bytes.
+COPY docker/patches/freerdp-confirm-active-trailing.patch /tmp/freerdp-confirm-active-trailing.patch
+RUN git -C freerdp apply /tmp/freerdp-confirm-active-trailing.patch
+
 RUN cmake -S freerdp -B build/freerdp \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/freerdp \
