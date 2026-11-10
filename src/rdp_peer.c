@@ -218,8 +218,22 @@ static bool client_prepare_bitmap(Client* client)
 	}
 	else
 	{
-		gateway_log("ERROR", "client가 RemoteFX/NSCodec을 지원하지 않아 raw bitmap으로 내려가지 않습니다");
-		return false;
+		/* Jump Desktop advertises neither SurfaceCommands nor BitmapCodecs and
+		 * rejects the RDPGFX channel, so classic 16-bit BitmapUpdate is the
+		 * only path it can decode. */
+		const uint32_t color_depth = freerdp_settings_get_uint32(settings, FreeRDP_ColorDepth);
+		client->classic_encoded = calloc(CLASSIC_BITMAP_BATCH, CLASSIC_TILE_MAX_ENCODED);
+		if (!client->classic_encoded)
+			return false;
+		if (color_depth != 16 && color_depth != 24 && color_depth != 32)
+		{
+			gateway_log("ERROR", "client가 지원하지 않는 classic bitmap 색 깊이를 요청했습니다");
+			return false;
+		}
+		if (color_depth == 24 &&
+		    !freerdp_settings_set_uint32((rdpSettings*)settings, FreeRDP_ColorDepth, 16))
+			return false;
+		gateway_log("INFO", "RemoteFX/NSCodec 없이 16-bit raw BitmapUpdate 경로를 사용합니다");
 	}
 	if (client->bitmap_uses_rfx || client->nsc)
 	{
@@ -335,8 +349,25 @@ static bool client_check_gfx_timeout(Client* client)
 		return true;
 	const uint64_t now = monotonic_milliseconds();
 	const uint64_t started_at = client->gfx_opened ? client->gfx_opened_at : client->gfx_wait_started_at;
-	if (now - started_at <= 15000)
+	const rdpSettings* settings = client->context.settings;
+	/* A client without RemoteFX and NSCodec cannot take surface commands, so
+	 * it never opens RDPGFX either. Switch it to classic bitmap soon. */
+	const bool classic_only = settings && !bitmap_stream_rfx_supported(settings) &&
+	                          !bitmap_stream_nsc_supported(settings);
+	if (now - started_at <= (classic_only ? 3000U : 15000U))
 		return true;
+	if (classic_only)
+	{
+		client->direct_gfx_active = false;
+		client->gfx_wait_started_at = 0;
+		if (!client_prepare_bitmap(client))
+		{
+			gateway_log("ERROR", "RDPGFX 미지원 client의 classic bitmap fallback을 시작할 수 없습니다");
+			return false;
+		}
+		gateway_log("INFO", "RDPGFX를 쓰지 않는 client를 classic bitmap backend로 전환합니다");
+		return true;
+	}
 	gateway_log("ERROR",
 	            "RDPGFX 준비 실패로 연결을 종료합니다 opened=%u state=%u waited_ms=%llu",
 	            (unsigned)client->gfx_opened,
