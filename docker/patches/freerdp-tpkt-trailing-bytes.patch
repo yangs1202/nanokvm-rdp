@@ -1,0 +1,18 @@
+diff --git a/libfreerdp/core/tpkt.c b/libfreerdp/core/tpkt.c
+index 5d7beef..db55e91 100644
+--- a/libfreerdp/core/tpkt.c
++++ b/libfreerdp/core/tpkt.c
+@@ -145,9 +145,11 @@ BOOL tpkt_ensure_stream_consumed_(wLog* log, wStream* s, size_t length, const ch
+ 	{
+ 		WLog_Print(log, WLOG_ERROR,
+ 		           "[%s] Received invalid TPKT header length %" PRIu16 ", %" PRIdz
+-		           " bytes too long!",
++		           " bytes too long, ignoring",
+ 		           fkt, length, rem);
+-		return FALSE;
++		/* Jump Desktop appends bytes that the PDU parsers do not account for.
++		 * Skip them instead of dropping the connection. */
++		Stream_Seek(s, rem);
+ 	}
+ 	return TRUE;
+ }
