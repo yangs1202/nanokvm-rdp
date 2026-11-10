@@ -104,6 +104,18 @@ UINT on_gfx_caps_advertise(RdpgfxServerContext* gfx,
 	client->gfx_uses_progressive = !use_avc420;
 	client->bitmap_fallback_active = !use_avc420;
 	LeaveCriticalSection(&client->lock);
+	/* Progressive frames are sent from output_thread. Only client_prepare_bitmap()
+	 * started it, so a client that disables AVC (iPad Windows App) decoded video
+	 * but never received a frame. */
+	if (!use_avc420 && !client->output_thread)
+	{
+		client->output_thread = CreateThread(NULL, 0, output_thread, client, 0, NULL);
+		if (!client->output_thread)
+		{
+			client_stop(client);
+			return ERROR_NOT_ENOUGH_MEMORY;
+		}
+	}
 	client->video_thread = CreateThread(NULL, 0,
 	                                    use_avc420 ? video_thread : bitmap_video_thread,
 	                                    client, 0, NULL);
