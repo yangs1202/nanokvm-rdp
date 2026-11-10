@@ -34,9 +34,10 @@ static void classic_pack_rgb16(uint8_t* destination, const uint8_t* bgra, uint16
                                uint16_t left, uint16_t top, uint16_t columns, uint16_t rows)
 {
 	size_t written = 0;
+	/* Uncompressed TS_BITMAP_DATA is a bottom-up DIB, so emit the last row first. */
 	for (uint16_t row = 0; row < rows; row++)
 	{
-		const size_t offset = ((size_t)(top + row) * width + left) * 4U;
+		const size_t offset = ((size_t)(top + (rows - 1U - row)) * width + left) * 4U;
 		for (uint16_t column = 0; column < columns; column++)
 		{
 			const uint8_t* pixel = bgra + offset + (size_t)column * 4U;
@@ -460,7 +461,7 @@ static bool client_flush_pending_bitmap(Client* client)
 	EnterCriticalSection(&client->lock);
 	client->stats.bitmap_flushes++;
 	unsigned interval = client->gfx_uses_progressive
-	                        ? frame_flow_interval(&client->frame_flow) : BITMAP_FRAME_INTERVAL_MS;
+	                        ? frame_flow_interval(&client->frame_flow) : CLASSIC_FRAME_INTERVAL_MS;
 	/* A classic frame is sliced. Pace only between completed frames; an open
 	 * slice must resume immediately so input is not delayed by the old 250 ms cap. */
 	const bool classic_resume = !client->gfx_uses_progressive && client->classic_frame_open;
@@ -471,7 +472,9 @@ static bool client_flush_pending_bitmap(Client* client)
 		LeaveCriticalSection(&client->lock);
 		return true;
 	}
-	AVFrame* frame = client->pending_decoded;
+	/* An open classic slice keeps sending converter.frame. Leave any newer
+	 * pending frame queued; taking it here would leak it. */
+	AVFrame* frame = classic_resume ? NULL : client->pending_decoded;
 	if (!frame && !classic_resume)
 	{
 		client->stats.bitmap_empty_flushes++;
@@ -565,7 +568,7 @@ DWORD WINAPI output_thread(LPVOID argument)
 		const uint64_t last_send = client->bitmap_last_send_started_at;
 		const uint64_t interval = client->gfx_uses_progressive
 		                              ? frame_flow_interval(&client->frame_flow)
-		                              : BITMAP_FRAME_INTERVAL_MS;
+		                              : CLASSIC_FRAME_INTERVAL_MS;
 		LeaveCriticalSection(&client->lock);
 		DWORD timeout = 50;
 		if (pending && !waiting_for_ack)
