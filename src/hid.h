@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define HID_REPORT_QUEUE_CAPACITY 256U
+#define HID_REPORT_QUEUE_CAPACITY 2048U
 #define HID_REPORT_STALL_TIMEOUT_MS 1000U
 #define HID_KEEPALIVE_INTERVAL_MS 300000U
 

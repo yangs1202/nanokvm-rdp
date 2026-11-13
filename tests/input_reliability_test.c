@@ -452,6 +452,34 @@ static void test_unicode_shortcuts_preserve_modifiers(void)
 	}
 }
 
+static void test_hangul_burst_keeps_order(void)
+{
+	Fixture f; setup(&f);
+	const char* syllable = "\xed\x95\x9c\xea\xb8\x80"; /* 한글 */
+	const char* expected = "gksrmf";
+	uint8_t text[6 * 25];
+	size_t length = 0;
+	for (unsigned i = 0; i < 25; i++) { memcpy(text + length, syllable, 6); length += 6; }
+	assert(hid_type_utf8(&f.hid, text, length));
+	unsigned typed = 0;
+	const uint64_t deadline = now_ms() + 30000;
+	while (now_ms() < deadline)
+	{
+		assert(hid_flush(&f.hid));
+		uint8_t report[8];
+		while (read(f.receiver[0], report, 8) == 8)
+		{
+			if (!report[2]) continue;
+			assert(report[2] == (uint8_t)(4 + expected[typed % 6] - 'a'));
+			typed++;
+		}
+		if (!hid_pending(&f.hid)) break;
+		poll(NULL, 0, 1);
+	}
+	assert(typed == 150 && !hid_pending(&f.hid) && f.hid.queue_overflows == 0);
+	cleanup(&f);
+}
+
 int main(void)
 {
 	test_button_mapping_and_mixed_motion(); test_final_release_and_coalescing();
@@ -461,5 +489,6 @@ int main(void)
 	test_control_space_with_host_feedback();
 	test_synchronize_preserves_pending_input();
 	test_unicode_shortcuts_preserve_modifiers();
-	puts("Input reliability: all 13 scenarios passed"); return 0;
+	test_hangul_burst_keeps_order();
+	puts("Input reliability: all 14 scenarios passed"); return 0;
 }
